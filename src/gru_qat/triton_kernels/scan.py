@@ -242,6 +242,400 @@ def gru_scan_forward_persistent(
     return out
 
 
+@triton.jit
+def gru_scan_bwd_persistent_kernel(
+    # forward inputs (read-only)
+    gi_ptr,           # [T, B, 3H]
+    h0_ptr,           # [B, H]
+    Wh_ptr,           # [3H, H]
+    bh_ptr,           # [3H]
+    out_ptr,          # [T, B, H]
+    # upstream gradient
+    dout_ptr,         # [T, B, H]
+    # outputs
+    dgi_ptr,          # [T, B, 3H]
+    dh0_ptr,          # [B, H]
+    # per-batch-tile output buffers (reduced across pid_oh inside the kernel
+    # via atomic_add, then summed across pid_b in Python)
+    dWh_partial_ptr,  # [num_pid_b, 3H, H]
+    dbh_partial_ptr,  # [num_pid_b, 3H]
+    # ping-pong dh_acc scratch — atomic-add target for cross-program
+    # coordination of the dh_prev_via_W contribution. Both [B, H] fp32.
+    dh_a_ptr,
+    dh_b_ptr,
+    # per-timestep barrier counter for cross-CTA sync, [T] int32
+    barrier_ptr,
+    T, B,
+    sg_t, sg_b,
+    sh0_b,
+    sW_o,
+    so_t, so_b,
+    sdo_t, sdo_b,
+    sdgi_t, sdgi_b,
+    sdh0_b,
+    sdWp_pid, sdWp_o,
+    sdbp_pid,
+    sdh_b,
+    NUM_PROGRAMS,
+    H: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_OH: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Persistent backward kernel.
+
+    2D grid (pid_b, pid_oh) mirroring the persistent forward. Per-step,
+    each program:
+    - Reads its [BLOCK_B, BLOCK_OH] slice of incoming dh_acc and zeros
+      that slice (preparing it to be the next step's write buffer after
+      the ping-pong).
+    - Recomputes forward gates for its slice.
+    - Stores its slice of dgi[t].
+    - Atomic-adds the cross-H dh_prev_via_W contribution into the write
+      buffer (matmul output spans all of H).
+    - Atomic-adds dh_prev_direct into the write buffer at its OH slice
+      (per-element, one writer).
+    - Atomic-adds dWh_partial / dbh_partial slabs (each program owns a
+      unique OH range, no contention there).
+    - Spin-waits on the per-timestep barrier.
+
+    Constraint as in the forward: total grid programs <= GPU SM count.
+    """
+    pid_b = tl.program_id(0)
+    pid_oh = tl.program_id(1)
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
+    offs_oh = pid_oh * BLOCK_OH + tl.arange(0, BLOCK_OH)
+    mask_oh = offs_oh < H
+    mask_oh2 = mask_b[:, None] & mask_oh[None, :]
+
+    # Pre-load bh slice for this oh range — constant across T.
+    bhr_tile = tl.load(bh_ptr + 0 * H + offs_oh, mask=mask_oh, other=0.0)
+    bhz_tile = tl.load(bh_ptr + 1 * H + offs_oh, mask=mask_oh, other=0.0)
+    bhn_tile = tl.load(bh_ptr + 2 * H + offs_oh, mask=mask_oh, other=0.0)
+
+    read_ptr = dh_a_ptr
+    write_ptr = dh_b_ptr
+
+    for t_rev in range(0, T):
+        t = T - 1 - t_rev
+
+        if t == 0:
+            h_prev_ptr = h0_ptr
+            sh_prev_b = sh0_b
+        else:
+            h_prev_ptr = out_ptr + (t - 1) * so_t
+            sh_prev_b = so_b
+
+        # ---- Recompute forward gh tiles for this oh range ----
+        ghr = tl.zeros((BLOCK_B, BLOCK_OH), dtype=tl.float32)
+        ghz = tl.zeros((BLOCK_B, BLOCK_OH), dtype=tl.float32)
+        ghn = tl.zeros((BLOCK_B, BLOCK_OH), dtype=tl.float32)
+        for k in range(0, H, BLOCK_K):
+            offs_k = k + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < H
+            h_prev_ptrs = h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_k[None, :]
+            h_prev_tile = tl.load(
+                h_prev_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
+            )
+            W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
+            Wr_tile = tl.load(
+                Wh_ptr + 0 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            Wz_tile = tl.load(
+                Wh_ptr + 1 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            Wn_tile = tl.load(
+                Wh_ptr + 2 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            ghr += tl.dot(h_prev_tile, tl.trans(Wr_tile), input_precision="tf32")
+            ghz += tl.dot(h_prev_tile, tl.trans(Wz_tile), input_precision="tf32")
+            ghn += tl.dot(h_prev_tile, tl.trans(Wn_tile), input_precision="tf32")
+        ghr += bhr_tile[None, :]
+        ghz += bhz_tile[None, :]
+        ghn += bhn_tile[None, :]
+
+        gi_base = (
+            gi_ptr + t * sg_t + offs_b[:, None] * sg_b + offs_oh[None, :]
+        )
+        gir = tl.load(gi_base + 0 * H, mask=mask_oh2, other=0.0)
+        giz = tl.load(gi_base + 1 * H, mask=mask_oh2, other=0.0)
+        gin = tl.load(gi_base + 2 * H, mask=mask_oh2, other=0.0)
+        r = tl.sigmoid(gir + ghr)
+        z = tl.sigmoid(giz + ghz)
+        n = tl.extra.libdevice.tanh(gin + r * ghn)
+
+        h_prev_oh_ptrs = (
+            h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_oh[None, :]
+        )
+        h_prev_oh = tl.load(h_prev_oh_ptrs, mask=mask_oh2, other=0.0)
+
+        # ---- Read incoming dh_acc and zero it (it'll be next step's write
+        # buffer after the swap; each cell has exactly one reader). ----
+        # cache_modifier=".cv" forces a fresh global load — needed because
+        # atomic_add writes from sibling CTAs in the previous timestep may
+        # not be visible through L1 cache without it.
+        dh_acc_ptrs = read_ptr + offs_b[:, None] * sdh_b + offs_oh[None, :]
+        dh_acc_oh = tl.load(
+            dh_acc_ptrs, mask=mask_oh2, other=0.0, cache_modifier=".cv",
+        )
+        tl.store(dh_acc_ptrs, tl.zeros_like(dh_acc_oh), mask=mask_oh2)
+
+        dout_base = (
+            dout_ptr + t * sdo_t + offs_b[:, None] * sdo_b + offs_oh[None, :]
+        )
+        dout_oh = tl.load(dout_base, mask=mask_oh2, other=0.0)
+        dh_t = dout_oh + dh_acc_oh
+
+        # h_t = (1 - z) * n + z * h_prev
+        dn = dh_t * (1.0 - z)
+        dz = dh_t * (h_prev_oh - n)
+        dh_prev_direct = dh_t * z
+
+        dgn_pre = dn * (1.0 - n * n)
+        dgi_n = dgn_pre
+        dr = dgn_pre * ghn
+        dgh_n = dgn_pre * r
+
+        dgz_pre = dz * z * (1.0 - z)
+        dgi_z = dgz_pre
+        dgh_z = dgz_pre
+
+        dgr_pre = dr * r * (1.0 - r)
+        dgi_r = dgr_pre
+        dgh_r = dgr_pre
+
+        # Store dgi[t][oh_slice] (no contention — each program owns its OH).
+        tl.store(
+            dgi_ptr + t * sdgi_t + offs_b[:, None] * sdgi_b + offs_oh[None, :] + 0 * H,
+            dgi_r, mask=mask_oh2,
+        )
+        tl.store(
+            dgi_ptr + t * sdgi_t + offs_b[:, None] * sdgi_b + offs_oh[None, :] + 1 * H,
+            dgi_z, mask=mask_oh2,
+        )
+        tl.store(
+            dgi_ptr + t * sdgi_t + offs_b[:, None] * sdgi_b + offs_oh[None, :] + 2 * H,
+            dgi_n, mask=mask_oh2,
+        )
+
+        # dbh_partial accumulation — each program owns its OH range and is
+        # the only writer to its rows; plain load+add+store (no atomic).
+        dbh_base = dbh_partial_ptr + pid_b * sdbp_pid + offs_oh
+        tl.store(
+            dbh_base + 0 * H,
+            tl.load(dbh_base + 0 * H, mask=mask_oh, other=0.0)
+            + tl.sum(dgh_r, axis=0),
+            mask=mask_oh,
+        )
+        tl.store(
+            dbh_base + 1 * H,
+            tl.load(dbh_base + 1 * H, mask=mask_oh, other=0.0)
+            + tl.sum(dgh_z, axis=0),
+            mask=mask_oh,
+        )
+        tl.store(
+            dbh_base + 2 * H,
+            tl.load(dbh_base + 2 * H, mask=mask_oh, other=0.0)
+            + tl.sum(dgh_n, axis=0),
+            mask=mask_oh,
+        )
+
+        # dh_prev_via_W: dgh @ Wh — accumulates into write_ptr ALL of H,
+        # which is shared across pid_oh programs. Use atomic_add.
+        for k in range(0, H, BLOCK_K):
+            offs_k = k + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < H
+            W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
+            Wr_t = tl.load(
+                Wh_ptr + 0 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            Wz_t = tl.load(
+                Wh_ptr + 1 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            Wn_t = tl.load(
+                Wh_ptr + 2 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            contrib = (
+                tl.dot(dgh_r, Wr_t, input_precision="tf32")
+                + tl.dot(dgh_z, Wz_t, input_precision="tf32")
+                + tl.dot(dgh_n, Wn_t, input_precision="tf32")
+            )
+            w_ptrs = write_ptr + offs_b[:, None] * sdh_b + offs_k[None, :]
+            tl.atomic_add(
+                w_ptrs, contrib,
+                mask=mask_b[:, None] & mask_k[None, :],
+            )
+
+        # dh_prev_direct goes to write_ptr at this program's oh slice; each
+        # cell has exactly one writer (only this program owns this OH), so
+        # plain store is sufficient — but we use atomic_add to play nicely
+        # with the via_W writes that may also hit this OH range.
+        wd_ptrs = write_ptr + offs_b[:, None] * sdh_b + offs_oh[None, :]
+        tl.atomic_add(wd_ptrs, dh_prev_direct, mask=mask_oh2)
+
+        # dWh_partial accumulation: each program owns unique rows in
+        # dWh_partial[pid_b, this_oh, :], so plain load+add+store works.
+        for k in range(0, H, BLOCK_K):
+            offs_k = k + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < H
+            h_prev_ptrs = (
+                h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_k[None, :]
+            )
+            h_prev_tile = tl.load(
+                h_prev_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
+            )
+            dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
+            dWz = tl.dot(tl.trans(dgh_z), h_prev_tile, input_precision="tf32")
+            dWn = tl.dot(tl.trans(dgh_n), h_prev_tile, input_precision="tf32")
+            dWh_base = dWh_partial_ptr + pid_b * sdWp_pid
+            Wr_ptrs = (
+                dWh_base + (0 * H + offs_oh)[:, None] * sdWp_o + offs_k[None, :]
+            )
+            Wz_ptrs = (
+                dWh_base + (1 * H + offs_oh)[:, None] * sdWp_o + offs_k[None, :]
+            )
+            Wn_ptrs = (
+                dWh_base + (2 * H + offs_oh)[:, None] * sdWp_o + offs_k[None, :]
+            )
+            mask_okok = mask_oh[:, None] & mask_k[None, :]
+            tl.store(
+                Wr_ptrs,
+                tl.load(Wr_ptrs, mask=mask_okok, other=0.0) + dWr,
+                mask=mask_okok,
+            )
+            tl.store(
+                Wz_ptrs,
+                tl.load(Wz_ptrs, mask=mask_okok, other=0.0) + dWz,
+                mask=mask_okok,
+            )
+            tl.store(
+                Wn_ptrs,
+                tl.load(Wn_ptrs, mask=mask_okok, other=0.0) + dWn,
+                mask=mask_okok,
+            )
+
+        # Cross-CTA barrier. Release on the increment so prior data
+        # atomic_adds are visible to any reader observing the post-
+        # increment counter; acquire on the spin-load so writes by
+        # programs that already incremented are visible after the wait.
+        # tl.load doesn't accept a memory order, so we read via a no-op
+        # atomic_add (add 0) with sem="acquire".
+        tl.atomic_add(barrier_ptr + t_rev, 1, sem="release")
+        done = tl.atomic_add(barrier_ptr + t_rev, 0, sem="acquire")
+        while done < NUM_PROGRAMS:
+            done = tl.atomic_add(barrier_ptr + t_rev, 0, sem="acquire")
+
+        # Swap read/write for next step.
+        tmp = read_ptr
+        read_ptr = write_ptr
+        write_ptr = tmp
+
+    # After the loop, read_ptr holds the final dh_acc — write to dh0.
+    # cache_modifier=".cv" same reason as the in-loop dh_acc read: this
+    # buffer was just atomic-added to by sibling CTAs and the L1 view may
+    # be stale.
+    dh_final_ptrs = read_ptr + offs_b[:, None] * sdh_b + offs_oh[None, :]
+    dh_final = tl.load(
+        dh_final_ptrs, mask=mask_oh2, other=0.0, cache_modifier=".cv",
+    )
+    dh0_ptrs = dh0_ptr + offs_b[:, None] * sdh0_b + offs_oh[None, :]
+    tl.store(dh0_ptrs, dh_final, mask=mask_oh2)
+
+
+def gru_scan_backward_persistent(
+    gi: torch.Tensor,
+    h0: torch.Tensor,
+    Wh_cat: torch.Tensor,
+    bh_cat: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    *,
+    block_b: int = 16,
+    block_oh: int = 64,
+    block_k: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Persistent backward. Same launch constraint as the forward kernel.
+
+    BLOCK_B is fixed at 16 (vs 8 in the forward) because the dWh
+    accumulation does ``tl.dot(trans(dgh), h_prev)`` with reduction
+    K = BLOCK_B; tl.dot requires K >= 16.
+    """
+    T, B, three_H = gi.shape
+    H = three_H // 3
+    assert h0.shape == (B, H)
+    assert Wh_cat.shape == (3 * H, H)
+    assert bh_cat.shape == (3 * H,)
+    assert out.shape == (T, B, H)
+    assert dout.shape == (T, B, H)
+
+    gi = gi.contiguous()
+    h0 = h0.contiguous()
+    Wh_cat = Wh_cat.contiguous()
+    bh_cat = bh_cat.contiguous()
+    out = out.contiguous()
+    dout = dout.contiguous()
+
+    block_oh = max(16, min(block_oh, H))
+    block_k = max(16, min(block_k, H))
+
+    n_pid_b = triton.cdiv(B, block_b)
+    n_pid_oh = triton.cdiv(H, block_oh)
+    num_programs = n_pid_b * n_pid_oh
+
+    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
+    if num_programs > sm_count:
+        raise RuntimeError(
+            f"persistent grid {num_programs} > SM count {sm_count}; "
+            f"would deadlock on the spin-wait barrier. Increase block sizes."
+        )
+
+    dgi = torch.zeros_like(gi)
+    dh0 = torch.zeros_like(h0)
+    dWh_partial = torch.zeros((n_pid_b, 3 * H, H), device=gi.device, dtype=gi.dtype)
+    dbh_partial = torch.zeros((n_pid_b, 3 * H), device=gi.device, dtype=gi.dtype)
+    # Both ping-pong buffers start zeroed.
+    dh_a = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
+    dh_b = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
+    barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
+
+    grid = (n_pid_b, n_pid_oh)
+    gru_scan_bwd_persistent_kernel[grid](
+        gi, h0, Wh_cat, bh_cat, out,
+        dout,
+        dgi, dh0,
+        dWh_partial, dbh_partial,
+        dh_a, dh_b,
+        barrier,
+        T, B,
+        gi.stride(0), gi.stride(1),
+        h0.stride(0),
+        Wh_cat.stride(0),
+        out.stride(0), out.stride(1),
+        dout.stride(0), dout.stride(1),
+        dgi.stride(0), dgi.stride(1),
+        dh0.stride(0),
+        dWh_partial.stride(0), dWh_partial.stride(1),
+        dbh_partial.stride(0),
+        dh_a.stride(0),
+        num_programs,
+        H=H, BLOCK_B=block_b, BLOCK_OH=block_oh, BLOCK_K=block_k,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    dWh = dWh_partial.sum(dim=0)
+    dbh = dbh_partial.sum(dim=0)
+    return dgi, dh0, dWh, dbh
+
+
 @triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])
 @triton.jit
 def gru_scan_fwd_kernel(
@@ -1066,6 +1460,45 @@ def gru_scan(
     return GRUScanFunction.apply(
         gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
     )
+
+
+class GRUScanPersistentFunction(torch.autograd.Function):
+    """Same autograd contract as GRUScanFunction, dispatched to the
+    persistent forward/backward kernels.
+
+    No fake-quant support yet (separate work item). Constraint: the chosen
+    grid sizes must fit inside the GPU's SM count or the kernel deadlocks
+    on the spin-wait barrier; the wrappers check this.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        gi: torch.Tensor,
+        h0: torch.Tensor,
+        Wh_cat: torch.Tensor,
+        bh_cat: torch.Tensor,
+    ) -> torch.Tensor:
+        out = gru_scan_forward_persistent(gi, h0, Wh_cat, bh_cat)
+        ctx.save_for_backward(gi, h0, Wh_cat, bh_cat, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):  # type: ignore[override]
+        gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
+        return gru_scan_backward_persistent(gi, h0, Wh_cat, bh_cat, out, dout)
+
+
+def gru_scan_persistent(
+    gi: torch.Tensor,
+    h0: torch.Tensor,
+    Wh_cat: torch.Tensor,
+    bh_cat: torch.Tensor,
+) -> torch.Tensor:
+    """Persistent-kernel variant of gru_scan. Forward and backward both
+    use 2D grids with cross-CTA barriers; better SM utilization at modest
+    batch sizes. fp32 only (no fake-quant in this path yet)."""
+    return GRUScanPersistentFunction.apply(gi, h0, Wh_cat, bh_cat)
 
 
 def gru_scan_forward(

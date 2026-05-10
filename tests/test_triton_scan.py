@@ -17,6 +17,8 @@ from gru_qat.triton_kernels.scan import (
     gru_scan,
     gru_scan_forward,
     gru_scan_forward_persistent,
+    gru_scan_backward_persistent,
+    _gru_scan_backward_pytorch,
 )
 
 cuda_only = pytest.mark.skipif(
@@ -70,6 +72,43 @@ def test_triton_forward_persistent_matches_default(
     rel = max_diff / max(out_default.abs().max().item(), 1e-6)
     # TF32 in both paths but different accumulation orders → looser bound.
     assert rel < 5e-2, f"persistent vs default rel diff {rel:.4f}"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,IN,H", [(8, 16, 32, 128), (16, 32, 64, 256)])
+def test_triton_backward_persistent_matches_pytorch(
+    T: int, B: int, IN: int, H: int
+) -> None:
+    """Persistent backward kernel must match the PyTorch reference
+    backward to within TF32 noise on the four gradient outputs."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    gi = torch.randn(T, B, 3 * H, device=device) * 0.5
+    h0 = torch.randn(B, H, device=device) * 0.5
+    Wh = torch.randn(3 * H, H, device=device) * 0.1
+    bh = torch.randn(3 * H, device=device) * 0.1
+    out_fwd = gru_scan_forward(gi, h0, Wh, bh)
+    dout = torch.randn(T, B, H, device=device) * 0.5
+
+    dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_backward_persistent(
+        gi, h0, Wh, bh, out_fwd, dout,
+        block_b=16, block_oh=min(H, 64), block_k=32,
+    )
+    dgi_p, dh0_p, dWh_p, dbh_p = _gru_scan_backward_pytorch(
+        gi, h0, Wh, bh, out_fwd, dout,
+    )
+
+    for name, t, p in [
+        ("dgi", dgi_t, dgi_p),
+        ("dh0", dh0_t, dh0_p),
+        ("dWh", dWh_t, dWh_p),
+        ("dbh", dbh_t, dbh_p),
+    ]:
+        diff = (t - p).abs().max().item()
+        rel = diff / max(p.abs().max().item(), 1e-9)
+        assert rel < 1e-1, f"{name} rel diff {rel:.4f}"
 
 
 @cuda_only
