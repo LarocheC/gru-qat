@@ -13,7 +13,11 @@ triton = pytest.importorskip("triton")
 
 from gru_qat.gru_layer import GRULayer
 from gru_qat.quantizers import QuantizerConfig, QuantRecipe
-from gru_qat.triton_kernels.scan import gru_scan, gru_scan_forward
+from gru_qat.triton_kernels.scan import (
+    gru_scan,
+    gru_scan_forward,
+    gru_scan_forward_persistent,
+)
 
 cuda_only = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
@@ -35,6 +39,37 @@ def _ref_layer(in_dim: int, hidden: int) -> GRULayer:
     return GRULayer(
         in_dim, hidden, recipe=rec, gate_layout="fused", pre_batch_input=True
     )
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,IN,H", [(8, 16, 32, 128), (16, 32, 64, 256)])
+def test_triton_forward_persistent_matches_default(
+    T: int, B: int, IN: int, H: int
+) -> None:
+    """Persistent forward kernel must match the autotune (non-persistent)
+    forward kernel within TF32 noise. Uses shapes whose persistent-grid
+    size fits inside the SM count (block_b=8, block_oh=H caps grid)."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+    layer = _ref_layer(IN, H).to(device).eval()
+
+    x = torch.randn(T, B, IN, device=device)
+    h0 = torch.randn(B, H, device=device)
+
+    with torch.no_grad():
+        w = layer.cell.quantize_weights()
+        gi = layer.cell.input_projection(x, w)
+        out_default = gru_scan_forward(gi, h0, w.Wh_cat, w.bh_cat)
+        out_persist = gru_scan_forward_persistent(
+            gi, h0, w.Wh_cat, w.bh_cat,
+            block_b=8, block_oh=min(H, 128), block_k=32,
+        )
+
+    max_diff = (out_default - out_persist).abs().max().item()
+    rel = max_diff / max(out_default.abs().max().item(), 1e-6)
+    # TF32 in both paths but different accumulation orders → looser bound.
+    assert rel < 5e-2, f"persistent vs default rel diff {rel:.4f}"
 
 
 @cuda_only

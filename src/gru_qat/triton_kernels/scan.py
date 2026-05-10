@@ -61,6 +61,187 @@ _AUTOTUNE_CONFIGS_BWD = [
 _MIN_AUTOTUNE_BLOCK_B = 16
 
 
+# Persistent forward kernel: 2D grid over (batch, output-H), each program
+# co-owns one [BLOCK_B, BLOCK_OH] state slice for ALL T timesteps. Programs
+# coordinate per-step via a global atomic counter (one slot per timestep);
+# each CTA increments after writing its slice and spin-waits until every
+# CTA has done the same before reading the new h_{t} for the next step.
+#
+# Spin-wait deadlocks if grid size exceeds the number of SMs that can run
+# concurrently — scheduled-but-not-running CTAs would block forever waiting
+# on their unscheduled siblings. The wrapper is responsible for keeping the
+# total program count <= the GPU's SM count.
+@triton.jit
+def gru_scan_fwd_persistent_kernel(
+    gi_ptr,            # [T, B, 3H], fp32
+    h0_ptr,            # [B, H], fp32
+    Wh_ptr,            # [3H, H], fp32
+    bh_ptr,            # [3H], fp32
+    out_ptr,           # [T, B, H], fp32
+    barrier_ptr,       # [T], int32 — one counter per timestep
+    T,
+    B,
+    sg_t, sg_b,
+    sh0_b,
+    sW_o,
+    so_t, so_b,
+    NUM_PROGRAMS,
+    H: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_OH: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_oh = tl.program_id(1)
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
+    offs_oh = pid_oh * BLOCK_OH + tl.arange(0, BLOCK_OH)
+    mask_oh = offs_oh < H
+    mask_oh2 = mask_b[:, None] & mask_oh[None, :]
+
+    # Pre-load bias slice (constant across T).
+    bhr_tile = tl.load(bh_ptr + 0 * H + offs_oh, mask=mask_oh, other=0.0)
+    bhz_tile = tl.load(bh_ptr + 1 * H + offs_oh, mask=mask_oh, other=0.0)
+    bhn_tile = tl.load(bh_ptr + 2 * H + offs_oh, mask=mask_oh, other=0.0)
+
+    h_in_ptr = h0_ptr
+    sh_b = sh0_b
+
+    for t in range(0, T):
+        # Matmul reduction over K=H. Each program reads the full h vector
+        # for its batch tile (across all H) tile-by-tile through L2.
+        ghr = tl.zeros((BLOCK_B, BLOCK_OH), dtype=tl.float32)
+        ghz = tl.zeros((BLOCK_B, BLOCK_OH), dtype=tl.float32)
+        ghn = tl.zeros((BLOCK_B, BLOCK_OH), dtype=tl.float32)
+
+        for k in range(0, H, BLOCK_K):
+            offs_k = k + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < H
+            h_ptrs = h_in_ptr + offs_b[:, None] * sh_b + offs_k[None, :]
+            h_tile = tl.load(
+                h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
+            )
+            W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
+            Wr_tile = tl.load(
+                Wh_ptr + 0 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            Wz_tile = tl.load(
+                Wh_ptr + 1 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            Wn_tile = tl.load(
+                Wh_ptr + 2 * H * sW_o + W_offset,
+                mask=mask_oh[:, None] & mask_k[None, :], other=0.0,
+            )
+            ghr += tl.dot(h_tile, tl.trans(Wr_tile), input_precision="tf32")
+            ghz += tl.dot(h_tile, tl.trans(Wz_tile), input_precision="tf32")
+            ghn += tl.dot(h_tile, tl.trans(Wn_tile), input_precision="tf32")
+
+        ghr += bhr_tile[None, :]
+        ghz += bhz_tile[None, :]
+        ghn += bhn_tile[None, :]
+
+        gi_base = (
+            gi_ptr + t * sg_t + offs_b[:, None] * sg_b + offs_oh[None, :]
+        )
+        gir = tl.load(gi_base + 0 * H, mask=mask_oh2, other=0.0)
+        giz = tl.load(gi_base + 1 * H, mask=mask_oh2, other=0.0)
+        gin = tl.load(gi_base + 2 * H, mask=mask_oh2, other=0.0)
+
+        r = tl.sigmoid(gir + ghr)
+        z = tl.sigmoid(giz + ghz)
+        n = tl.extra.libdevice.tanh(gin + r * ghn)
+
+        h_old_ptrs = h_in_ptr + offs_b[:, None] * sh_b + offs_oh[None, :]
+        h_old = tl.load(h_old_ptrs, mask=mask_oh2, other=0.0)
+        h_new = (1.0 - z) * n + z * h_old
+
+        out_ptrs = (
+            out_ptr + t * so_t + offs_b[:, None] * so_b + offs_oh[None, :]
+        )
+        tl.store(out_ptrs, h_new, mask=mask_oh2)
+
+        # Grid-level barrier: every CTA increments the per-timestep counter,
+        # then spin-waits until all CTAs have arrived. Volatile read forces a
+        # fresh load each iteration so we see other CTAs' atomic_add updates.
+        tl.atomic_add(barrier_ptr + t, 1)
+        done = tl.load(barrier_ptr + t, cache_modifier=".cv")
+        while done < NUM_PROGRAMS:
+            done = tl.load(barrier_ptr + t, cache_modifier=".cv")
+
+        # All CTAs have written their slice of out[t]; safe to read it as
+        # h_in for step t+1.
+        h_in_ptr = out_ptr + t * so_t
+        sh_b = so_b
+
+
+def gru_scan_forward_persistent(
+    gi: torch.Tensor,
+    h0: torch.Tensor,
+    Wh_cat: torch.Tensor,
+    bh_cat: torch.Tensor,
+    *,
+    block_b: int = 8,
+    block_oh: int = 128,
+    block_k: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> torch.Tensor:
+    """Persistent-grid forward. Higher SM utilization at modest (B, H).
+
+    Constraint: ``cdiv(B, block_b) * cdiv(H, block_oh) <= num_SMs`` —
+    otherwise the spin-wait barrier deadlocks. Wrapper raises if exceeded.
+    """
+    assert gi.is_cuda
+    T, B, three_H = gi.shape
+    H = three_H // 3
+    assert h0.shape == (B, H)
+    assert Wh_cat.shape == (3 * H, H)
+    assert bh_cat.shape == (3 * H,)
+
+    gi = gi.contiguous()
+    h0 = h0.contiguous()
+    Wh_cat = Wh_cat.contiguous()
+    bh_cat = bh_cat.contiguous()
+
+    block_oh = max(16, min(block_oh, H))
+    block_k = max(16, min(block_k, H))
+
+    n_pid_b = triton.cdiv(B, block_b)
+    n_pid_oh = triton.cdiv(H, block_oh)
+    num_programs = n_pid_b * n_pid_oh
+
+    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
+    if num_programs > sm_count:
+        raise RuntimeError(
+            f"persistent grid {num_programs} > SM count {sm_count}; "
+            f"would deadlock on the spin-wait barrier. Increase block sizes."
+        )
+
+    out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
+    barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
+
+    grid = (n_pid_b, n_pid_oh)
+    gru_scan_fwd_persistent_kernel[grid](
+        gi, h0, Wh_cat, bh_cat, out,
+        barrier,
+        T, B,
+        gi.stride(0), gi.stride(1),
+        h0.stride(0),
+        Wh_cat.stride(0),
+        out.stride(0), out.stride(1),
+        num_programs,
+        H=H,
+        BLOCK_B=block_b,
+        BLOCK_OH=block_oh,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
 @triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])
 @triton.jit
 def gru_scan_fwd_kernel(
