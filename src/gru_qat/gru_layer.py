@@ -225,15 +225,26 @@ class GRULayer(nn.Module):
                 h_in_quant=h_in_q, h_out_quant=h_out_q,
             )
         elif self._dispatch_kind == "butterfly":
-            from gru_qat.triton_kernels.scan_butterfly import (
-                extract_butterfly_factors,
-                gru_scan_butterfly,
-            )
-            modules, bh_cat = extract_butterfly_factors(self.cell)
-            out = gru_scan_butterfly(
-                gi, h0, modules, bh_cat,
-                h_in_quant=h_in_q, h_out_quant=h_out_q,
-            )
+            # Prefer the Triton kernel path when available — fp32 only;
+            # falls back to the per-step CUDA-op path if hidden quant is
+            # active (no fake-quant in the Triton butterfly kernels yet).
+            if h_in_q is None and h_out_q is None:
+                from gru_qat.triton_kernels.scan_butterfly import (
+                    extract_butterfly_twiddles,
+                    gru_scan_butterfly_triton,
+                )
+                twiddles, bh_cat = extract_butterfly_twiddles(self.cell)
+                out = gru_scan_butterfly_triton(gi, h0, twiddles, bh_cat)
+            else:
+                from gru_qat.triton_kernels.scan_butterfly import (
+                    extract_butterfly_factors,
+                    gru_scan_butterfly,
+                )
+                modules, bh_cat = extract_butterfly_factors(self.cell)
+                out = gru_scan_butterfly(
+                    gi, h0, modules, bh_cat,
+                    h_in_quant=h_in_q, h_out_quant=h_out_q,
+                )
         else:
             raise RuntimeError(
                 f"unexpected dispatch kind {self._dispatch_kind!r}"
