@@ -16,6 +16,7 @@ implementations get this wrong and silently lose 1-2% accuracy.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -31,6 +32,33 @@ from gru_qat.quantizers import (
 )
 
 GateLayout = Literal["split", "fused"]
+
+
+@dataclass
+class CellWeights:
+    """Bag of fake-quantized weights for one cell.
+
+    Returned by `GRUCellQuant.quantize_weights()` so a multi-step layer can
+    quantize once per forward and reuse the result across all timesteps.
+    Weights don't change inside a forward pass; running `quant_W_*` per
+    step costs 6 × seq_len pointless module calls.
+
+    `Wi_cat`/`Wh_cat`/`bi_cat`/`bh_cat` are populated when the cell uses
+    `gate_layout="fused"`; the per-step path then runs two large GEMMs
+    instead of six small ones. Concat is along axis 0 (the per-channel
+    axis), so per-channel/per-group weight quant scales survive intact.
+    """
+
+    Wir: torch.Tensor
+    Wiz: torch.Tensor
+    Win: torch.Tensor
+    Whr: torch.Tensor
+    Whz: torch.Tensor
+    Whn: torch.Tensor
+    Wi_cat: torch.Tensor | None = None
+    Wh_cat: torch.Tensor | None = None
+    bi_cat: torch.Tensor | None = None
+    bh_cat: torch.Tensor | None = None
 
 
 class GRUCellQuant(nn.Module):
@@ -67,9 +95,17 @@ class GRUCellQuant(nn.Module):
     ) -> None:
         super().__init__()
         if gate_layout == "fused":
-            # TODO(phase=5): permitted only with per-channel weight quant
-            # (or higher granularity along the channel axis).
-            raise NotImplementedError("fused gate layout — Phase 5")
+            # Fusing concatenates W_ir/W_iz/W_in along axis 0 (output rows).
+            # Per-channel and per-group weight quant along axis 0 survive
+            # because each row keeps its own scale. Per-tensor weight quant
+            # would silently share one scale across all three gate matrices,
+            # which is exactly the regime SCOPE.md §4 says to avoid.
+            if recipe.weight.axis != 0:
+                raise ValueError(
+                    "fused gate layout requires recipe.weight.axis=0; "
+                    f"got axis={recipe.weight.axis}. Per-tensor weight quant "
+                    "is not supported with fused gates."
+                )
 
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -133,14 +169,39 @@ class GRUCellQuant(nn.Module):
 
     # ------------------------------------------------------------------
 
-    def forward(
-        self, x: torch.Tensor, h: torch.Tensor
+    def quantize_weights(self) -> CellWeights:
+        """Run all six weight quantizers once and return the result.
+
+        Hoist this out of the per-step loop in multi-step layers — weights
+        are constant across time, so per-step re-quantization is wasted.
+        For fused gate layout, also concatenate the three input/hidden
+        weights and biases once so the per-step path can issue two big
+        GEMMs instead of six small ones.
+        """
+        Wir = self.quant_W_ir(self.W_ir)
+        Wiz = self.quant_W_iz(self.W_iz)
+        Win = self.quant_W_in(self.W_in)
+        Whr = self.quant_W_hr(self.W_hr)
+        Whz = self.quant_W_hz(self.W_hz)
+        Whn = self.quant_W_hn(self.W_hn)
+        cw = CellWeights(Wir, Wiz, Win, Whr, Whz, Whn)
+        if self.gate_layout == "fused":
+            cw.Wi_cat = torch.cat([Wir, Wiz, Win], dim=0)
+            cw.Wh_cat = torch.cat([Whr, Whz, Whn], dim=0)
+            if self.b_ir is not None:
+                cw.bi_cat = torch.cat([self.b_ir, self.b_iz, self.b_in])
+                cw.bh_cat = torch.cat([self.b_hr, self.b_hz, self.b_hn])
+        return cw
+
+    def step(
+        self, x: torch.Tensor, h: torch.Tensor, w: CellWeights
     ) -> torch.Tensor:
-        """One step.
+        """One step with pre-quantized weights.
 
         Args:
             x: [batch, input_size]
             h: [batch, hidden_size]
+            w: weights already passed through their FakeQuantize modules.
         Returns:
             h_new: [batch, hidden_size]
         """
@@ -148,30 +209,31 @@ class GRUCellQuant(nn.Module):
         xq = self.quant_x(x)
         hq = self.quant_h_in(h)
 
-        # ---- 2. Quantize weights ----
-        Wir = self.quant_W_ir(self.W_ir)
-        Wiz = self.quant_W_iz(self.W_iz)
-        Win = self.quant_W_in(self.W_in)
-        Whr = self.quant_W_hr(self.W_hr)
-        Whz = self.quant_W_hz(self.W_hz)
-        Whn = self.quant_W_hn(self.W_hn)
-
-        # ---- 3. Gate pre-activations (in float; bias unquantized) ----
-        # F.linear computes x @ W.T + b. Each linear is a "matmul" in the
-        # eventual int kernel; the granularity / dtype / accumulator type
-        # are decided by the weight quantizer's config.
-        gate_r = F.linear(xq, Wir, self.b_ir) + F.linear(hq, Whr, self.b_hr)
-        gate_z = F.linear(xq, Wiz, self.b_iz) + F.linear(hq, Whz, self.b_hz)
-
-        # n-gate: NOTE the asymmetry — r_t scales only the hidden branch.
-        n_input_branch = F.linear(xq, Win, self.b_in)
-        n_hidden_branch = F.linear(hq, Whn, self.b_hn)
+        # ---- 2. Gate pre-activations (in float; bias unquantized) ----
+        # F.linear computes x @ W.T + b. Fused layout stacks the three
+        # gate matrices along axis 0 and runs one GEMM per branch.
+        if self.gate_layout == "fused":
+            assert w.Wi_cat is not None and w.Wh_cat is not None
+            gi = F.linear(xq, w.Wi_cat, w.bi_cat)
+            gh = F.linear(hq, w.Wh_cat, w.bh_cat)
+            gi_r, gi_z, gi_n = gi.chunk(3, dim=-1)
+            gh_r, gh_z, gh_n = gh.chunk(3, dim=-1)
+            gate_r = gi_r + gh_r
+            gate_z = gi_z + gh_z
+            n_input_branch = gi_n
+            n_hidden_branch = gh_n
+        else:
+            gate_r = F.linear(xq, w.Wir, self.b_ir) + F.linear(hq, w.Whr, self.b_hr)
+            gate_z = F.linear(xq, w.Wiz, self.b_iz) + F.linear(hq, w.Whz, self.b_hz)
+            # n-gate: NOTE the asymmetry — r_t scales only the hidden branch.
+            n_input_branch = F.linear(xq, w.Win, self.b_in)
+            n_hidden_branch = F.linear(hq, w.Whn, self.b_hn)
 
         # Optional fake-quant on gate pre-activations (Phase 3 toggle).
         gate_r = self.quant_gate_r(gate_r)
         gate_z = self.quant_gate_z(gate_z)
 
-        # ---- 4. Nonlinearities (fp32) ----
+        # ---- 3. Nonlinearities (fp32) ----
         r = torch.sigmoid(gate_r)
         z = torch.sigmoid(gate_z)
 
@@ -180,15 +242,79 @@ class GRUCellQuant(nn.Module):
         gate_n = self.quant_gate_n(gate_n)
         n = torch.tanh(gate_n)
 
-        # ---- 5. Hidden update ----
+        # ---- 4. Hidden update ----
         h_new = (1.0 - z) * n + z * h
         # Note: we use unquantized h on the carry side so the fp32 path is
         # bit-identical to nn.GRUCell when all quantizers are Identity.
         # The "stored" h_new is the quantized one — see GRULayer.
 
-        # ---- 6. Quantize on the write side (so next step reads quant) ----
-        h_out = self.quant_h_out(h_new)
-        return h_out
+        # ---- 5. Quantize on the write side (so next step reads quant) ----
+        return self.quant_h_out(h_new)
+
+    def input_projection(
+        self, x_seq: torch.Tensor, w: CellWeights
+    ) -> torch.Tensor:
+        """Pre-compute x @ W_i + b_i for the whole sequence in one GEMM.
+
+        Args:
+            x_seq: [T, B, input_size]
+            w: must have `Wi_cat` populated (fused gate layout).
+        Returns:
+            gi: [T, B, 3 * hidden_size] with bias added; chunk along the
+                last dim per step into (r, z, n) slices.
+
+        Side effect for activation quant: `quant_x` runs once on the full
+        `[T, B, in]` tensor instead of per-step on `[B, in]`. For per-tensor
+        dynamic mode this means *one* scale across the whole sequence —
+        closer to the eventual frozen-inference kernel's behaviour, and
+        a meaningful behaviour change vs. the per-step path. Per-channel
+        activation quant on a non-time axis is unaffected.
+        """
+        if self.gate_layout != "fused":
+            raise RuntimeError(
+                "input_projection requires gate_layout='fused'"
+            )
+        assert w.Wi_cat is not None
+        xq = self.quant_x(x_seq)
+        return F.linear(xq, w.Wi_cat, w.bi_cat)
+
+    def step_with_gi(
+        self,
+        gi_t: torch.Tensor,
+        h: torch.Tensor,
+        w: CellWeights,
+    ) -> torch.Tensor:
+        """One step using a pre-computed input projection.
+
+        Args:
+            gi_t: [B, 3*hidden_size] — output of input_projection at time t.
+            h:    [B, hidden_size]
+            w:    pre-quantized weights (fused layout).
+        """
+        assert self.gate_layout == "fused"
+        assert w.Wh_cat is not None
+        hq = self.quant_h_in(h)
+        gh = F.linear(hq, w.Wh_cat, w.bh_cat)
+        gi_r, gi_z, gi_n = gi_t.chunk(3, dim=-1)
+        gh_r, gh_z, gh_n = gh.chunk(3, dim=-1)
+        gate_r = self.quant_gate_r(gi_r + gh_r)
+        gate_z = self.quant_gate_z(gi_z + gh_z)
+        r = torch.sigmoid(gate_r)
+        z = torch.sigmoid(gate_z)
+        gate_n = self.quant_gate_n(gi_n + r * gh_n)
+        n = torch.tanh(gate_n)
+        h_new = (1.0 - z) * n + z * h
+        return self.quant_h_out(h_new)
+
+    def forward(
+        self, x: torch.Tensor, h: torch.Tensor
+    ) -> torch.Tensor:
+        """One step. Convenience wrapper that quantizes weights inline.
+
+        Multi-step callers should use `quantize_weights()` + `step()` to
+        avoid re-quantizing weights on every timestep.
+        """
+        return self.step(x, h, self.quantize_weights())
 
     # ------------------------------------------------------------------
     # Construction helpers

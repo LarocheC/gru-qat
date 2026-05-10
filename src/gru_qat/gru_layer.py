@@ -20,7 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from gru_qat.gru_cell import GRUCellQuant
+from gru_qat.gru_cell import GateLayout, GRUCellQuant
 from gru_qat.quantizers import QuantRecipe
 
 
@@ -32,11 +32,38 @@ class GRULayer(nn.Module):
         recipe: QuantRecipe,
         *,
         batch_first: bool = False,
+        gate_layout: GateLayout = "split",
+        compile_step: bool = False,
+        pre_batch_input: bool = False,
     ) -> None:
         super().__init__()
-        self.cell = GRUCellQuant(input_size, hidden_size, recipe)
+        if pre_batch_input and gate_layout != "fused":
+            raise ValueError(
+                "pre_batch_input=True requires gate_layout='fused'"
+            )
+        self.cell = GRUCellQuant(
+            input_size, hidden_size, recipe, gate_layout=gate_layout
+        )
         self.hidden_size = hidden_size
         self.batch_first = batch_first
+        self.pre_batch_input = pre_batch_input
+        # When compile_step is True, wrap the per-step body in torch.compile
+        # so Inductor fuses the elementwise ops (sigmoid/tanh/mul/add) with
+        # the matmul epilogue. Static shapes only — bind one specialization
+        # per (batch, hidden) seen.
+        #
+        # We deliberately do NOT use mode="reduce-overhead": that enables
+        # CUDA Graphs which captures input/output buffers statically, but
+        # the GRU loop feeds the previous step's output back as the next
+        # step's input — the graph then overwrites a tensor that the next
+        # invocation is still holding a pointer to. Plain "default" gets
+        # the kernel fusion win without the graph-capture footgun.
+        body = self.cell.step_with_gi if pre_batch_input else self.cell.step
+        self._compiled_step = (
+            torch.compile(body, mode="default", dynamic=False)
+            if compile_step
+            else body
+        )
 
     def forward(
         self,
@@ -61,11 +88,26 @@ class GRULayer(nn.Module):
         if h0 is None:
             h0 = x.new_zeros(batch_size, self.hidden_size)
 
+        # Hoist weight quantization out of the time loop — weights are
+        # invariant across timesteps, so calling the six FakeQuantize
+        # modules per step is wasted work (it dominates int8 training cost).
+        w = self.cell.quantize_weights()
+
         h = h0
         outputs: list[torch.Tensor] = []
-        for t in range(seq_len):
-            h = self.cell(x[t], h)
-            outputs.append(h)
+        step = self._compiled_step
+        if self.pre_batch_input:
+            # Run x @ W_i + b_i once over the whole sequence so the per-step
+            # body only does the hidden-projection GEMM. Big win at large
+            # T where the input GEMM is no longer launch-bound.
+            gi = self.cell.input_projection(x, w)  # [T, B, 3*hidden]
+            for t in range(seq_len):
+                h = step(gi[t], h, w)
+                outputs.append(h)
+        else:
+            for t in range(seq_len):
+                h = step(x[t], h, w)
+                outputs.append(h)
 
         out = torch.stack(outputs, dim=0)
         if self.batch_first:
