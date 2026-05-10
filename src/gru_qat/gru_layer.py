@@ -84,25 +84,31 @@ class GRULayer(nn.Module):
             )
         self.pre_batch_input = pre_batch_input
 
-        # Triton-Monarch dispatch eligibility: only when input side is
-        # dense AND hidden side is structured-Monarch. Other structured
-        # kinds (Circulant / Butterfly / LDR) don't have a Triton kernel.
-        # Also gate_layout must be 'fused' so the input projection
-        # produces a [T, B, 3H] tensor compatible with gru_scan_monarch.
-        self._monarch_triton_eligible = (
+        # Fast-path dispatch eligibility: input must be dense, gate
+        # layout must be 'fused' (so the input projection produces a
+        # [T, B, 3H] tensor), and the hidden side must be either:
+        # - "monarch": uses the persistent Triton kernel (real speedup).
+        # - "butterfly": uses a Python time loop calling
+        #   torch_structured.butterfly_multiply per step (API parity,
+        #   no multi-step Triton fusion). The flag is named ``use_triton``
+        #   for symmetry with the monarch path even though butterfly
+        #   doesn't actually use a Triton kernel.
+        kind = structure_hidden.kind if structure_hidden is not None else None
+        self._fast_dispatch_eligible = (
             structure_input is None
-            and structure_hidden is not None
-            and structure_hidden.kind == "monarch"
+            and kind in ("monarch", "butterfly")
             and gate_layout == "fused"
         )
+        self._dispatch_kind: str | None = kind if self._fast_dispatch_eligible else None
         if use_triton == "auto":
-            self.use_triton = self._monarch_triton_eligible
+            self.use_triton = self._fast_dispatch_eligible
         else:
             self.use_triton = bool(use_triton)
-            if self.use_triton and not self._monarch_triton_eligible:
+            if self.use_triton and not self._fast_dispatch_eligible:
                 raise ValueError(
                     "use_triton=True requires structure_input=None, "
-                    "structure_hidden.kind='monarch', and gate_layout='fused'."
+                    "structure_hidden.kind in {'monarch', 'butterfly'}, "
+                    "and gate_layout='fused'."
                 )
         # When compile_step is True, wrap the per-step body in torch.compile
         # so Inductor fuses the elementwise ops (sigmoid/tanh/mul/add) with
@@ -150,9 +156,13 @@ class GRULayer(nn.Module):
         if h0 is None:
             h0 = x.new_zeros(batch_size, self.hidden_size)
 
-        # Fast path: structured-Monarch hidden + dense input + Triton enabled.
+        # Fast path: structured hidden (monarch or butterfly) + dense
+        # input + dispatch enabled. Monarch goes through the persistent
+        # Triton kernel; butterfly goes through a Python time loop with
+        # torch_structured's butterfly_multiply CUDA op (API parity, not
+        # a Triton kernel).
         if self.use_triton and x.is_cuda:
-            return self._forward_triton_monarch(x, h0)
+            return self._forward_fast_dispatch(x, h0)
 
         h = h0
         outputs: list[torch.Tensor] = []
@@ -186,38 +196,49 @@ class GRULayer(nn.Module):
             out = out.transpose(0, 1)
         return out, h
 
-    def _forward_triton_monarch(
+    def _forward_fast_dispatch(
         self, x: torch.Tensor, h0: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Triton dispatch for structured-Monarch hidden + dense input.
+        """Dispatch for structured-hidden + dense-input fast paths.
 
-        Builds gi from the dense input projection, extracts Monarch
-        factors from the hidden side, pulls h_in/h_out quant params if
-        the hidden quantizers are frozen, and routes through
-        ``gru_scan_monarch``. Returns ``(outputs, h_T)`` shaped to match
-        the per-step path (with ``batch_first`` flip if requested).
+        Both monarch and butterfly share the input projection setup
+        (xq via quant_x, then F.linear with the dense input weights)
+        and the QAT param extraction. They differ only in the scan
+        backend used for the hidden recurrence.
         """
-        # Imported lazily so importing GRULayer doesn't pay the Triton
-        # import cost on systems without CUDA.
-        from gru_qat.triton_kernels.scan_monarch import (
-            extract_monarch_factors,
-            gru_scan_monarch,
-        )
-
-        # Quantize the input: quant_x runs once on the full sequence
-        # (per-tensor static or dynamic-mode same as the per-step path).
+        # Quantize the input: quant_x runs once on the full sequence.
         xq = self.cell.quant_x(x)
         Wi_cat, bi_cat = self.cell.quantize_input_weights()
         gi = nn.functional.linear(xq, Wi_cat, bi_cat)  # [T, B, 3*hidden]
 
-        Wh_struct, bh_cat = extract_monarch_factors(self.cell)
         h_in_q = _extract_h_quant_params(self.cell.quant_h_in)
         h_out_q = _extract_h_quant_params(self.cell.quant_h_out)
 
-        out = gru_scan_monarch(
-            gi, h0, Wh_struct, bh_cat,
-            h_in_quant=h_in_q, h_out_quant=h_out_q,
-        )
+        if self._dispatch_kind == "monarch":
+            from gru_qat.triton_kernels.scan_monarch import (
+                extract_monarch_factors,
+                gru_scan_monarch,
+            )
+            Wh_struct, bh_cat = extract_monarch_factors(self.cell)
+            out = gru_scan_monarch(
+                gi, h0, Wh_struct, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+        elif self._dispatch_kind == "butterfly":
+            from gru_qat.triton_kernels.scan_butterfly import (
+                extract_butterfly_factors,
+                gru_scan_butterfly,
+            )
+            modules, bh_cat = extract_butterfly_factors(self.cell)
+            out = gru_scan_butterfly(
+                gi, h0, modules, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+        else:
+            raise RuntimeError(
+                f"unexpected dispatch kind {self._dispatch_kind!r}"
+            )
+
         h_T = out[-1]  # [B, H] — capture before any batch_first flip.
         if self.batch_first:
             out = out.transpose(0, 1)
@@ -241,12 +262,24 @@ class GRULayer(nn.Module):
         runs ``n_batches`` forward passes from ``loader``, and returns a
         stats summary. Does not auto-freeze — call ``self.freeze()`` once
         you're happy with the calibration.
+
+        Temporarily disables ``use_triton`` so the per-step path runs
+        and ``cell.quant_h_in`` / ``quant_h_out`` actually fire — the
+        fast dispatch reads scales directly from those quantizers
+        instead of calling them, which means their observers don't
+        update. Subsequent forwards (after freeze()) will go back
+        through the fast dispatch.
         """
-        from gru_qat.calibration import calibrate as _calibrate
-        return _calibrate(
-            self, loader, n_batches=n_batches,
-            only_activations=only_activations,
-        )
+        saved_use_triton = self.use_triton
+        self.use_triton = False
+        try:
+            from gru_qat.calibration import calibrate as _calibrate
+            return _calibrate(
+                self, loader, n_batches=n_batches,
+                only_activations=only_activations,
+            )
+        finally:
+            self.use_triton = saved_use_triton
 
     def freeze(self) -> None:
         self.cell.freeze_quantizers()
