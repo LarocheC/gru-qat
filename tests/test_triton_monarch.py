@@ -22,6 +22,12 @@ from gru_qat.triton_kernels.scan_monarch import (  # noqa: E402
     extract_monarch_factors,
     gru_scan_monarch_backward_pytorch,
     gru_scan_monarch_forward_pytorch,
+    gru_scan_monarch_forward_triton,
+)
+
+
+cuda_only = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
 )
 
 
@@ -92,6 +98,32 @@ def test_monarch_pytorch_forward_matches_cell(
     max_diff = (ref_out - mon_out).abs().max().item()
     rel = max_diff / max(ref_out.abs().max().item(), 1e-6)
     assert rel < 1e-5, f"forward rel diff {rel:.4e}"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H,nblocks", [(8, 32, 64, 4), (16, 32, 256, 4)])
+def test_monarch_triton_forward_matches_pytorch(
+    T: int, B: int, H: int, nblocks: int
+) -> None:
+    """Triton forward kernel must match the PyTorch monarch reference
+    within TF32 noise."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    gi = (torch.randn(T, B, 3 * H, device=device) * 0.5).contiguous()
+    h0 = (torch.randn(B, H, device=device) * 0.5).contiguous()
+    blksz = H // nblocks
+    Wh_struct = (torch.randn(3, nblocks, blksz, blksz, device=device) * 0.1).contiguous()
+    bh_cat = (torch.randn(3 * H, device=device) * 0.1).contiguous()
+
+    ref = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+    tri = gru_scan_monarch_forward_triton(gi, h0, Wh_struct, bh_cat)
+
+    max_diff = (ref - tri).abs().max().item()
+    rel = max_diff / max(ref.abs().max().item(), 1e-6)
+    # TF32 matmul + T-step compounding.
+    assert rel < 5e-3, f"forward rel diff {rel:.4e}"
 
 
 @pytest.mark.parametrize("T,B,H,nblocks", [(8, 4, 32, 4), (16, 8, 64, 4)])
