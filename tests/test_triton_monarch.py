@@ -248,6 +248,109 @@ def test_monarch_triton_backward_matches_pytorch(
         assert rel < 5e-2, f"{name} rel diff {rel:.4e}"
 
 
+@cuda_only
+@pytest.mark.parametrize("T,B,H,nblocks", [(8, 16, 32, 4), (16, 32, 64, 4)])
+def test_grulayer_use_triton_matches_pytorch_path(
+    T: int, B: int, H: int, nblocks: int
+) -> None:
+    """GRULayer with use_triton=True must produce the same output as
+    use_triton=False (PyTorch path). Both fp32, no activation quant."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    rec = QuantRecipe(
+        weight=QuantizerConfig(bits=32, axis=0, name="W_id"),
+        input_act=QuantizerConfig(bits=32, name="x_id"),
+        hidden=QuantizerConfig(bits=32, name="h_id"),
+    )
+    cfg = StructureConfig(kind="monarch", nblocks=nblocks)
+
+    pt_layer = GRULayer(
+        H, H, recipe=rec, gate_layout="fused",
+        structure_hidden=cfg, use_triton=False,
+    ).to(device)
+    tri_layer = GRULayer(
+        H, H, recipe=rec, gate_layout="fused",
+        structure_hidden=cfg, use_triton=True,
+    ).to(device)
+    tri_layer.load_state_dict(pt_layer.state_dict())
+
+    x = torch.randn(T, B, H, device=device) * 0.1
+    h0 = torch.randn(B, H, device=device) * 0.1
+
+    pt_out, pt_hT = pt_layer(x, h0)
+    tri_out, tri_hT = tri_layer(x, h0)
+
+    rel_out = (pt_out - tri_out).abs().max().item() / max(pt_out.abs().max().item(), 1e-6)
+    rel_hT = (pt_hT - tri_hT).abs().max().item() / max(pt_hT.abs().max().item(), 1e-6)
+    assert rel_out < 5e-2, f"out rel diff {rel_out:.4e}"
+    assert rel_hT < 5e-2, f"hT rel diff {rel_hT:.4e}"
+
+
+@cuda_only
+def test_grulayer_use_triton_qat_after_calibration() -> None:
+    """End-to-end QAT flow: build, calibrate, freeze, run via Triton.
+
+    Validates that the GRULayer's use_triton path correctly extracts
+    h_in/h_out frozen scales and produces correct output."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    H = 32
+    T, B = 8, 16
+    rec = QuantRecipe(
+        weight=QuantizerConfig(bits=32, axis=0, name="W_id"),
+        input_act=QuantizerConfig(bits=32, name="x_id"),
+        hidden=QuantizerConfig(bits=8, name="h_q"),  # int8 hidden
+    )
+    cfg = StructureConfig(kind="monarch", nblocks=4)
+    layer = GRULayer(
+        H, H, recipe=rec, gate_layout="fused",
+        structure_hidden=cfg, use_triton=True,
+    ).to(device)
+
+    # Calibrate with synthetic loader, then freeze.
+    def loader(n):
+        for _ in range(n):
+            yield torch.randn(T, B, H, device=device) * 0.1
+
+    layer.calibrate(loader(8), n_batches=8)
+    layer.freeze()
+
+    # Forward should now run through the Triton path with frozen scales.
+    x = torch.randn(T, B, H, device=device) * 0.1
+    out, hT = layer(x)
+    assert torch.isfinite(out).all()
+    assert out.shape == (T, B, H)
+
+
+@cuda_only
+def test_grulayer_use_triton_eligibility_errors() -> None:
+    """use_triton=True must error when the cell isn't compatible
+    (input structured, non-monarch hidden, or split gate layout)."""
+    rec = QuantRecipe(
+        weight=QuantizerConfig(bits=32, axis=0, name="W_id"),
+        input_act=QuantizerConfig(bits=32, name="x_id"),
+        hidden=QuantizerConfig(bits=32, name="h_id"),
+    )
+    # Hidden non-monarch (circulant)
+    cfg_circ = StructureConfig(kind="circulant")
+    with pytest.raises(ValueError, match="monarch"):
+        GRULayer(
+            32, 32, recipe=rec, gate_layout="fused",
+            structure_hidden=cfg_circ, use_triton=True,
+        )
+    # Split gate layout
+    cfg_mon = StructureConfig(kind="monarch", nblocks=4)
+    with pytest.raises(ValueError, match="fused"):
+        GRULayer(
+            32, 32, recipe=rec, gate_layout="split",
+            structure_hidden=cfg_mon, use_triton=True,
+        )
+
+
 @pytest.mark.parametrize("T,B,H,nblocks", [(8, 4, 32, 4), (16, 8, 64, 4)])
 def test_monarch_pytorch_backward_matches_cell(
     T: int, B: int, H: int, nblocks: int

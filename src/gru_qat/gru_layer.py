@@ -21,8 +21,29 @@ import torch
 import torch.nn as nn
 
 from gru_qat.gru_cell import GateLayout, GRUCellQuant
-from gru_qat.quantizers import QuantRecipe
+from gru_qat.quantizers import FakeQuantize, FakeQuantizePerTensor, QuantRecipe
 from gru_qat.structure import StructureConfig
+
+
+def _extract_h_quant_params(
+    quantizer: FakeQuantize,
+) -> tuple[float, int, int] | None:
+    """Pull (scale, qmin, qmax) from a frozen per-tensor symmetric quantizer.
+
+    Returns None if the quantizer isn't in a state the Triton-Monarch
+    path can consume:
+    - mode != "frozen" (scales aren't stable)
+    - per-channel/per-group (kernel is per-tensor only)
+    - asymmetric (zero_point != 0)
+    Caller should treat None as "no in-kernel fake-quant".
+    """
+    if quantizer.config.mode != "frozen":
+        return None
+    if not isinstance(quantizer, FakeQuantizePerTensor):
+        return None
+    if not quantizer.config.symmetric:
+        return None
+    return (float(quantizer.scale.item()), int(quantizer.qmin), int(quantizer.qmax))
 
 
 class GRULayer(nn.Module):
@@ -38,6 +59,7 @@ class GRULayer(nn.Module):
         pre_batch_input: bool = False,
         structure_input: StructureConfig | None = None,
         structure_hidden: StructureConfig | None = None,
+        use_triton: bool | str = "auto",
     ) -> None:
         super().__init__()
         if pre_batch_input and gate_layout != "fused":
@@ -61,6 +83,27 @@ class GRULayer(nn.Module):
                 "(no dense Wi_cat to pre-project)."
             )
         self.pre_batch_input = pre_batch_input
+
+        # Triton-Monarch dispatch eligibility: only when input side is
+        # dense AND hidden side is structured-Monarch. Other structured
+        # kinds (Circulant / Butterfly / LDR) don't have a Triton kernel.
+        # Also gate_layout must be 'fused' so the input projection
+        # produces a [T, B, 3H] tensor compatible with gru_scan_monarch.
+        self._monarch_triton_eligible = (
+            structure_input is None
+            and structure_hidden is not None
+            and structure_hidden.kind == "monarch"
+            and gate_layout == "fused"
+        )
+        if use_triton == "auto":
+            self.use_triton = self._monarch_triton_eligible
+        else:
+            self.use_triton = bool(use_triton)
+            if self.use_triton and not self._monarch_triton_eligible:
+                raise ValueError(
+                    "use_triton=True requires structure_input=None, "
+                    "structure_hidden.kind='monarch', and gate_layout='fused'."
+                )
         # When compile_step is True, wrap the per-step body in torch.compile
         # so Inductor fuses the elementwise ops (sigmoid/tanh/mul/add) with
         # the matmul epilogue. Static shapes only — bind one specialization
@@ -107,6 +150,10 @@ class GRULayer(nn.Module):
         if h0 is None:
             h0 = x.new_zeros(batch_size, self.hidden_size)
 
+        # Fast path: structured-Monarch hidden + dense input + Triton enabled.
+        if self.use_triton and x.is_cuda:
+            return self._forward_triton_monarch(x, h0)
+
         h = h0
         outputs: list[torch.Tensor] = []
         step = self._compiled_step
@@ -139,22 +186,67 @@ class GRULayer(nn.Module):
             out = out.transpose(0, 1)
         return out, h
 
+    def _forward_triton_monarch(
+        self, x: torch.Tensor, h0: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Triton dispatch for structured-Monarch hidden + dense input.
+
+        Builds gi from the dense input projection, extracts Monarch
+        factors from the hidden side, pulls h_in/h_out quant params if
+        the hidden quantizers are frozen, and routes through
+        ``gru_scan_monarch``. Returns ``(outputs, h_T)`` shaped to match
+        the per-step path (with ``batch_first`` flip if requested).
+        """
+        # Imported lazily so importing GRULayer doesn't pay the Triton
+        # import cost on systems without CUDA.
+        from gru_qat.triton_kernels.scan_monarch import (
+            extract_monarch_factors,
+            gru_scan_monarch,
+        )
+
+        # Quantize the input: quant_x runs once on the full sequence
+        # (per-tensor static or dynamic-mode same as the per-step path).
+        xq = self.cell.quant_x(x)
+        Wi_cat, bi_cat = self.cell.quantize_input_weights()
+        gi = nn.functional.linear(xq, Wi_cat, bi_cat)  # [T, B, 3*hidden]
+
+        Wh_struct, bh_cat = extract_monarch_factors(self.cell)
+        h_in_q = _extract_h_quant_params(self.cell.quant_h_in)
+        h_out_q = _extract_h_quant_params(self.cell.quant_h_out)
+
+        out = gru_scan_monarch(
+            gi, h0, Wh_struct, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        h_T = out[-1]  # [B, H] — capture before any batch_first flip.
+        if self.batch_first:
+            out = out.transpose(0, 1)
+        return out, h_T
+
     # ------------------------------------------------------------------
     # Calibration / freezing
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def calibrate(self, loader: object) -> None:
-        """Run forward passes in min_max observer mode to gather stats.
+    def calibrate(
+        self,
+        loader,
+        n_batches: int = 64,
+        *,
+        only_activations: bool = True,
+    ):
+        """Convenience wrapper around ``gru_qat.calibration.calibrate``.
 
-        Caller must set the recipe's mode to "min_max" before constructing
-        the layer (or set it on each quantizer manually). After calibrate(),
-        call freeze() to fix the scales for inference.
-
-        TODO(phase=4): take a real DataLoader, run N batches, return stats
-        summary. For now this is a stub.
+        Switches activation-side quantizers to ``min_max`` observer mode,
+        runs ``n_batches`` forward passes from ``loader``, and returns a
+        stats summary. Does not auto-freeze — call ``self.freeze()`` once
+        you're happy with the calibration.
         """
-        raise NotImplementedError("phase=4")
+        from gru_qat.calibration import calibrate as _calibrate
+        return _calibrate(
+            self, loader, n_batches=n_batches,
+            only_activations=only_activations,
+        )
 
     def freeze(self) -> None:
         self.cell.freeze_quantizers()

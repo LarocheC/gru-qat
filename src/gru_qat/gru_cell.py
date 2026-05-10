@@ -271,6 +271,34 @@ class GRUCellQuant(nn.Module):
                 cw.bh_cat = torch.cat([self.b_hr, self.b_hz, self.b_hn])
         return cw
 
+    def quantize_input_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Quantize the dense input-side weights and return concat'd
+        ``(Wi_cat, bi_cat)`` ready for a single F.linear over the whole
+        sequence. Used by the GRULayer Triton-Monarch dispatch path —
+        input side is dense, hidden side is structured.
+
+        Raises if the input side is structured (no single dense weight to
+        concat).
+        """
+        if not self._input_dense:
+            raise RuntimeError(
+                "quantize_input_weights() requires dense input side; "
+                "cell has structured input."
+            )
+        Wi_cat = torch.cat(
+            [
+                self.quant_W_ir(self.W_ir),
+                self.quant_W_iz(self.W_iz),
+                self.quant_W_in(self.W_in),
+            ],
+            dim=0,
+        )
+        if self.b_ir is None:
+            bi_cat: torch.Tensor | None = None
+        else:
+            bi_cat = torch.cat([self.b_ir, self.b_iz, self.b_in])
+        return Wi_cat, bi_cat
+
     def step_structured(
         self, x: torch.Tensor, h: torch.Tensor
     ) -> torch.Tensor:
