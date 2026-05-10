@@ -1,31 +1,160 @@
 # gru-qat
 
-Pluggable QAT and quantized inference for GRU.
+Pluggable QAT and quantized inference for GRU, with structured-matrix
+hidden weights and a multi-step persistent Triton kernel.
 
-- **Why**: cuDNN's GRU is a closed kernel; we cannot insert fake-quant. To
-  do QAT with arbitrary quantization granularities (per-channel, per-group,
-  fine-grained int4) we own the cell.
-- **What**: a manually-unrolled GRU cell where every quantizable quantity
-  is a `FakeQuantize` module that can be swapped without touching the cell
-  code. Reference path is pure PyTorch; accelerated path is Triton (Phase 5).
+- **Why**: cuDNN's GRU is a closed kernel; we cannot insert fake-quant.
+  To do QAT with arbitrary quantization granularities (per-channel,
+  per-group, fine-grained int4) we own the cell.
+- **What**: a manually-unrolled GRU cell where every quantizable
+  quantity is a `FakeQuantize` module that can be swapped without
+  touching the cell code. Reference path is pure PyTorch; accelerated
+  path is Triton.
+- **Plus**: hidden weights can be parameterized as Monarch
+  (block-diagonal), Butterfly (`O(H log H)` twiddle), Circulant, or
+  LDR (low-displacement rank) structured matrices, with matching
+  Triton kernels for Monarch and Butterfly.
 
 ## Read first
 
-1. [`SCOPE.md`](./SCOPE.md) — what's in, what's out, key design decisions.
-2. [`DEVELOPMENT.md`](./DEVELOPMENT.md) — phased plan, file map, tests,
-   upgrade pathways. Read this before writing code.
+1. [`SCOPE.md`](./SCOPE.md) — what's in, what's out, key design
+   decisions.
+2. [`DEVELOPMENT.md`](./DEVELOPMENT.md) — file map, phase status,
+   bench numbers, upgrade pathways.
 
 ## Quick start
 
 ```bash
 uv sync
-pytest tests/test_ste.py tests/test_quantizers.py    # Phase 1
-pytest tests/test_parity.py                          # Phase 2
-pytest tests/test_qat_smoke.py                       # Phase 3+4
+uv pip install -e ".[dev]"   # optional: tests, mypy, ruff
+pytest -q
+```
+
+For structured-matrix support, also install
+[`torch-structured`](https://github.com/LarocheC/torch-structured):
+
+```bash
+uv pip install git+https://github.com/LarocheC/torch-structured
+```
+
+### Dense QAT layer
+
+```python
+import torch
+from gru_qat import GRULayer, PRESETS
+
+layer = GRULayer(
+    input_size=512, hidden_size=512,
+    recipe=PRESETS["int8_per_channel"],
+    gate_layout="fused",
+    pre_batch_input=True,        # one big GEMM for x @ W_i across T
+    compile_step=True,           # torch.compile fuses the elementwise body
+).cuda()
+out, h_T = layer(x, h0)
+```
+
+### Triton-accelerated dense (persistent kernel)
+
+```python
+from gru_qat.triton_kernels.scan import gru_scan_persistent
+
+# Inside training loop:
+w = layer.cell.quantize_weights()
+gi = layer.cell.input_projection(x, w)
+out = gru_scan_persistent(gi, h0, w.Wh_cat, w.bh_cat)
+```
+
+### Structured hidden weights with Triton (Monarch — fastest)
+
+```python
+from gru_qat import GRULayer, QuantRecipe, QuantizerConfig, StructureConfig
+
+layer = GRULayer(
+    input_size=512, hidden_size=512,
+    recipe=QuantRecipe(
+        weight=QuantizerConfig(bits=32, axis=0, name="W_id"),
+        input_act=QuantizerConfig(bits=32, name="x_id"),
+        hidden=QuantizerConfig(bits=8, name="h_q"),       # int8 hidden quant
+    ),
+    gate_layout="fused",
+    structure_hidden=StructureConfig(kind="monarch", nblocks=8),
+    use_triton="auto",   # routes through the persistent monarch kernel
+).cuda()
+
+# QAT flow:
+for x in train_loader:
+    out, _ = layer(x)
+    loss = ...
+    loss.backward()
+
+layer.calibrate(val_loader, n_batches=64)
+layer.freeze()
+out, _ = layer(x)        # now runs through the Triton kernel with frozen scales
+```
+
+### Structured hidden weights — Butterfly (smallest params)
+
+```python
+from gru_qat import GRULayer, StructureConfig
+
+layer = GRULayer(
+    H, H, recipe=...,
+    gate_layout="fused",
+    structure_hidden=StructureConfig(kind="butterfly"),
+    use_triton="auto",
+).cuda()
+# Same calibrate -> freeze -> forward flow.
 ```
 
 ## Status
 
-Skeleton with working contracts and inline TODOs marking each phase.
-Phase 1 and 2 should pass once subclass bodies are completed; Phase 3+4
-require additional wiring described in `DEVELOPMENT.md`.
+All originally-planned phases (0–5) complete. The dense and structured
+paths are feature-complete:
+
+| feature | status |
+|---|---|
+| STE primitives + FakeQuantize variants | ✓ |
+| Dense `GRUCellQuant` parity vs `nn.GRUCell` (`< 1e-5`) | ✓ |
+| Fake-quant insertion in cell (all 6 weight + 3 activation points) | ✓ |
+| `GRULayer` with calibration → freeze flow | ✓ |
+| Triton multi-step persistent kernel (dense, fp32, fp32 + frozen int8 QAT) | ✓ |
+| Structured hidden weights (Monarch / Butterfly / Circulant / LDR) | ✓ |
+| Triton persistent kernel for Monarch (fp32 + QAT) | ✓ |
+| Triton persistent kernel for Butterfly (fp32 + QAT) | ✓ |
+
+100 tests pass, 1 skipped (the simulator-parity placeholder that's
+deferred until the simulator is on `PYTHONPATH`).
+
+## Train-step speed at `(T=64, B=32, H=512)` — fp32
+
+| variant | ms/iter | vs cuDNN |
+|---|---|---|
+| cuDNN `nn.GRU` (dense, no quant) | 4.4 | 1.0× |
+| `GRULayer` dense + `torch.compile` | 38.7 | 8.8× |
+| dense Triton persistent | 8.8 | 1.9× |
+| **Monarch persistent (nblocks=4)** | **5.8** | **1.3×** |
+| **Monarch persistent (nblocks=8)** | **2.0** | **0.45× (2.2× faster)** |
+| Butterfly persistent | 20.3 | 4.6× |
+
+For QAT (frozen int8 hidden), expect ~10–30% overhead on top of the
+fp32 number depending on path.
+
+## Layout
+
+```
+src/gru_qat/
+  __init__.py             public API
+  ste.py                  STE autograd functions
+  quantizers.py           FakeQuantize + observers
+  calibration.py          calibrate(module, loader, n_batches)
+  structure.py            StructureConfig + make_structured_linear
+  gru_cell.py             GRUCellQuant (single step, optionally structured)
+  gru_layer.py            GRULayer (multi-step + Triton dispatch)
+  triton_kernels/
+    scan.py               dense persistent fwd+bwd kernels
+    scan_monarch.py       Monarch persistent fwd+bwd kernels
+    scan_butterfly.py     Butterfly persistent fwd+bwd kernels
+```
+
+See [`DEVELOPMENT.md`](./DEVELOPMENT.md) for the file-by-file design
+and the per-phase commit history.

@@ -1,219 +1,256 @@
-# DEVELOPMENT.md — Agent Handoff
+# DEVELOPMENT.md — File map, phase status, upgrade pathways
 
-This document is for the implementing agent. Read `SCOPE.md` first.
+This document tracks the implementation. Read [`SCOPE.md`](./SCOPE.md)
+first for design rationale.
 
 ## Working agreement
 
 - Environment: `uv` (see `pyproject.toml`). `uv sync` to bootstrap.
-- Strict typing: all public functions annotated; `mypy --strict` on the
-  `gru_qat` package.
-- Strict dtype discipline: never silently upcast. Every fake-quant op
-  preserves input dtype. Every internal float op runs in `torch.float32`
-  unless the caller has explicitly opted into fp16/bf16.
-- Each phase has an exit test in `tests/`. Do not start phase N+1 until
-  phase N tests pass.
-- One PR per phase. Commit message format: `phase N: <verb> <object>`.
+  Optional dev extras: `uv pip install -e ".[dev]"`.
+- `torch-structured` (used by `structure.py` for Monarch / Butterfly /
+  Circulant / LDR) is an optional dependency. Install from source:
+  `uv pip install git+https://github.com/LarocheC/torch-structured`.
+  The lazy import in `structure.py` means dense-only users don't need it.
+- Strict dtype discipline: every fake-quant op preserves input dtype;
+  every internal float op runs in `torch.float32` unless the caller
+  has explicitly opted into fp16/bf16 (autocast). bf16 around fake-quant
+  was tried and dropped — the fp32↔bf16 cast tax around quantize/dequantize
+  boundaries exceeded the GEMM saving at our shapes.
+- Each phase has tests under `tests/`. CI green ⇒ phase landed.
 
 ## File map
 
 ```
 src/gru_qat/
-  __init__.py          public API surface
-  ste.py               Straight-Through Estimator autograd functions
-  quantizers.py        FakeQuantize module + observers
-  calibration.py       observer collection / freezing for inference
-  gru_cell.py          GRUCellQuant — single-step, fully unrolled
-  gru_layer.py         GRULayer — multi-step, hidden-state carry
+  __init__.py             public API surface
+  ste.py                  STE autograd functions (STERound, STEClamp, fake_quant_ste)
+  quantizers.py           FakeQuantize base + per-tensor / per-channel / per-group
+  calibration.py          calibrate(module, loader, n_batches), freeze_all
+  structure.py            StructureConfig + make_structured_linear
+                          (Monarch, Circulant, Butterfly, LDR)
+  gru_cell.py             GRUCellQuant — single step. Optionally structured
+                          (structure_input / structure_hidden).
+  gru_layer.py            GRULayer — multi-step. Triton dispatch via use_triton.
   triton_kernels/
-    __init__.py        (Phase 5) Triton GRU cell
+    __init__.py           Phase 5 design notes
+    scan.py               Dense persistent fwd+bwd kernels (Monarch tier 2 sibling).
+                          Autotune over BLOCK_B/OH/K. In-kernel fake-quant for QAT.
+    scan_monarch.py       Monarch persistent fwd+bwd. nblocks block-diagonal matmuls
+                          per timestep. In-kernel fake-quant for QAT.
+    scan_butterfly.py     Butterfly persistent fwd+bwd. log_H stages of strided
+                          2x2 mixing. In-kernel fake-quant for QAT.
 
 tests/
-  test_ste.py
-  test_quantizers.py
-  test_parity.py            cell parity vs torch.nn.GRUCell at fp32
-  test_simulator_parity.py  fake-quant matches inference simulator
-  test_qat_smoke.py         end-to-end QAT trains on toy task
-  test_triton_parity.py     (Phase 5)
+  test_ste.py                    STE primitives
+  test_quantizers.py             FakeQuantize variants
+  test_parity.py                 Cell parity vs torch.nn.GRUCell at fp32
+  test_qat_smoke.py              End-to-end QAT trains on toy task
+  test_calibration.py            calibrate() round-trip
+  test_structure.py              Structured cells (all 4 kinds): forward,
+                                 gradient flow, training, int8 QAT
+  test_triton_scan.py            Dense Triton fwd+bwd + persistent + QAT
+  test_triton_monarch.py         Monarch Triton fwd+bwd + QAT + GRULayer dispatch
+  test_butterfly_dispatch.py     Butterfly Triton fwd+bwd + QAT + GRULayer dispatch
+
+bench/
+  bench_layer.py                 Dense train-step bench (cudnn / compile / Triton)
+  bench_triton_fwd.py            Forward-only bench across variants
+  bench_triton_train.py          Train-step bench across variants
 ```
 
-## Phased plan
+## Phase status
 
-### Phase 0 — bootstrap (target: 1 hour)
+All originally-planned phases (0–5) are complete, plus a structured-
+matrix track and a calibration plumbing pass.
 
-1. `uv sync` works.
-2. `pytest -q` runs (zero tests pass; many skipped).
-3. CI lint passes.
+### Phase 0 — bootstrap ✓
 
-**Exit test**: `pytest --collect-only` succeeds without import errors.
+- `uv sync` works; `pytest --collect-only` succeeds.
 
-### Phase 1 — STE and quantizer primitives (target: 1 day)
+### Phase 1 — STE and quantizer primitives ✓
 
-Implement `ste.py` and `quantizers.py`. The skeletons in this repo show the
-contracts; fill in the bodies.
+- `ste.py`, `quantizers.py`.
+- Per-tensor sym/asym, per-channel sym (any axis), per-group sym (group
+  size along axis). Bits ∈ {2, 3, 4, 8} supported.
+- Observer modes: `dynamic`, `min_max`, `frozen`.
+- Tests: `test_ste.py`, `test_quantizers.py`.
 
-Required quantizers, all sharing the `FakeQuantize` base:
-- per-tensor symmetric / asymmetric
-- per-channel symmetric (axis configurable)
-- per-group symmetric (group_size along axis)
+**Known gap (carried forward)**: the `min_max` observer's
+`_update_observer` uses a global scalar reduction even when `axis` is
+set, so per-channel observers don't accumulate per-channel running
+stats. Per-channel activation quant with min_max isn't used in the
+fast paths (which are per-tensor + frozen post-calibration), so this
+hasn't blocked anything; fix is a one-method change in
+`quantizers.py` whenever a per-channel activation quant scheme is
+needed.
 
-For each, support `bits ∈ {2, 3, 4, 8}`.
+### Phase 2 — fp32 cell parity ✓
 
-Observer modes:
-- `dynamic` — scale recomputed each forward from current tensor (training)
-- `min_max` — running min/max stats updated during forward
-- `frozen` — uses stored `scale`/`zero_point`, no stats update (inference)
+- `GRUCellQuant.forward()` with Identity quantizers matches
+  `torch.nn.GRUCell` within `< 1e-5` on the parametrized shapes plus
+  edge cases (h=0, x=0, large magnitudes).
+- Tests: `test_parity.py`.
 
-**Exit tests**:
-- `test_quantizers.py::test_roundtrip_no_clip` — values inside qrange
-  reconstruct with error ≤ scale/2.
-- `test_quantizers.py::test_per_channel_independent` — scales per channel
-  differ when input rows have different magnitudes.
-- `test_quantizers.py::test_group_axis` — group_size=K returns ceil(N/K)
-  scales along axis.
-- `test_simulator_parity.py` — bit-identical to existing simulator's
-  `quantize_dequantize()` for matched configs.
+### Phase 3 — fake-quant insertion ✓
 
-### Phase 2 — GRU cell with fp32 parity (target: 1 day)
+- All 6 weight + 3 activation insertion points wired in `gru_cell.py`.
+- Optional gate-preact quantizers (Identity by default; configurable
+  via `recipe.gate_act`).
+- Bias / sigmoid / tanh stay fp32 — see SCOPE non-goals.
+- Tests: `test_qat_smoke.py`.
 
-Implement `GRUCellQuant.forward()` with all quantizers set to `Identity`.
-Validate it matches `torch.nn.GRUCell` exactly.
+### Phase 4 — multi-step layer + calibration ✓
 
-**Exit test**: `test_parity.py::test_cell_matches_torch_gru_cell` — max abs
-diff < 1e-5 over 100 random `(input, hidden, weight)` triples, including
-edge cases (h=0, x=0, large magnitudes).
+- `GRULayer` wraps cell, loops over time. Multiple per-step bodies:
+  - Dense: `cell.step_with_gi(gi_t, h, w)` if `pre_batch_input=True`,
+    else `cell.step(x_t, h, w)`.
+  - Structured: `cell.step_structured(x_t, h)`.
+  - Triton fast path: `_forward_fast_dispatch` when `use_triton=True`.
+- `calibrate(module, loader, n_batches)` switches activation
+  quantizers to `min_max`, runs forwards, returns stats summary.
+  `freeze_all(module)` locks scales for inference.
+- `GRULayer.calibrate(loader, n_batches)` is a thin wrapper that
+  temporarily disables `use_triton` so the per-step path runs and
+  observers actually update.
+- Tests: `test_qat_smoke.py`, `test_calibration.py`.
 
-This phase exists to lock down the unroll math before we layer
-quantization on top. If parity fails here, every later test is meaningless.
+### Phase 5 — Triton kernels ✓
 
-### Phase 3 — fake-quant insertion in the cell (target: 2 days)
+Multiple persistent kernels, all multi-step (one launch per fwd/bwd
+half across all T timesteps):
 
-Replace `Identity` quantizers with real `FakeQuantize` modules. Insertion
-points (mark each with a comment in `gru_cell.py`):
+| kernel | layout | parallelism | notes |
+|---|---|---|---|
+| `scan.py` (dense) | autotune + persistent | grid `(B_tile, OH_tile)` with spin-wait barrier | Both autotune (1D grid, no inter-CTA) and persistent (2D grid + barrier) variants. QAT support. |
+| `scan_monarch.py` | persistent | grid `(B_tile, block)` | One small `[blksz, blksz]` matmul per (block, gate). Best speed at typical training shapes. QAT support. |
+| `scan_butterfly.py` | persistent | grid `(B_tile,)` | log_H stages of strided 2×2 mixing per gate. No tensor-core utilization. QAT support. |
 
-1. Input activation `x_t`
-2. Hidden state `h_{t-1}` (read side)
-3. Weights `W_ir, W_iz, W_in, W_hr, W_hz, W_hn`
-4. (Optional, gated by flag) gate pre-activations before sigmoid/tanh
-5. Output hidden state `h_t` (write side)
+**Cross-CTA barriers** use the release/acquire atomic_add pattern:
+```python
+tl.atomic_add(barrier_ptr + t, 1, sem="release")
+done = tl.atomic_add(barrier_ptr + t, 0, sem="acquire")
+while done < NUM_PROGRAMS:
+    done = tl.atomic_add(barrier_ptr + t, 0, sem="acquire")
+```
+The earlier "relaxed atomic_add + `tl.load(cache_modifier='.cv')`"
+pattern looked plausible but didn't provide the acquire fence needed
+for cross-CTA data visibility — caused non-deterministic ~0.2 absolute
+drift on `gru_scan_persistent` outputs. Fixed in the most recent
+commits.
 
-Bias remains fp32. Sigmoid/tanh remain fp32.
+- Tests: `test_triton_scan.py`, `test_triton_monarch.py`,
+  `test_butterfly_dispatch.py`.
 
-**Exit tests**:
-- `test_qat_smoke.py::test_no_op_quant_matches_fp32` — when all quantizers
-  are pass-throughs, output == fp32 path.
-- `test_qat_smoke.py::test_int8_per_channel_close_to_fp32` — INT8
-  per-channel weight quant + per-tensor activation quant on a single cell
-  evaluation: max relative error < 5%.
-- `test_qat_smoke.py::test_swap_granularity_no_code_change` — same model,
-  swap weight quantizer from per-channel to per-group(64) by changing one
-  factory argument; both run, both produce sensible output.
+### Phase 5+ — structured-matrix hidden weights ✓
 
-### Phase 4 — multi-step layer + calibration (target: 2 days)
+Extension to the phase-5 work, not part of the original plan:
 
-`GRULayer` wraps the cell, loops over time. Two paths:
-- training: dynamic scales for activations, learnable scales for
-  weights (LSQ).
-- calibration: observers running on real data to record activation ranges,
-  then frozen for inference.
+- `structure.py`: `StructureConfig(kind, nblocks, ...)` and
+  `make_structured_linear` factory. Wraps `torch-structured`'s
+  primitives plus a thin Circulant via `torch.fft.rfft`.
+- Cell: optional `structure_input` / `structure_hidden`. Structured
+  mode runs `step_structured` per timestep with the structured linear
+  modules in place of dense weights. Per-gate output-side fake-quant
+  replaces per-row weight quant.
+- Triton kernels for Monarch and Butterfly (Circulant / LDR fall back
+  to the per-step PyTorch path).
+- Tests: `test_structure.py`, `test_triton_monarch.py`,
+  `test_butterfly_dispatch.py`.
 
-Hidden state quantizer **must** transition from dynamic (training) to
-frozen (inference); otherwise the inference kernel cannot be written
-because step `t+1` doesn't know step `t`'s scale.
+### Phase 6 — int activations and LUT nonlinearities
 
-**Exit tests**:
-- `test_qat_smoke.py::test_layer_trains_to_baseline` — synthetic seq2seq
-  regression. INT8 QAT model converges to within 1% MSE of fp32 baseline.
-- `test_qat_smoke.py::test_calibration_freezes_scales` — after
-  `calibrate(loader)` then `freeze()`, scales stop updating.
+Not started. Out of scope for QAT; needed for embedded deployment.
 
-### Phase 5 — Triton kernel (target: 4 days)
+## Train-step bench at `(T=64, B=32, H=512)`, fp32, RTX 2000 Ada
 
-See `triton_kernels/__init__.py` for the kernel-level contract. The cell
-is one `triton.jit` function consuming quantized weight tiles + fp16/bf16
-activations and producing fp16/bf16 hidden state.
+| variant | train ms | vs cuDNN |
+|---|---|---|
+| cuDNN `nn.GRU` | 4.4 | 1.0× |
+| `GRULayer` dense + compile_step | 38.7 | 8.8× |
+| dense Triton persistent | 8.8 | 1.9× |
+| Monarch persistent, nblocks=4 | 5.8 | 1.3× |
+| Monarch persistent, nblocks=8 | 2.0 | **0.45× (2.2× faster than cuDNN)** |
+| Butterfly persistent | 20.3 | 4.6× |
+| Butterfly per-step CUDA op (pre-Triton) | 107 | 24× |
 
-Quantization scheme is selected by the *Python wrapper* that picks the
-kernel variant; the kernel itself is parameterized over `BITS`,
-`GROUP_SIZE`, `SYMMETRIC` as `tl.constexpr`.
+For QAT (frozen int8 hidden) add ~10–30% to the Triton numbers.
 
-Variants in priority order:
-1. fp16 weights, fp16 acts (baseline; matches cuDNN regime, validates loop
-   structure)
-2. int8 per-channel weights, fp16 acts
-3. int4 per-group weights, fp16 acts (the actual prize)
-4. int8 weights, int8 acts (rare but useful for embedded)
+Per-gate hidden parameter counts:
 
-**Exit tests**:
-- `test_triton_parity.py` — Triton output matches the PyTorch fake-quant
-  path within fp16 tolerance for each variant.
-- benchmark script reports throughput vs cuDNN at `(batch, hidden) ∈
-  {(1,128), (16,256), (64,512)}`.
-
-### Phase 6 — int activations and LUT nonlinearities (optional)
-
-For full integer inference. Out of scope for the QAT side; needed only for
-embedded deployment.
+| kind | params per gate at H=512 |
+|---|---|
+| dense | 262K |
+| Monarch nblocks=4 | 65K |
+| Monarch nblocks=8 | 32K |
+| Butterfly | 4.6K |
 
 ## Upgrade pathways
 
-The skeleton is designed so each of these is a *localized* change.
-
 ### Adding a new quantization scheme
 
-1. Subclass `FakeQuantize` in `quantizers.py`. Override `_compute_scale_zp`.
-2. Add a factory entry in `quantizers.QUANTIZER_FACTORIES`.
-3. Pass the factory name into `GRUCellQuant(weight_quantizer=...)`.
+1. Subclass `FakeQuantize` in `quantizers.py`. Override
+   `_compute_scale_zp`.
+2. Add a factory entry in `quantizers.make_quantizer`.
+3. Pass the config into `GRUCellQuant(recipe=...)`.
 
 No changes to `gru_cell.py` or `gru_layer.py`.
 
+### Adding a new structured kind
+
+1. Add the kind to `StructuredKind` literal in `structure.py`.
+2. Add a branch in `make_structured_linear` constructing the underlying
+   `nn.Module`. Validate shape constraints in `_validate_shapes`.
+3. The PyTorch cell path picks it up automatically. For Triton speed,
+   either write a new persistent kernel (`scan_<kind>.py`) following
+   the Monarch / Butterfly templates, or leave it as PyTorch-only.
+
 ### Switching from STE-round to a different gradient estimator
 
-Edit `ste.py`. The round op is wrapped in `STERound.apply`; replace it
-with `LSQRound.apply` or similar. Quantizers that need a learnable step
-size already pass through `STERound`; gradient flow is contained.
-
-### Fusing the three input gates into one GEMM
-
-In `gru_cell.py`, replace the three `F.linear(x, W_i*)` calls with a single
-`F.linear(x, W_i)` where `W_i = cat([W_ir, W_iz, W_in], dim=0)`. Then split
-the output along dim 1. Per-channel weight quant survives this trivially
-because the concat is along the per-channel axis. Per-tensor weight quant
-*does not* — guard with `assert weight_quantizer.axis is not None` if
-you take this path.
+Edit `ste.py`. `STERound.apply` and `STEClamp.apply` are the swap
+points. Quantizers that need a learnable step size (LSQ) would slot
+in here.
 
 ### Targeting a different hardware backend (CUTLASS, IREE, embedded)
 
-The Triton kernel is the reference for the integer math. Port the inner
-loop. The Python `GRULayer` doesn't change; only the
-`triton_kernels/__init__.py` dispatcher does.
+The Triton kernels are the reference for the integer math. Port the
+inner loop. `GRULayer` doesn't change; the Python dispatch in
+`_forward_fast_dispatch` adds a new branch.
 
 ### Adding LSTM later
 
-Mostly copy-paste of `gru_cell.py` with four gates instead of three and a
-cell state quantizer. The quantizer infrastructure is unchanged.
+Mostly copy-paste of `gru_cell.py` with four gates instead of three
+and a cell state quantizer. Quantizer / structure infrastructure
+unchanged.
 
 ## What the agent should NOT do
 
 - Do not rewrite the existing simulator's `quant_primitives.py`. Import
   from it; match its conventions.
 - Do not optimize the PyTorch reference path. Its job is to be slow,
-  obvious, and correct. Speed lives in Triton.
-- Do not add quantization to bias, sigmoid, or tanh in the reference path
-  without an explicit ticket. These are deliberate omissions.
-- Do not collapse `FakeQuantize` granularities into a single class with
-  `if/else` branches. Subclassing keeps the dispatch flat and the kernel
-  variants tractable.
+  obvious, and correct. Speed lives in the Triton kernels.
+- Do not add quantization to bias, sigmoid, or tanh in the reference
+  path without an explicit ticket. These are deliberate omissions.
+- Do not collapse `FakeQuantize` granularities into a single class
+  with `if/else` branches. Subclassing keeps the dispatch flat and
+  the kernel variants tractable.
+- Do not use `tl.load(cache_modifier=".cv")` as a substitute for an
+  acquire fence in cross-CTA barriers. Use
+  `tl.atomic_add(barrier, 0, sem="acquire")` for the spin-wait read.
+  See the comment in `scan.py:gru_scan_fwd_persistent_kernel`.
 
-## Open questions for the human (Clément)
+## Open questions / known limitations
 
-These are decisions to make before Phase 3, not before Phase 0:
-
-1. LSQ vs PACT vs static observers for activation scales? Default in
-   skeleton is min-max observer with optional LSQ flag.
-2. Hidden state bits — same as activations, or separate? Skeleton allows
-   separate; defaulting them to equal would simplify the API.
-3. Is bias-fp32 acceptable for the target deployment, or do we need
-   bias-int32 (quantized to weight_scale × act_scale)? Affects export, not
-   QAT. Defer to Phase 6.
-4. Streaming inference frame size — fixed or variable? Fixed simplifies
-   the Triton kernel substantially.
+1. **Per-channel min_max observer**: see Phase 1 known gap. Not blocking
+   any current path; per-channel weight quant uses `dynamic` mode where
+   scales are derived from static weights each forward.
+2. **bf16 autocast around fake-quant**: tried and dropped. The fp32↔bf16
+   cast tax around quant boundaries exceeds the GEMM saving at our
+   shapes. Documented in `gru_layer.py`.
+3. **LSQ / PACT activation scales**: `learnable_scale` flag is plumbed
+   in `QuantizerConfig` but not implemented. Activation scales use
+   min_max + freeze after calibration.
+4. **Bias quantization**: bias-fp32 throughout. Bias-int32 (export to
+   `weight_scale × act_scale`) would be a phase-6 export concern.
+5. **Streaming inference**: full-sequence forward only. Streaming
+   (`step(x_t, h)` called by user) works mechanically through the cell
+   but bypasses the Triton kernels which require knowing T at launch.
