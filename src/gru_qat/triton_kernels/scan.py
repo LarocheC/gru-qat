@@ -86,10 +86,18 @@ def gru_scan_fwd_persistent_kernel(
     sW_o,
     so_t, so_b,
     NUM_PROGRAMS,
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     H: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_OH: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_oh = tl.program_id(1)
@@ -121,6 +129,12 @@ def gru_scan_fwd_persistent_kernel(
             h_tile = tl.load(
                 h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
+            # quant_h_in only on the matmul-side h (direct contribution
+            # uses the raw h_old below — matches gru_cell.step semantics).
+            if QUANT_H_IN:
+                q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                h_tile = q * h_in_scale
             W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
             Wr_tile = tl.load(
                 Wh_ptr + 0 * H * sW_o + W_offset,
@@ -157,6 +171,11 @@ def gru_scan_fwd_persistent_kernel(
         h_old = tl.load(h_old_ptrs, mask=mask_oh2, other=0.0)
         h_new = (1.0 - z) * n + z * h_old
 
+        if QUANT_H_OUT:
+            q = tl.extra.libdevice.rint(h_new / h_out_scale)
+            q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
+            h_new = q * h_out_scale
+
         out_ptrs = (
             out_ptr + t * so_t + offs_b[:, None] * so_b + offs_oh[None, :]
         )
@@ -187,6 +206,8 @@ def gru_scan_forward_persistent(
     block_k: int = 32,
     num_warps: int = 4,
     num_stages: int = 2,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Persistent-grid forward. Higher SM utilization at modest (B, H).
 
@@ -222,6 +243,9 @@ def gru_scan_forward_persistent(
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
     barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = (n_pid_b, n_pid_oh)
     gru_scan_fwd_persistent_kernel[grid](
         gi, h0, Wh_cat, bh_cat, out,
@@ -232,10 +256,14 @@ def gru_scan_forward_persistent(
         Wh_cat.stride(0),
         out.stride(0), out.stride(1),
         num_programs,
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H,
         BLOCK_B=block_b,
         BLOCK_OH=block_oh,
         BLOCK_K=block_k,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -277,10 +305,18 @@ def gru_scan_bwd_persistent_kernel(
     sdbp_pid,
     sdh_b,
     NUM_PROGRAMS,
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     H: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_OH: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     """Persistent backward kernel.
 
@@ -338,6 +374,10 @@ def gru_scan_bwd_persistent_kernel(
             h_prev_tile = tl.load(
                 h_prev_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
+            if QUANT_H_IN:
+                q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                h_prev_tile = q * h_in_scale
             W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
             Wr_tile = tl.load(
                 Wh_ptr + 0 * H * sW_o + W_offset,
@@ -389,6 +429,15 @@ def gru_scan_bwd_persistent_kernel(
         )
         dout_oh = tl.load(dout_base, mask=mask_oh2, other=0.0)
         dh_t = dout_oh + dh_acc_oh
+
+        # STE backward of quant_h_out: incoming dh_t is grad on the
+        # quantized h_t; multiply by clip mask of h_t_raw to get grad on
+        # h_t_raw before propagating through the recurrence.
+        if QUANT_H_OUT:
+            h_t_raw = (1.0 - z) * n + z * h_prev_oh
+            q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+            mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
+            dh_t = tl.where(mask_out, dh_t, 0.0)
 
         # h_t = (1 - z) * n + z * h_prev
         dn = dh_t * (1.0 - z)
@@ -467,6 +516,22 @@ def gru_scan_bwd_persistent_kernel(
                 + tl.dot(dgh_z, Wz_t, input_precision="tf32")
                 + tl.dot(dgh_n, Wn_t, input_precision="tf32")
             )
+            # STE backward of quant_h_in: contrib is grad on the quantized
+            # h_prev (matmul side); zero where the value was clipped.
+            if QUANT_H_IN:
+                h_prev_k_ptrs = (
+                    h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_k[None, :]
+                )
+                h_prev_k = tl.load(
+                    h_prev_k_ptrs,
+                    mask=mask_b[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                q_in_unclamped = tl.extra.libdevice.rint(h_prev_k / h_in_scale)
+                mask_in = (q_in_unclamped >= h_in_qmin) & (
+                    q_in_unclamped <= h_in_qmax
+                )
+                contrib = tl.where(mask_in, contrib, 0.0)
             w_ptrs = write_ptr + offs_b[:, None] * sdh_b + offs_k[None, :]
             tl.atomic_add(
                 w_ptrs, contrib,
@@ -491,6 +556,12 @@ def gru_scan_bwd_persistent_kernel(
             h_prev_tile = tl.load(
                 h_prev_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
+            # Forward used hq = quant_h_in(h_prev) in the matmul, so dWh
+            # accumulates against hq, not raw h_prev.
+            if QUANT_H_IN:
+                q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                h_prev_tile = q * h_in_scale
             dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
             dWz = tl.dot(tl.trans(dgh_z), h_prev_tile, input_precision="tf32")
             dWn = tl.dot(tl.trans(dgh_n), h_prev_tile, input_precision="tf32")
@@ -562,6 +633,8 @@ def gru_scan_backward_persistent(
     block_k: int = 32,
     num_warps: int = 4,
     num_stages: int = 2,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Persistent backward. Same launch constraint as the forward kernel.
 
@@ -607,6 +680,9 @@ def gru_scan_backward_persistent(
     dh_b = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
     barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = (n_pid_b, n_pid_oh)
     gru_scan_bwd_persistent_kernel[grid](
         gi, h0, Wh_cat, bh_cat, out,
@@ -627,7 +703,11 @@ def gru_scan_backward_persistent(
         dbh_partial.stride(0),
         dh_a.stride(0),
         num_programs,
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H, BLOCK_B=block_b, BLOCK_OH=block_oh, BLOCK_K=block_k,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps, num_stages=num_stages,
     )
 
@@ -1464,11 +1544,8 @@ def gru_scan(
 
 class GRUScanPersistentFunction(torch.autograd.Function):
     """Same autograd contract as GRUScanFunction, dispatched to the
-    persistent forward/backward kernels.
-
-    No fake-quant support yet (separate work item). Constraint: the chosen
-    grid sizes must fit inside the GPU's SM count or the kernel deadlocks
-    on the spin-wait barrier; the wrappers check this.
+    persistent forward/backward kernels. Optional in-kernel fake-quant on
+    hidden state, same parameter shape as GRUScanFunction.
     """
 
     @staticmethod
@@ -1478,15 +1555,26 @@ class GRUScanPersistentFunction(torch.autograd.Function):
         h0: torch.Tensor,
         Wh_cat: torch.Tensor,
         bh_cat: torch.Tensor,
+        h_in_quant: tuple[float, int, int] | None,
+        h_out_quant: tuple[float, int, int] | None,
     ) -> torch.Tensor:
-        out = gru_scan_forward_persistent(gi, h0, Wh_cat, bh_cat)
+        out = gru_scan_forward_persistent(
+            gi, h0, Wh_cat, bh_cat,
+            h_in_quant=h_in_quant, h_out_quant=h_out_quant,
+        )
         ctx.save_for_backward(gi, h0, Wh_cat, bh_cat, out)
+        ctx.h_in_quant = h_in_quant
+        ctx.h_out_quant = h_out_quant
         return out
 
     @staticmethod
     def backward(ctx, dout):  # type: ignore[override]
         gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
-        return gru_scan_backward_persistent(gi, h0, Wh_cat, bh_cat, out, dout)
+        grads = gru_scan_backward_persistent(
+            gi, h0, Wh_cat, bh_cat, out, dout,
+            h_in_quant=ctx.h_in_quant, h_out_quant=ctx.h_out_quant,
+        )
+        return (*grads, None, None)
 
 
 def gru_scan_persistent(
@@ -1494,11 +1582,17 @@ def gru_scan_persistent(
     h0: torch.Tensor,
     Wh_cat: torch.Tensor,
     bh_cat: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Persistent-kernel variant of gru_scan. Forward and backward both
     use 2D grids with cross-CTA barriers; better SM utilization at modest
-    batch sizes. fp32 only (no fake-quant in this path yet)."""
-    return GRUScanPersistentFunction.apply(gi, h0, Wh_cat, bh_cat)
+    batch sizes. ``h_in_quant`` / ``h_out_quant`` enable in-kernel
+    fake-quant on the hidden state, same semantics as gru_scan."""
+    return GRUScanPersistentFunction.apply(
+        gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+    )
 
 
 def gru_scan_forward(
