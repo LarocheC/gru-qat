@@ -30,6 +30,7 @@ from gru_qat.quantizers import (
     factory,
     make_quantizer,
 )
+from gru_qat.structure import StructureConfig, make_structured_linear
 
 GateLayout = Literal["split", "fused"]
 
@@ -92,6 +93,8 @@ class GRUCellQuant(nn.Module):
         *,
         gate_layout: GateLayout = "split",
         bias: bool = True,
+        structure_input: StructureConfig | None = None,
+        structure_hidden: StructureConfig | None = None,
     ) -> None:
         super().__init__()
         if gate_layout == "fused":
@@ -110,19 +113,67 @@ class GRUCellQuant(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.gate_layout = gate_layout
+        # Whether each side uses dense weights (raw nn.Parameter, quantized
+        # via FakeQuantize on the weight) or a structured nn.Module
+        # parameterization (quantized on the matmul output).
+        self._input_dense = (
+            structure_input is None or structure_input.kind == "dense"
+        )
+        self._hidden_dense = (
+            structure_hidden is None or structure_hidden.kind == "dense"
+        )
+        self._structure_input = structure_input
+        self._structure_hidden = structure_hidden
 
-        # ---- weights (split-gate layout) ----
-        # Each weight is [hidden_size, *_size]; bias is [hidden_size].
-        def _w(out_dim: int, in_dim: int) -> nn.Parameter:
-            return nn.Parameter(torch.empty(out_dim, in_dim))
+        # ---- input-side weights ----
+        if self._input_dense:
+            self.W_ir = nn.Parameter(torch.empty(hidden_size, input_size))
+            self.W_iz = nn.Parameter(torch.empty(hidden_size, input_size))
+            self.W_in = nn.Parameter(torch.empty(hidden_size, input_size))
+        else:
+            # Three separate structured layers, one per gate. Splitting
+            # per gate (vs. one fused 3*hidden output) is what makes
+            # square-only kinds (circulant, ldr) usable here when
+            # input_size == hidden_size — the fused [3*hidden] output
+            # would never be square.
+            assert structure_input is not None
+            self.struct_Wi_r = make_structured_linear(
+                structure_input, input_size, hidden_size, bias=False,
+            )
+            self.struct_Wi_z = make_structured_linear(
+                structure_input, input_size, hidden_size, bias=False,
+            )
+            self.struct_Wi_n = make_structured_linear(
+                structure_input, input_size, hidden_size, bias=False,
+            )
+            # Output-side fake-quant per gate (placement: matmul output,
+            # before bias). Three quantizers so each gate's running stats
+            # are independent.
+            self.quant_struct_Wi_r = make_quantizer(recipe.weight)
+            self.quant_struct_Wi_z = make_quantizer(recipe.weight)
+            self.quant_struct_Wi_n = make_quantizer(recipe.weight)
 
-        self.W_ir = _w(hidden_size, input_size)
-        self.W_iz = _w(hidden_size, input_size)
-        self.W_in = _w(hidden_size, input_size)
-        self.W_hr = _w(hidden_size, hidden_size)
-        self.W_hz = _w(hidden_size, hidden_size)
-        self.W_hn = _w(hidden_size, hidden_size)
+        # ---- hidden-side weights ----
+        if self._hidden_dense:
+            self.W_hr = nn.Parameter(torch.empty(hidden_size, hidden_size))
+            self.W_hz = nn.Parameter(torch.empty(hidden_size, hidden_size))
+            self.W_hn = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        else:
+            assert structure_hidden is not None
+            self.struct_Wh_r = make_structured_linear(
+                structure_hidden, hidden_size, hidden_size, bias=False,
+            )
+            self.struct_Wh_z = make_structured_linear(
+                structure_hidden, hidden_size, hidden_size, bias=False,
+            )
+            self.struct_Wh_n = make_structured_linear(
+                structure_hidden, hidden_size, hidden_size, bias=False,
+            )
+            self.quant_struct_Wh_r = make_quantizer(recipe.weight)
+            self.quant_struct_Wh_z = make_quantizer(recipe.weight)
+            self.quant_struct_Wh_n = make_quantizer(recipe.weight)
 
+        # ---- biases (always per-gate, fp32) ----
         if bias:
             self.b_ir = nn.Parameter(torch.zeros(hidden_size))
             self.b_iz = nn.Parameter(torch.zeros(hidden_size))
@@ -142,9 +193,9 @@ class GRUCellQuant(nn.Module):
         self.quant_h_in = make_quantizer(recipe.hidden)
         self.quant_h_out = make_quantizer(recipe.hidden)
 
-        # Weight quantizers — six independent modules so each one's
-        # observer / learnable scale is independent. They share `recipe.weight`
-        # as a *config* but each instance has its own buffers.
+        # Weight quantizers — only used in dense mode. We always create
+        # them so the cell has stable attributes; in structured mode the
+        # ones for that side are simply unused.
         self.quant_W_ir = make_quantizer(recipe.weight)
         self.quant_W_iz = make_quantizer(recipe.weight)
         self.quant_W_in = make_quantizer(recipe.weight)
@@ -159,13 +210,30 @@ class GRUCellQuant(nn.Module):
         self.quant_gate_z = make_quantizer(gate_cfg)
         self.quant_gate_n = make_quantizer(gate_cfg)
 
+    @property
+    def is_structured(self) -> bool:
+        """True iff either side uses a structured weight parameterization."""
+        return not (self._input_dense and self._hidden_dense)
+
     # ------------------------------------------------------------------
 
     def reset_parameters(self) -> None:
-        # Match nn.GRUCell init: uniform(-k, k) where k = 1/sqrt(hidden_size)
+        # Match nn.GRUCell init: uniform(-k, k) where k = 1/sqrt(hidden_size).
+        # Only touch dense weights and biases — structured submodules have
+        # their own reset_parameters with kind-appropriate inits.
         k = self.hidden_size**-0.5
-        for p in self.parameters():
-            nn.init.uniform_(p, -k, k)
+        if self._input_dense:
+            nn.init.uniform_(self.W_ir, -k, k)
+            nn.init.uniform_(self.W_iz, -k, k)
+            nn.init.uniform_(self.W_in, -k, k)
+        if self._hidden_dense:
+            nn.init.uniform_(self.W_hr, -k, k)
+            nn.init.uniform_(self.W_hz, -k, k)
+            nn.init.uniform_(self.W_hn, -k, k)
+        for name in ("b_ir", "b_iz", "b_in", "b_hr", "b_hz", "b_hn"):
+            b = getattr(self, name)
+            if b is not None:
+                nn.init.uniform_(b, -k, k)
 
     # ------------------------------------------------------------------
 
@@ -177,7 +245,17 @@ class GRUCellQuant(nn.Module):
         For fused gate layout, also concatenate the three input/hidden
         weights and biases once so the per-step path can issue two big
         GEMMs instead of six small ones.
+
+        Structured mode does NOT have a single dense weight to pre-quantize
+        per side — the structured layer is run per-step. This method
+        raises if either side is structured; callers should dispatch to
+        ``forward_structured()`` instead.
         """
+        if self.is_structured:
+            raise RuntimeError(
+                "quantize_weights() is dense-only; use the structured "
+                "forward path (cell.forward(x, h)) for structured cells."
+            )
         Wir = self.quant_W_ir(self.W_ir)
         Wiz = self.quant_W_iz(self.W_iz)
         Win = self.quant_W_in(self.W_in)
@@ -192,6 +270,55 @@ class GRUCellQuant(nn.Module):
                 cw.bi_cat = torch.cat([self.b_ir, self.b_iz, self.b_in])
                 cw.bh_cat = torch.cat([self.b_hr, self.b_hz, self.b_hn])
         return cw
+
+    def step_structured(
+        self, x: torch.Tensor, h: torch.Tensor
+    ) -> torch.Tensor:
+        """One step in structured mode (split-three-layers per side).
+
+        For each gate (r, z, n) we run a per-side projection: dense uses
+        the existing W_*r/W_*z/W_*n parameters with quant_W_*; structured
+        uses self.struct_W*_r/_z/_n with output-side quant_struct_W*_*.
+        """
+        xq = self.quant_x(x)
+        hq = self.quant_h_in(h)
+
+        # ---- Input side — three projections, one per gate ----
+        if self._input_dense:
+            gi_r = F.linear(xq, self.quant_W_ir(self.W_ir), self.b_ir)
+            gi_z = F.linear(xq, self.quant_W_iz(self.W_iz), self.b_iz)
+            gi_n = F.linear(xq, self.quant_W_in(self.W_in), self.b_in)
+        else:
+            gi_r = self.quant_struct_Wi_r(self.struct_Wi_r(xq))
+            gi_z = self.quant_struct_Wi_z(self.struct_Wi_z(xq))
+            gi_n = self.quant_struct_Wi_n(self.struct_Wi_n(xq))
+            if self.b_ir is not None:
+                gi_r = gi_r + self.b_ir
+                gi_z = gi_z + self.b_iz
+                gi_n = gi_n + self.b_in
+
+        # ---- Hidden side — three projections, one per gate ----
+        if self._hidden_dense:
+            gh_r = F.linear(hq, self.quant_W_hr(self.W_hr), self.b_hr)
+            gh_z = F.linear(hq, self.quant_W_hz(self.W_hz), self.b_hz)
+            gh_n = F.linear(hq, self.quant_W_hn(self.W_hn), self.b_hn)
+        else:
+            gh_r = self.quant_struct_Wh_r(self.struct_Wh_r(hq))
+            gh_z = self.quant_struct_Wh_z(self.struct_Wh_z(hq))
+            gh_n = self.quant_struct_Wh_n(self.struct_Wh_n(hq))
+            if self.b_hr is not None:
+                gh_r = gh_r + self.b_hr
+                gh_z = gh_z + self.b_hz
+                gh_n = gh_n + self.b_hn
+
+        gate_r = self.quant_gate_r(gi_r + gh_r)
+        gate_z = self.quant_gate_z(gi_z + gh_z)
+        r = torch.sigmoid(gate_r)
+        z = torch.sigmoid(gate_z)
+        gate_n = self.quant_gate_n(gi_n + r * gh_n)
+        n = torch.tanh(gate_n)
+        h_new = (1.0 - z) * n + z * h
+        return self.quant_h_out(h_new)
 
     def step(
         self, x: torch.Tensor, h: torch.Tensor, w: CellWeights
@@ -309,11 +436,16 @@ class GRUCellQuant(nn.Module):
     def forward(
         self, x: torch.Tensor, h: torch.Tensor
     ) -> torch.Tensor:
-        """One step. Convenience wrapper that quantizes weights inline.
+        """One step. Convenience wrapper that dispatches to dense or
+        structured path based on configuration.
 
-        Multi-step callers should use `quantize_weights()` + `step()` to
-        avoid re-quantizing weights on every timestep.
+        Multi-step dense callers should use ``quantize_weights()`` +
+        ``step()`` directly to avoid re-quantizing weights on every
+        timestep. Structured mode has no per-forward weight quantization
+        to hoist, so per-step ``step_structured`` is the only path.
         """
+        if self.is_structured:
+            return self.step_structured(x, h)
         return self.step(x, h, self.quantize_weights())
 
     # ------------------------------------------------------------------
