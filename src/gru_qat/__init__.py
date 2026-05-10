@@ -16,6 +16,7 @@ from gru_qat.quantizers import (
     QuantRecipe,
 )
 from gru_qat.ste import STEClamp, STERound
+from gru_qat.structure import StructureConfig, make_structured_linear
 
 __all__ = [
     "GRUCellQuant",
@@ -30,4 +31,6 @@ __all__ = [
     "PRESETS",
     "STERound",
     "STEClamp",
+    "StructureConfig",
+    "make_structured_linear",
 ]

@@ -21,7 +21,29 @@ import torch
 import torch.nn as nn
 
 from gru_qat.gru_cell import GateLayout, GRUCellQuant
-from gru_qat.quantizers import QuantRecipe
+from gru_qat.quantizers import FakeQuantize, FakeQuantizePerTensor, QuantRecipe
+from gru_qat.structure import StructureConfig
+
+
+def _extract_h_quant_params(
+    quantizer: FakeQuantize,
+) -> tuple[float, int, int] | None:
+    """Pull (scale, qmin, qmax) from a frozen per-tensor symmetric quantizer.
+
+    Returns None if the quantizer isn't in a state the Triton-Monarch
+    path can consume:
+    - mode != "frozen" (scales aren't stable)
+    - per-channel/per-group (kernel is per-tensor only)
+    - asymmetric (zero_point != 0)
+    Caller should treat None as "no in-kernel fake-quant".
+    """
+    if quantizer.config.mode != "frozen":
+        return None
+    if not isinstance(quantizer, FakeQuantizePerTensor):
+        return None
+    if not quantizer.config.symmetric:
+        return None
+    return (float(quantizer.scale.item()), int(quantizer.qmin), int(quantizer.qmax))
 
 
 class GRULayer(nn.Module):
@@ -35,6 +57,9 @@ class GRULayer(nn.Module):
         gate_layout: GateLayout = "split",
         compile_step: bool = False,
         pre_batch_input: bool = False,
+        structure_input: StructureConfig | None = None,
+        structure_hidden: StructureConfig | None = None,
+        use_triton: bool | str = "auto",
     ) -> None:
         super().__init__()
         if pre_batch_input and gate_layout != "fused":
@@ -42,11 +67,49 @@ class GRULayer(nn.Module):
                 "pre_batch_input=True requires gate_layout='fused'"
             )
         self.cell = GRUCellQuant(
-            input_size, hidden_size, recipe, gate_layout=gate_layout
+            input_size, hidden_size, recipe,
+            gate_layout=gate_layout,
+            structure_input=structure_input,
+            structure_hidden=structure_hidden,
         )
         self.hidden_size = hidden_size
         self.batch_first = batch_first
+        # Structured cells go through a different per-step path that
+        # doesn't pre-quantize a CellWeights bag. pre_batch_input also
+        # depends on the dense fused layout so it's force-disabled there.
+        if self.cell.is_structured and pre_batch_input:
+            raise ValueError(
+                "pre_batch_input is not supported in structured mode "
+                "(no dense Wi_cat to pre-project)."
+            )
         self.pre_batch_input = pre_batch_input
+
+        # Fast-path dispatch eligibility: input must be dense, gate
+        # layout must be 'fused' (so the input projection produces a
+        # [T, B, 3H] tensor), and the hidden side must be either:
+        # - "monarch": uses the persistent Triton kernel (real speedup).
+        # - "butterfly": uses a Python time loop calling
+        #   torch_structured.butterfly_multiply per step (API parity,
+        #   no multi-step Triton fusion). The flag is named ``use_triton``
+        #   for symmetry with the monarch path even though butterfly
+        #   doesn't actually use a Triton kernel.
+        kind = structure_hidden.kind if structure_hidden is not None else None
+        self._fast_dispatch_eligible = (
+            structure_input is None
+            and kind in ("monarch", "butterfly")
+            and gate_layout == "fused"
+        )
+        self._dispatch_kind: str | None = kind if self._fast_dispatch_eligible else None
+        if use_triton == "auto":
+            self.use_triton = self._fast_dispatch_eligible
+        else:
+            self.use_triton = bool(use_triton)
+            if self.use_triton and not self._fast_dispatch_eligible:
+                raise ValueError(
+                    "use_triton=True requires structure_input=None, "
+                    "structure_hidden.kind in {'monarch', 'butterfly'}, "
+                    "and gate_layout='fused'."
+                )
         # When compile_step is True, wrap the per-step body in torch.compile
         # so Inductor fuses the elementwise ops (sigmoid/tanh/mul/add) with
         # the matmul epilogue. Static shapes only — bind one specialization
@@ -58,7 +121,12 @@ class GRULayer(nn.Module):
         # step's input — the graph then overwrites a tensor that the next
         # invocation is still holding a pointer to. Plain "default" gets
         # the kernel fusion win without the graph-capture footgun.
-        body = self.cell.step_with_gi if pre_batch_input else self.cell.step
+        if self.cell.is_structured:
+            body = self.cell.step_structured
+        elif pre_batch_input:
+            body = self.cell.step_with_gi
+        else:
+            body = self.cell.step
         self._compiled_step = (
             torch.compile(body, mode="default", dynamic=False)
             if compile_step
@@ -88,48 +156,134 @@ class GRULayer(nn.Module):
         if h0 is None:
             h0 = x.new_zeros(batch_size, self.hidden_size)
 
-        # Hoist weight quantization out of the time loop — weights are
-        # invariant across timesteps, so calling the six FakeQuantize
-        # modules per step is wasted work (it dominates int8 training cost).
-        w = self.cell.quantize_weights()
+        # Fast path: structured hidden (monarch or butterfly) + dense
+        # input + dispatch enabled. Monarch goes through the persistent
+        # Triton kernel; butterfly goes through a Python time loop with
+        # torch_structured's butterfly_multiply CUDA op (API parity, not
+        # a Triton kernel).
+        if self.use_triton and x.is_cuda:
+            return self._forward_fast_dispatch(x, h0)
 
         h = h0
         outputs: list[torch.Tensor] = []
         step = self._compiled_step
-        if self.pre_batch_input:
-            # Run x @ W_i + b_i once over the whole sequence so the per-step
-            # body only does the hidden-projection GEMM. Big win at large
-            # T where the input GEMM is no longer launch-bound.
-            gi = self.cell.input_projection(x, w)  # [T, B, 3*hidden]
+        if self.cell.is_structured:
+            # Structured per-step path takes (x, h) only — there's no
+            # pre-quantized CellWeights bag to thread through.
             for t in range(seq_len):
-                h = step(gi[t], h, w)
+                h = step(x[t], h)
                 outputs.append(h)
         else:
-            for t in range(seq_len):
-                h = step(x[t], h, w)
-                outputs.append(h)
+            # Hoist weight quantization out of the time loop — weights are
+            # invariant across timesteps, so calling the six FakeQuantize
+            # modules per step is wasted work (it dominates int8 training cost).
+            w = self.cell.quantize_weights()
+            if self.pre_batch_input:
+                # Run x @ W_i + b_i once over the whole sequence so the per-step
+                # body only does the hidden-projection GEMM. Big win at large
+                # T where the input GEMM is no longer launch-bound.
+                gi = self.cell.input_projection(x, w)  # [T, B, 3*hidden]
+                for t in range(seq_len):
+                    h = step(gi[t], h, w)
+                    outputs.append(h)
+            else:
+                for t in range(seq_len):
+                    h = step(x[t], h, w)
+                    outputs.append(h)
 
         out = torch.stack(outputs, dim=0)
         if self.batch_first:
             out = out.transpose(0, 1)
         return out, h
 
+    def _forward_fast_dispatch(
+        self, x: torch.Tensor, h0: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch for structured-hidden + dense-input fast paths.
+
+        Both monarch and butterfly share the input projection setup
+        (xq via quant_x, then F.linear with the dense input weights)
+        and the QAT param extraction. They differ only in the scan
+        backend used for the hidden recurrence.
+        """
+        # Quantize the input: quant_x runs once on the full sequence.
+        xq = self.cell.quant_x(x)
+        Wi_cat, bi_cat = self.cell.quantize_input_weights()
+        gi = nn.functional.linear(xq, Wi_cat, bi_cat)  # [T, B, 3*hidden]
+
+        h_in_q = _extract_h_quant_params(self.cell.quant_h_in)
+        h_out_q = _extract_h_quant_params(self.cell.quant_h_out)
+
+        if self._dispatch_kind == "monarch":
+            from gru_qat.triton_kernels.scan_monarch import (
+                extract_monarch_factors,
+                gru_scan_monarch,
+            )
+            Wh_struct, bh_cat = extract_monarch_factors(self.cell)
+            out = gru_scan_monarch(
+                gi, h0, Wh_struct, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+        elif self._dispatch_kind == "butterfly":
+            # The Triton kernel handles both fp32 and QAT (frozen
+            # per-tensor symmetric hidden quant). Same kernel path
+            # regardless — h_in_q / h_out_q being None just disables
+            # the in-kernel fake-quant via the constexpr flags.
+            from gru_qat.triton_kernels.scan_butterfly import (
+                extract_butterfly_twiddles,
+                gru_scan_butterfly_triton,
+            )
+            twiddles, bh_cat = extract_butterfly_twiddles(self.cell)
+            out = gru_scan_butterfly_triton(
+                gi, h0, twiddles, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+        else:
+            raise RuntimeError(
+                f"unexpected dispatch kind {self._dispatch_kind!r}"
+            )
+
+        h_T = out[-1]  # [B, H] — capture before any batch_first flip.
+        if self.batch_first:
+            out = out.transpose(0, 1)
+        return out, h_T
+
     # ------------------------------------------------------------------
     # Calibration / freezing
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def calibrate(self, loader: object) -> None:
-        """Run forward passes in min_max observer mode to gather stats.
+    def calibrate(
+        self,
+        loader,
+        n_batches: int = 64,
+        *,
+        only_activations: bool = True,
+    ):
+        """Convenience wrapper around ``gru_qat.calibration.calibrate``.
 
-        Caller must set the recipe's mode to "min_max" before constructing
-        the layer (or set it on each quantizer manually). After calibrate(),
-        call freeze() to fix the scales for inference.
+        Switches activation-side quantizers to ``min_max`` observer mode,
+        runs ``n_batches`` forward passes from ``loader``, and returns a
+        stats summary. Does not auto-freeze — call ``self.freeze()`` once
+        you're happy with the calibration.
 
-        TODO(phase=4): take a real DataLoader, run N batches, return stats
-        summary. For now this is a stub.
+        Temporarily disables ``use_triton`` so the per-step path runs
+        and ``cell.quant_h_in`` / ``quant_h_out`` actually fire — the
+        fast dispatch reads scales directly from those quantizers
+        instead of calling them, which means their observers don't
+        update. Subsequent forwards (after freeze()) will go back
+        through the fast dispatch.
         """
-        raise NotImplementedError("phase=4")
+        saved_use_triton = self.use_triton
+        self.use_triton = False
+        try:
+            from gru_qat.calibration import calibrate as _calibrate
+            return _calibrate(
+                self, loader, n_batches=n_batches,
+                only_activations=only_activations,
+            )
+        finally:
+            self.use_triton = saved_use_triton
 
     def freeze(self) -> None:
         self.cell.freeze_quantizers()

@@ -10,6 +10,11 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = ["triton>=2.2"]
+# Structured-matrix support uses `torch-structured` which isn't on PyPI.
+# Install it directly from your local checkout, e.g.:
+#     uv pip install git+https://github.com/LarocheC/torch-structured
+# The structure module imports it lazily so gru-qat works without it as
+# long as you only use kind="dense".
 dev = [
     "pytest>=7",
     "pytest-xdist>=3",
