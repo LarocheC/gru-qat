@@ -181,13 +181,26 @@ def gru_scan_fwd_persistent_kernel(
         )
         tl.store(out_ptrs, h_new, mask=mask_oh2)
 
-        # Grid-level barrier: every CTA increments the per-timestep counter,
-        # then spin-waits until all CTAs have arrived. Volatile read forces a
-        # fresh load each iteration so we see other CTAs' atomic_add updates.
-        tl.atomic_add(barrier_ptr + t, 1)
-        done = tl.load(barrier_ptr + t, cache_modifier=".cv")
+        # Grid-level barrier. Same release/acquire pattern as the
+        # backward kernel: release on the increment so prior out[t]
+        # writes are visible to any reader observing the post-increment
+        # counter; acquire on the spin-load so writes by programs that
+        # already incremented are visible after the wait. ``tl.load``
+        # doesn't accept a memory order, so we read via a no-op
+        # ``atomic_add(0)`` with ``sem="acquire"``.
+        #
+        # Earlier versions used relaxed atomic_add + ``tl.load(cache_modifier=".cv")``
+        # for the spin-wait. That looked plausible (cache modifier seems
+        # like volatile semantics) but the CUDA memory model doesn't
+        # guarantee that out[t] data writes are visible after the
+        # post-increment counter is observed without an acquire fence.
+        # In practice this produced output that was MOSTLY correct but
+        # with ~0.2 absolute drift on some [t>=1, batch, hidden] cells
+        # depending on CTA-scheduling order — i.e. non-deterministic.
+        tl.atomic_add(barrier_ptr + t, 1, sem="release")
+        done = tl.atomic_add(barrier_ptr + t, 0, sem="acquire")
         while done < NUM_PROGRAMS:
-            done = tl.load(barrier_ptr + t, cache_modifier=".cv")
+            done = tl.atomic_add(barrier_ptr + t, 0, sem="acquire")
 
         # All CTAs have written their slice of out[t]; safe to read it as
         # h_in for step t+1.
