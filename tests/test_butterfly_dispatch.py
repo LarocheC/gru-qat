@@ -21,7 +21,9 @@ torch_structured = pytest.importorskip("torch_structured")
 from gru_qat import GRULayer, QuantizerConfig, QuantRecipe, StructureConfig  # noqa: E402
 from gru_qat.triton_kernels.scan_butterfly import (  # noqa: E402
     extract_butterfly_factors,
+    extract_butterfly_twiddles,
     gru_scan_butterfly,
+    gru_scan_butterfly_forward_triton,
 )
 
 
@@ -120,6 +122,36 @@ def test_butterfly_grulayer_dispatch_grad_flows() -> None:
             continue
         assert p.grad is not None, f"no grad on {name}"
         assert torch.isfinite(p.grad).all(), f"non-finite grad on {name}"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H", [(8, 16, 32), (16, 32, 64), (8, 32, 128)])
+def test_butterfly_triton_forward_matches_per_step(T: int, B: int, H: int) -> None:
+    """Multi-step persistent Triton butterfly forward must match the
+    per-step CUDA-op path (gru_scan_butterfly with same modules)."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+    layer = _make_layer(H, use_triton=False).to(device).eval()
+
+    x = torch.randn(T, B, H, device=device) * 0.1
+    h0 = torch.randn(B, H, device=device) * 0.1
+
+    with torch.no_grad():
+        # Reference: gru_scan_butterfly via the existing CUDA per-step path.
+        xq = layer.cell.quant_x(x)
+        Wi_cat, bi_cat = layer.cell.quantize_input_weights()
+        gi = torch.nn.functional.linear(xq, Wi_cat, bi_cat)
+        modules, bh_cat = extract_butterfly_factors(layer.cell)
+        ref_out = gru_scan_butterfly(gi, h0, modules, bh_cat)
+
+        # Triton path: same gi/h0/bh, but twiddles flattened for the kernel.
+        twiddles, _ = extract_butterfly_twiddles(layer.cell)
+        tri_out = gru_scan_butterfly_forward_triton(gi, h0, twiddles, bh_cat)
+
+    max_diff = (ref_out - tri_out).abs().max().item()
+    rel = max_diff / max(ref_out.abs().max().item(), 1e-6)
+    assert rel < 5e-3, f"butterfly Triton forward rel diff {rel:.4e}"
 
 
 @cuda_only
