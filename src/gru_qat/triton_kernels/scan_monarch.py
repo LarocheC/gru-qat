@@ -48,11 +48,27 @@ def extract_monarch_factors(cell: nn.Module) -> tuple[torch.Tensor, torch.Tensor
     return Wh_struct, bh_cat
 
 
+def _fake_quant(
+    x: torch.Tensor, params: tuple[float, int, int] | None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Per-tensor symmetric fake-quant + STE clip mask. None passes through."""
+    if params is None:
+        return x, None
+    scale, qmin, qmax = params
+    q_unclamped = torch.round(x / scale)
+    mask = (q_unclamped >= qmin) & (q_unclamped <= qmax)
+    q_clamped = q_unclamped.clamp(qmin, qmax)
+    return q_clamped * scale, mask
+
+
 def gru_scan_monarch_forward_pytorch(
     gi: torch.Tensor,
     h0: torch.Tensor,
     Wh_struct: torch.Tensor,
     bh_cat: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Reference forward for the block-diagonal scan, in PyTorch.
 
@@ -61,6 +77,8 @@ def gru_scan_monarch_forward_pytorch(
         h0: [B, H]
         Wh_struct: [3, nblocks, blksz, blksz]
         bh_cat: [3H]
+        h_in_quant: optional (scale, qmin, qmax) for matmul-side h.
+        h_out_quant: optional (scale, qmin, qmax) for h_new before store.
     Returns:
         out: [T, B, H] — hidden state at every timestep.
     """
@@ -77,12 +95,11 @@ def gru_scan_monarch_forward_pytorch(
     bh = bh_cat.view(3, H)
 
     for t in range(T):
-        # h: [B, H] -> [B, nblocks, blksz]
-        h_chunks = h.view(B, nblocks, blksz)
-        # Block-diagonal matmul per gate:
-        #   gh[g, b, n, o] = sum_i h_chunks[b, n, i] * Wh_struct[g, n, o, i]
-        gh = torch.einsum("bni,gnoi->bgno", h_chunks, Wh_struct)  # [B, 3, nblocks, blksz]
-        gh = gh.reshape(B, 3, H) + bh  # add bias per gate
+        # quant_h_in only on the matmul-side (direct contribution uses raw h).
+        h_for_matmul, _ = _fake_quant(h, h_in_quant)
+        h_chunks = h_for_matmul.view(B, nblocks, blksz)
+        gh = torch.einsum("bni,gnoi->bgno", h_chunks, Wh_struct)
+        gh = gh.reshape(B, 3, H) + bh
         gh_r, gh_z, gh_n = gh[:, 0, :], gh[:, 1, :], gh[:, 2, :]
 
         gi_r = gi[t, :, 0:H]
@@ -93,6 +110,7 @@ def gru_scan_monarch_forward_pytorch(
         z = torch.sigmoid(gi_z + gh_z)
         n = torch.tanh(gi_n + r * gh_n)
         h_new = (1.0 - z) * n + z * h
+        h_new, _ = _fake_quant(h_new, h_out_quant)
         out[t] = h_new
         h = h_new
 
@@ -114,11 +132,19 @@ def gru_scan_monarch_fwd_kernel(
     sW_g, sW_n, sW_o,
     so_t, so_b,
     NUM_PROGRAMS,
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     H: tl.constexpr,
     BLKSZ: tl.constexpr,
     NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     """Persistent forward over the block-diagonal recurrence.
 
@@ -166,6 +192,12 @@ def gru_scan_monarch_fwd_kernel(
             h_tile = tl.load(
                 h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
+            # quant_h_in only on the matmul-side h. The direct contribution
+            # to h_new uses raw h_old below — matches gru_cell.step.
+            if QUANT_H_IN:
+                q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                h_tile = q * h_in_scale
 
             # Three W tiles, one per gate. Each is [BLKSZ, BLOCK_K].
             W_block_offset = pid_block * sW_n
@@ -215,6 +247,11 @@ def gru_scan_monarch_fwd_kernel(
         h_old = tl.load(h_old_ptrs, mask=mask_b[:, None], other=0.0)
         h_new = (1.0 - z) * n + z * h_old
 
+        if QUANT_H_OUT:
+            q = tl.extra.libdevice.rint(h_new / h_out_scale)
+            q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
+            h_new = q * h_out_scale
+
         out_ptrs = (
             out_ptr
             + t * so_t
@@ -243,6 +280,8 @@ def gru_scan_monarch_forward_triton(
     block_k: int = 32,
     num_warps: int = 4,
     num_stages: int = 2,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Triton forward for the Monarch hidden-side scan."""
     assert gi.is_cuda and Wh_struct.is_cuda
@@ -270,6 +309,9 @@ def gru_scan_monarch_forward_triton(
             f"would deadlock on the spin-wait barrier."
         )
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = (n_pid_b, nblocks)
     gru_scan_monarch_fwd_kernel[grid](
         gi, h0, Wh_struct, bh_cat, out,
@@ -280,11 +322,15 @@ def gru_scan_monarch_forward_triton(
         Wh_struct.stride(0), Wh_struct.stride(1), Wh_struct.stride(2),
         out.stride(0), out.stride(1),
         num_programs,
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H,
         BLKSZ=out_blksz,
         NBLOCKS=nblocks,
         BLOCK_B=block_b,
         BLOCK_K=block_k,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -323,11 +369,19 @@ def gru_scan_monarch_bwd_kernel(
     sdbp_pid,
     sdh_b,
     NUM_PROGRAMS,
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     H: tl.constexpr,
     BLKSZ: tl.constexpr,
     NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     """Persistent backward over block-diagonal recurrence.
 
@@ -388,6 +442,10 @@ def gru_scan_monarch_bwd_kernel(
             h_tile = tl.load(
                 h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
+            if QUANT_H_IN:
+                q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                h_tile = q * h_in_scale
             W_block_offset = pid_block * sW_n
             W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
             Wr_tile = tl.load(
@@ -452,6 +510,14 @@ def gru_scan_monarch_bwd_kernel(
         )
         dout_oh = tl.load(dout_base, mask=mask_b[:, None], other=0.0)
         dh_t = dout_oh + dh_acc_oh
+
+        # STE backward of quant_h_out: incoming dh_t is grad on quantized
+        # h_t. Recompute h_t_raw to derive the clip mask.
+        if QUANT_H_OUT:
+            h_t_raw = (1.0 - z) * n + z * h_prev_oh
+            q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+            mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
+            dh_t = tl.where(mask_out, dh_t, 0.0)
 
         # h_t = (1 - z) * n + z * h_prev
         dn = dh_t * (1.0 - z)
@@ -531,6 +597,27 @@ def gru_scan_monarch_bwd_kernel(
                 + tl.dot(dgh_z, Wz_t, input_precision="tf32")
                 + tl.dot(dgh_n, Wn_t, input_precision="tf32")
             )
+            # STE backward of quant_h_in: contrib is grad on the quantized
+            # h_prev (matmul side); zero where the value was clipped.
+            # Reuse the h_prev tile we'll need for dWh below — load once.
+            h_prev_k_ptrs = (
+                h_prev_ptr
+                + offs_b[:, None] * sh_prev_b
+                + (pid_block * BLKSZ + offs_k)[None, :]
+            )
+            h_prev_tile_raw = tl.load(
+                h_prev_k_ptrs,
+                mask=mask_b[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+            if QUANT_H_IN:
+                q_in_unclamped = tl.extra.libdevice.rint(
+                    h_prev_tile_raw / h_in_scale
+                )
+                mask_in = (q_in_unclamped >= h_in_qmin) & (
+                    q_in_unclamped <= h_in_qmax
+                )
+                contrib = tl.where(mask_in, contrib, 0.0)
 
             # Each k-tile of `contrib` writes to a DIFFERENT range of
             # dh_acc (offs_k shifts by BLOCK_K per iter), so we always
@@ -548,15 +635,14 @@ def gru_scan_monarch_bwd_kernel(
             )
 
             # dWh_partial accumulation: dgh^T @ h_prev_chunk, per gate.
-            # Load h_prev tile for this k range.
-            h_prev_ptrs = (
-                h_prev_ptr
-                + offs_b[:, None] * sh_prev_b
-                + (pid_block * BLKSZ + offs_k)[None, :]
-            )
-            h_prev_tile = tl.load(
-                h_prev_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
-            )
+            # Reuse h_prev_tile_raw loaded above for the STE mask.
+            h_prev_tile = h_prev_tile_raw
+            # Forward used hq = quant_h_in(h_prev) in the matmul, so dWh
+            # accumulates against hq, not raw h_prev.
+            if QUANT_H_IN:
+                q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                h_prev_tile = q * h_in_scale
             # [BLKSZ, BLOCK_B] @ [BLOCK_B, BLOCK_K] -> [BLKSZ, BLOCK_K]
             dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
             dWz = tl.dot(tl.trans(dgh_z), h_prev_tile, input_precision="tf32")
@@ -631,6 +717,8 @@ def gru_scan_monarch_backward_triton(
     block_k: int = 32,
     num_warps: int = 4,
     num_stages: int = 1,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton backward for the Monarch hidden-side scan."""
     T, B, three_H = gi.shape
@@ -668,6 +756,9 @@ def gru_scan_monarch_backward_triton(
     dh_acc = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
     barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = (n_pid_b, nblocks)
     gru_scan_monarch_bwd_kernel[grid](
         gi, h0, Wh_struct, bh_cat, out,
@@ -688,11 +779,15 @@ def gru_scan_monarch_backward_triton(
         dbh_partial.stride(0),
         dh_acc.stride(0),
         num_programs,
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H,
         BLKSZ=out_blksz,
         NBLOCKS=nblocks,
         BLOCK_B=block_b,
         BLOCK_K=block_k,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -706,9 +801,9 @@ class GRUScanMonarchFunction(torch.autograd.Function):
     """autograd wrapper around the Monarch persistent kernels.
 
     Forward and backward both use 2D persistent grids (batch_tile,
-    block) with a cross-CTA barrier between timesteps. fp32 only — no
-    fake-quant on hidden state in this path yet (would mirror the dense
-    persistent kernel's QUANT_H_IN/QUANT_H_OUT, future work).
+    block) with a cross-CTA barrier between timesteps. Optional
+    in-kernel fake-quant on hidden state (per-tensor symmetric, frozen
+    scale) — same semantics as ``GRUScanPersistentFunction``.
     """
 
     @staticmethod
@@ -718,17 +813,26 @@ class GRUScanMonarchFunction(torch.autograd.Function):
         h0: torch.Tensor,
         Wh_struct: torch.Tensor,
         bh_cat: torch.Tensor,
+        h_in_quant: tuple[float, int, int] | None,
+        h_out_quant: tuple[float, int, int] | None,
     ) -> torch.Tensor:
-        out = gru_scan_monarch_forward_triton(gi, h0, Wh_struct, bh_cat)
+        out = gru_scan_monarch_forward_triton(
+            gi, h0, Wh_struct, bh_cat,
+            h_in_quant=h_in_quant, h_out_quant=h_out_quant,
+        )
         ctx.save_for_backward(gi, h0, Wh_struct, bh_cat, out)
+        ctx.h_in_quant = h_in_quant
+        ctx.h_out_quant = h_out_quant
         return out
 
     @staticmethod
     def backward(ctx, dout):  # type: ignore[override]
         gi, h0, Wh_struct, bh_cat, out = ctx.saved_tensors
-        return gru_scan_monarch_backward_triton(
-            gi, h0, Wh_struct, bh_cat, out, dout
+        grads = gru_scan_monarch_backward_triton(
+            gi, h0, Wh_struct, bh_cat, out, dout,
+            h_in_quant=ctx.h_in_quant, h_out_quant=ctx.h_out_quant,
         )
+        return (*grads, None, None)
 
 
 def gru_scan_monarch(
@@ -736,16 +840,24 @@ def gru_scan_monarch(
     h0: torch.Tensor,
     Wh_struct: torch.Tensor,
     bh_cat: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Public API: differentiable Monarch-hidden-side GRU scan.
 
     Mirror of ``gru_scan_persistent`` but with block-diagonal Wh:
     - ``Wh_struct: [3, nblocks, blksz, blksz]`` where ``blksz = H/nblocks``.
     - ``bh_cat: [3*H]``, same as dense.
-    Use ``extract_monarch_factors(cell)`` to pull these out of a tier-1
-    structured GRUCellQuant.
+    With ``h_in_quant`` / ``h_out_quant`` supplied (each
+    ``(scale, qmin, qmax)``), the kernel applies in-kernel fake-quant on
+    hidden state every step, identical to ``gru_scan_persistent``.
+    Use ``extract_monarch_factors(cell)`` to pull factors out of a
+    tier-1 structured GRUCellQuant.
     """
-    return GRUScanMonarchFunction.apply(gi, h0, Wh_struct, bh_cat)
+    return GRUScanMonarchFunction.apply(
+        gi, h0, Wh_struct, bh_cat, h_in_quant, h_out_quant
+    )
 
 
 def gru_scan_monarch_backward_pytorch(
@@ -755,6 +867,9 @@ def gru_scan_monarch_backward_pytorch(
     bh_cat: torch.Tensor,
     out: torch.Tensor,
     dout: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference backward.
 
@@ -777,11 +892,12 @@ def gru_scan_monarch_backward_pytorch(
     for t in reversed(range(T)):
         h_prev = h0 if t == 0 else out[t - 1]
 
-        # Forward recompute
+        # Forward recompute (with quant_h_in on the matmul-side h).
         gi_r = gi[t, :, 0:H]
         gi_z = gi[t, :, H:2 * H]
         gi_n = gi[t, :, 2 * H:3 * H]
-        h_chunks = h_prev.view(B, nblocks, blksz)
+        h_for_matmul, mask_in = _fake_quant(h_prev, h_in_quant)
+        h_chunks = h_for_matmul.view(B, nblocks, blksz)
         gh = torch.einsum("bni,gnoi->bgno", h_chunks, Wh_struct)
         gh = gh.reshape(B, 3, H) + bh_cat.view(3, H)
         gh_r = gh[:, 0, :]
@@ -790,10 +906,16 @@ def gru_scan_monarch_backward_pytorch(
         r = torch.sigmoid(gi_r + gh_r)
         z = torch.sigmoid(gi_z + gh_z)
         n = torch.tanh(gi_n + r * gh_n)
+        h_t_raw = (1.0 - z) * n + z * h_prev
 
         dh_t = dout[t] + dh_acc
 
-        # h_t = (1-z)*n + z*h_prev
+        # STE backward through quant_h_out: gradient on h_t_q -> on h_t_raw.
+        if h_out_quant is not None:
+            _, mask_out = _fake_quant(h_t_raw, h_out_quant)
+            dh_t = dh_t * mask_out
+
+        # h_t_raw = (1-z)*n + z*h_prev
         dn = dh_t * (1.0 - z)
         dz = dh_t * (h_prev - n)
         dh_prev_direct = dh_t * z
@@ -821,15 +943,17 @@ def gru_scan_monarch_backward_pytorch(
         dbh += dgh.sum(dim=0).reshape(-1)  # accumulate over batch and time
         dgh_chunks = dgh.view(B, 3, nblocks, blksz)
 
-        # gh = einsum('bni,gnoi->bgno', h_chunks, Wh_struct)
-        # Backward:
-        #   dWh_struct[g, n, o, i] += sum_b dgh[b, g, n, o] * h_chunks[b, n, i]
-        #   dh_chunks[b, n, i] += sum_{g,o} dgh[b, g, n, o] * Wh_struct[g, n, o, i]
+        # gh = einsum('bni,gnoi->bgno', h_chunks, Wh_struct)  with h_chunks
+        # being the *quantized* h_for_matmul. Backward:
+        #   dWh_struct accumulates against quantized h_chunks (matches forward).
+        #   dh_chunks (grad on quantized h) -> grad on raw h via STE mask.
         dWh_struct += torch.einsum("bgno,bni->gnoi", dgh_chunks, h_chunks)
         dh_via_W_chunks = torch.einsum(
             "bgno,gnoi->bni", dgh_chunks, Wh_struct
         )
         dh_via_W = dh_via_W_chunks.reshape(B, H)
+        if mask_in is not None:
+            dh_via_W = dh_via_W * mask_in
 
         dh_acc = dh_prev_direct + dh_via_W
 

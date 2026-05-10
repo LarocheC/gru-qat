@@ -129,6 +129,89 @@ def test_monarch_triton_forward_matches_pytorch(
 
 @cuda_only
 @pytest.mark.parametrize("T,B,H,nblocks", [(8, 32, 64, 4), (16, 32, 256, 4)])
+def test_monarch_triton_qat_forward_matches_pytorch(
+    T: int, B: int, H: int, nblocks: int
+) -> None:
+    """In-kernel fake-quant forward: Triton must match PyTorch reference."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    blksz = H // nblocks
+    gi = (torch.randn(T, B, 3 * H, device=device) * 0.1).contiguous()
+    h0 = (torch.randn(B, H, device=device) * 0.1).contiguous()
+    Wh_struct = (torch.randn(3, nblocks, blksz, blksz, device=device) * 0.1).contiguous()
+    bh_cat = (torch.randn(3 * H, device=device) * 0.05).contiguous()
+
+    bits = 8
+    qmin, qmax = -(2 ** (bits - 1)) + 1, 2 ** (bits - 1) - 1
+    h_in_q = (0.02, qmin, qmax)
+    h_out_q = (0.02, qmin, qmax)
+
+    ref = gru_scan_monarch_forward_pytorch(
+        gi, h0, Wh_struct, bh_cat,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+    tri = gru_scan_monarch_forward_triton(
+        gi, h0, Wh_struct, bh_cat,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+
+    max_diff = (ref - tri).abs().max().item()
+    rel = max_diff / max(ref.abs().max().item(), 1e-6)
+    assert rel < 1e-1, f"qat forward rel diff {rel:.4e}"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H,nblocks", [(8, 32, 64, 4), (16, 32, 256, 4)])
+def test_monarch_triton_qat_backward_matches_pytorch(
+    T: int, B: int, H: int, nblocks: int
+) -> None:
+    """In-kernel fake-quant backward: Triton must match PyTorch reference
+    on (dgi, dh0, dWh_struct, dbh)."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    blksz = H // nblocks
+    gi = (torch.randn(T, B, 3 * H, device=device) * 0.1).contiguous()
+    h0 = (torch.randn(B, H, device=device) * 0.1).contiguous()
+    Wh_struct = (torch.randn(3, nblocks, blksz, blksz, device=device) * 0.1).contiguous()
+    bh_cat = (torch.randn(3 * H, device=device) * 0.05).contiguous()
+
+    bits = 8
+    qmin, qmax = -(2 ** (bits - 1)) + 1, 2 ** (bits - 1) - 1
+    h_in_q = (0.02, qmin, qmax)
+    h_out_q = (0.02, qmin, qmax)
+
+    out_fwd = gru_scan_monarch_forward_triton(
+        gi, h0, Wh_struct, bh_cat,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+    dout = (torch.randn(T, B, H, device=device) * 0.1).contiguous()
+
+    dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_monarch_backward_triton(
+        gi, h0, Wh_struct, bh_cat, out_fwd, dout,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+    dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_monarch_backward_pytorch(
+        gi, h0, Wh_struct, bh_cat, out_fwd, dout,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+
+    for name, t, p in [
+        ("dgi", dgi_t, dgi_p),
+        ("dh0", dh0_t, dh0_p),
+        ("dWh_struct", dWh_t, dWh_p),
+        ("dbh", dbh_t, dbh_p),
+    ]:
+        diff = (t - p).abs().max().item()
+        rel = diff / max(p.abs().max().item(), 1e-9)
+        assert rel < 1e-1, f"qat {name} rel diff {rel:.4e}"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H,nblocks", [(8, 32, 64, 4), (16, 32, 256, 4)])
 def test_monarch_triton_backward_matches_pytorch(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
