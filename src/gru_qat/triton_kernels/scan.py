@@ -132,7 +132,7 @@ def gru_scan_fwd_persistent_kernel(
             # quant_h_in only on the matmul-side h (direct contribution
             # uses the raw h_old below — matches gru_cell.step semantics).
             if QUANT_H_IN:
-                q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(h_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_tile = q * h_in_scale
             W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
@@ -165,14 +165,14 @@ def gru_scan_fwd_persistent_kernel(
 
         r = tl.sigmoid(gir + ghr)
         z = tl.sigmoid(giz + ghz)
-        n = tl.extra.libdevice.tanh(gin + r * ghn)
+        n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
         h_old_ptrs = h_in_ptr + offs_b[:, None] * sh_b + offs_oh[None, :]
         h_old = tl.load(h_old_ptrs, mask=mask_oh2, other=0.0)
         h_new = (1.0 - z) * n + z * h_old
 
         if QUANT_H_OUT:
-            q = tl.extra.libdevice.rint(h_new / h_out_scale)
+            q = tl.extra.cuda.libdevice.rint(h_new / h_out_scale)
             q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
             h_new = q * h_out_scale
 
@@ -388,7 +388,7 @@ def gru_scan_bwd_persistent_kernel(
                 h_prev_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
             if QUANT_H_IN:
-                q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_prev_tile = q * h_in_scale
             W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
@@ -419,7 +419,7 @@ def gru_scan_bwd_persistent_kernel(
         gin = tl.load(gi_base + 2 * H, mask=mask_oh2, other=0.0)
         r = tl.sigmoid(gir + ghr)
         z = tl.sigmoid(giz + ghz)
-        n = tl.extra.libdevice.tanh(gin + r * ghn)
+        n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
         h_prev_oh_ptrs = (
             h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_oh[None, :]
@@ -433,7 +433,7 @@ def gru_scan_bwd_persistent_kernel(
         # not be visible through L1 cache without it.
         dh_acc_ptrs = read_ptr + offs_b[:, None] * sdh_b + offs_oh[None, :]
         dh_acc_oh = tl.load(
-            dh_acc_ptrs, mask=mask_oh2, other=0.0, cache_modifier=".cv",
+            dh_acc_ptrs, mask=mask_oh2, other=0.0,
         )
         tl.store(dh_acc_ptrs, tl.zeros_like(dh_acc_oh), mask=mask_oh2)
 
@@ -448,7 +448,7 @@ def gru_scan_bwd_persistent_kernel(
         # h_t_raw before propagating through the recurrence.
         if QUANT_H_OUT:
             h_t_raw = (1.0 - z) * n + z * h_prev_oh
-            q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+            q_unclamped = tl.extra.cuda.libdevice.rint(h_t_raw / h_out_scale)
             mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
             dh_t = tl.where(mask_out, dh_t, 0.0)
 
@@ -540,7 +540,7 @@ def gru_scan_bwd_persistent_kernel(
                     mask=mask_b[:, None] & mask_k[None, :],
                     other=0.0,
                 )
-                q_in_unclamped = tl.extra.libdevice.rint(h_prev_k / h_in_scale)
+                q_in_unclamped = tl.extra.cuda.libdevice.rint(h_prev_k / h_in_scale)
                 mask_in = (q_in_unclamped >= h_in_qmin) & (
                     q_in_unclamped <= h_in_qmax
                 )
@@ -572,7 +572,7 @@ def gru_scan_bwd_persistent_kernel(
             # Forward used hq = quant_h_in(h_prev) in the matmul, so dWh
             # accumulates against hq, not raw h_prev.
             if QUANT_H_IN:
-                q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_prev_tile = q * h_in_scale
             dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
@@ -627,7 +627,7 @@ def gru_scan_bwd_persistent_kernel(
     # be stale.
     dh_final_ptrs = read_ptr + offs_b[:, None] * sdh_b + offs_oh[None, :]
     dh_final = tl.load(
-        dh_final_ptrs, mask=mask_oh2, other=0.0, cache_modifier=".cv",
+        dh_final_ptrs, mask=mask_oh2, other=0.0,
     )
     dh0_ptrs = dh0_ptr + offs_b[:, None] * sdh0_b + offs_oh[None, :]
     tl.store(dh0_ptrs, dh_final, mask=mask_oh2)
@@ -804,7 +804,7 @@ def gru_scan_fwd_kernel(
                 # Direct contribution to h_new uses the *unquantized* h (see
                 # gru_cell.step), so we only mutate this matmul-local copy.
                 if QUANT_H_IN:
-                    q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                    q = tl.extra.cuda.libdevice.rint(h_tile / h_in_scale)
                     q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                     h_tile = q * h_in_scale
 
@@ -860,7 +860,7 @@ def gru_scan_fwd_kernel(
             # Gate math (matches gru_cell.step_with_gi, no fake-quant).
             r = tl.sigmoid(gir + ghr)
             z = tl.sigmoid(giz + ghz)
-            n = tl.extra.libdevice.tanh(gin + r * ghn)
+            n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
             # h_new = (1 - z) * n + z * h_old. Need h_old for THIS oh tile.
             h_old_ptrs = (
@@ -872,7 +872,7 @@ def gru_scan_fwd_kernel(
             # Apply quant_h_out before storing — the next step will read
             # this back as h_prev, so it sees the post-quant value.
             if QUANT_H_OUT:
-                q = tl.extra.libdevice.rint(h_new / h_out_scale)
+                q = tl.extra.cuda.libdevice.rint(h_new / h_out_scale)
                 q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
                 h_new = q * h_out_scale
 
@@ -1025,7 +1025,7 @@ def gru_scan_bwd_kernel(
 
                 # Apply quant_h_in to match the forward kernel.
                 if QUANT_H_IN:
-                    q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                    q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
                     q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                     h_prev_tile = q * h_in_scale
 
@@ -1064,7 +1064,7 @@ def gru_scan_bwd_kernel(
 
             r = tl.sigmoid(gir + ghr)
             z = tl.sigmoid(giz + ghz)
-            n = tl.extra.libdevice.tanh(gin + r * ghn)
+            n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
             # h_prev at this oh tile (for h_prev_direct in dz and dh_prev_direct)
             h_prev_oh_ptrs = (
@@ -1091,7 +1091,7 @@ def gru_scan_bwd_kernel(
             # Recompute h_t_raw to derive the mask.
             if QUANT_H_OUT:
                 h_t_raw = (1.0 - z) * n + z * h_prev_oh
-                q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+                q_unclamped = tl.extra.cuda.libdevice.rint(h_t_raw / h_out_scale)
                 mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
                 dh_t = tl.where(mask_out, dh_t, 0.0)
 
@@ -1196,7 +1196,7 @@ def gru_scan_bwd_kernel(
                         mask=mask_b[:, None] & mask_k[None, :],
                         other=0.0,
                     )
-                    q_in_unclamped = tl.extra.libdevice.rint(h_prev_k / h_in_scale)
+                    q_in_unclamped = tl.extra.cuda.libdevice.rint(h_prev_k / h_in_scale)
                     mask_in = (q_in_unclamped >= h_in_qmin) & (
                         q_in_unclamped <= h_in_qmax
                     )
@@ -1241,7 +1241,7 @@ def gru_scan_bwd_kernel(
                 # Forward used hq = quant_h_in(h_prev) in the matmul, so
                 # dWh accumulates against hq, not raw h_prev.
                 if QUANT_H_IN:
-                    q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                    q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
                     q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                     h_prev_tile = q * h_in_scale
 

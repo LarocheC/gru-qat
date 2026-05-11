@@ -212,7 +212,7 @@ def gru_scan_butterfly_fwd_kernel(
             mask=mask_b[:, None], other=0.0,
         )
         if QUANT_H_IN:
-            q = tl.extra.libdevice.rint(h_self / h_in_scale)
+            q = tl.extra.cuda.libdevice.rint(h_self / h_in_scale)
             q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
             h_self_q = q * h_in_scale
         else:
@@ -296,11 +296,11 @@ def gru_scan_butterfly_fwd_kernel(
 
         r = tl.sigmoid(gir + gh_r)
         z = tl.sigmoid(giz + gh_z)
-        n = tl.extra.libdevice.tanh(gin + r * gh_n)
+        n = tl.extra.cuda.libdevice.tanh(gin + r * gh_n)
         h_new = (1.0 - z) * n + z * h_self
 
         if QUANT_H_OUT:
-            q = tl.extra.libdevice.rint(h_new / h_out_scale)
+            q = tl.extra.cuda.libdevice.rint(h_new / h_out_scale)
             q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
             h_new = q * h_out_scale
 
@@ -486,7 +486,7 @@ def gru_scan_butterfly_bwd_kernel(
         # the matmul side starts from the QUANTIZED h_prev. The raw
         # h_prev is used below for the (1-z)*n + z*h_prev recurrence.
         if QUANT_H_IN:
-            q = tl.extra.libdevice.rint(h_prev / h_in_scale)
+            q = tl.extra.cuda.libdevice.rint(h_prev / h_in_scale)
             q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
             h_prev_q = q * h_in_scale
         else:
@@ -553,12 +553,12 @@ def gru_scan_butterfly_bwd_kernel(
 
         r = tl.sigmoid(gir + gh_r)
         z = tl.sigmoid(giz + gh_z)
-        n = tl.extra.libdevice.tanh(gin + r * gh_n)
+        n = tl.extra.cuda.libdevice.tanh(gin + r * gh_n)
 
         # ---- Read incoming dh_acc and dout[t] ----
         dh_acc_oh = tl.load(
             dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
-            mask=mask_b[:, None], other=0.0, cache_modifier=".cv",
+            mask=mask_b[:, None], other=0.0,
         )
         dout_oh = tl.load(
             dout_ptr + t * sdo_t + offs_b[:, None] * sdo_b + offs_h[None, :],
@@ -571,7 +571,7 @@ def gru_scan_butterfly_bwd_kernel(
         # h_t_raw to get grad on h_t_raw before walking the recurrence.
         if QUANT_H_OUT:
             h_t_raw = (1.0 - z) * n + z * h_prev
-            q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+            q_unclamped = tl.extra.cuda.libdevice.rint(h_t_raw / h_out_scale)
             mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
             dh_t = tl.where(mask_out, dh_t, 0.0)
 
@@ -806,7 +806,7 @@ def gru_scan_butterfly_bwd_kernel(
         )
         dh_via = dh_via_r + dh_via_z + dh_via_n
         if QUANT_H_IN:
-            q_in_unclamped = tl.extra.libdevice.rint(h_prev / h_in_scale)
+            q_in_unclamped = tl.extra.cuda.libdevice.rint(h_prev / h_in_scale)
             mask_in = (q_in_unclamped >= h_in_qmin) & (q_in_unclamped <= h_in_qmax)
             dh_via = tl.where(mask_in, dh_via, 0.0)
         dh_acc_new = dh_prev_direct + dh_via
@@ -820,7 +820,7 @@ def gru_scan_butterfly_bwd_kernel(
     # After loop, dh_acc holds dh0 for this batch tile.
     dh_final = tl.load(
         dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
-        mask=mask_b[:, None], other=0.0, cache_modifier=".cv",
+        mask=mask_b[:, None], other=0.0,
     )
     tl.store(
         dh0_ptr + offs_b[:, None] * sdh0_b + offs_h[None, :],

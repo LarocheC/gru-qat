@@ -195,7 +195,7 @@ def gru_scan_monarch_fwd_kernel(
             # quant_h_in only on the matmul-side h. The direct contribution
             # to h_new uses raw h_old below — matches gru_cell.step.
             if QUANT_H_IN:
-                q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(h_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_tile = q * h_in_scale
 
@@ -236,7 +236,7 @@ def gru_scan_monarch_fwd_kernel(
 
         r = tl.sigmoid(gir + ghr)
         z = tl.sigmoid(giz + ghz)
-        n = tl.extra.libdevice.tanh(gin + r * ghn)
+        n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
         # h_t = (1-z)*n + z*h_prev at THIS block's output positions.
         h_old_ptrs = (
@@ -248,7 +248,7 @@ def gru_scan_monarch_fwd_kernel(
         h_new = (1.0 - z) * n + z * h_old
 
         if QUANT_H_OUT:
-            q = tl.extra.libdevice.rint(h_new / h_out_scale)
+            q = tl.extra.cuda.libdevice.rint(h_new / h_out_scale)
             q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
             h_new = q * h_out_scale
 
@@ -443,7 +443,7 @@ def gru_scan_monarch_bwd_kernel(
                 h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
             )
             if QUANT_H_IN:
-                q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(h_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_tile = q * h_in_scale
             W_block_offset = pid_block * sW_n
@@ -479,7 +479,7 @@ def gru_scan_monarch_bwd_kernel(
 
         r = tl.sigmoid(gir + ghr)
         z = tl.sigmoid(giz + ghz)
-        n = tl.extra.libdevice.tanh(gin + r * ghn)
+        n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
         # h_prev at THIS block's positions (for dh_prev_direct and (1-z)*n + z*h_prev).
         h_prev_oh_ptrs = (
@@ -500,7 +500,7 @@ def gru_scan_monarch_bwd_kernel(
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
         dh_acc_oh = tl.load(
-            dh_acc_ptrs, mask=mask_b[:, None], other=0.0, cache_modifier=".cv",
+            dh_acc_ptrs, mask=mask_b[:, None], other=0.0,
         )
         dout_base = (
             dout_ptr
@@ -515,7 +515,7 @@ def gru_scan_monarch_bwd_kernel(
         # h_t. Recompute h_t_raw to derive the clip mask.
         if QUANT_H_OUT:
             h_t_raw = (1.0 - z) * n + z * h_prev_oh
-            q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+            q_unclamped = tl.extra.cuda.libdevice.rint(h_t_raw / h_out_scale)
             mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
             dh_t = tl.where(mask_out, dh_t, 0.0)
 
@@ -611,7 +611,7 @@ def gru_scan_monarch_bwd_kernel(
                 other=0.0,
             )
             if QUANT_H_IN:
-                q_in_unclamped = tl.extra.libdevice.rint(
+                q_in_unclamped = tl.extra.cuda.libdevice.rint(
                     h_prev_tile_raw / h_in_scale
                 )
                 mask_in = (q_in_unclamped >= h_in_qmin) & (
@@ -640,7 +640,7 @@ def gru_scan_monarch_bwd_kernel(
             # Forward used hq = quant_h_in(h_prev) in the matmul, so dWh
             # accumulates against hq, not raw h_prev.
             if QUANT_H_IN:
-                q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_prev_tile = q * h_in_scale
             # [BLKSZ, BLOCK_B] @ [BLOCK_B, BLOCK_K] -> [BLKSZ, BLOCK_K]
@@ -695,7 +695,7 @@ def gru_scan_monarch_bwd_kernel(
         + (pid_block * BLKSZ + offs_oh)[None, :]
     )
     dh_final = tl.load(
-        dh_final_ptrs, mask=mask_b[:, None], other=0.0, cache_modifier=".cv",
+        dh_final_ptrs, mask=mask_b[:, None], other=0.0,
     )
     dh0_ptrs = (
         dh0_ptr
