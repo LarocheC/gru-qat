@@ -140,6 +140,7 @@ def gru_scan_monarch_fwd_kernel(
     h_out_qmax,
     H: tl.constexpr,
     BLKSZ: tl.constexpr,
+    BLKSZ_PAD: tl.constexpr,
     NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -153,30 +154,36 @@ def gru_scan_monarch_fwd_kernel(
     boundaries don't mix in the matmul (block-diagonal), so the K
     reduction is only over blksz instead of full H — that's where the
     win comes from.
+
+    BLKSZ may be any positive integer; BLKSZ_PAD is the next power of 2
+    (Triton requires pow-2 ``tl.arange`` lengths). mask_oh = offs_oh <
+    BLKSZ excludes the padded tail from every memory op so we don't
+    corrupt the adjacent block / gate slice in the dense H/3H tensors.
     """
     pid_b = tl.program_id(0)
     pid_block = tl.program_id(1)
 
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
-    offs_oh = tl.arange(0, BLKSZ)  # output rows within this block
+    offs_oh = tl.arange(0, BLKSZ_PAD)  # output rows within this block (padded)
+    mask_oh = offs_oh < BLKSZ
 
     # Output position in flat 3H layout: gate * H + pid_block * BLKSZ + offs_oh.
     # h-input range: pid_block * BLKSZ + offs_k.
 
     # Pre-load the bias slice for this (gate, block) — 3 chunks of BLKSZ.
     bh_offset = pid_block * BLKSZ
-    bhr_tile = tl.load(bh_ptr + 0 * H + bh_offset + offs_oh)
-    bhz_tile = tl.load(bh_ptr + 1 * H + bh_offset + offs_oh)
-    bhn_tile = tl.load(bh_ptr + 2 * H + bh_offset + offs_oh)
+    bhr_tile = tl.load(bh_ptr + 0 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
+    bhz_tile = tl.load(bh_ptr + 1 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
+    bhn_tile = tl.load(bh_ptr + 2 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
 
     h_in_ptr = h0_ptr
     sh_b = sh0_b
 
     for t in range(0, T):
-        ghr = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
-        ghz = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
-        ghn = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
+        ghr = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
+        ghz = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
+        ghn = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
 
         for k in range(0, BLKSZ, BLOCK_K):
             offs_k = k + tl.arange(0, BLOCK_K)
@@ -199,20 +206,23 @@ def gru_scan_monarch_fwd_kernel(
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_tile = q * h_in_scale
 
-            # Three W tiles, one per gate. Each is [BLKSZ, BLOCK_K].
+            # Three W tiles, one per gate. Each is [BLKSZ_PAD, BLOCK_K].
+            # mask_oh zeroes the padded oh rows so they contribute 0 to
+            # the dot product over the BLKSZ_PAD axis.
             W_block_offset = pid_block * sW_n
             W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
+            W_mask = mask_oh[:, None] & mask_k[None, :]
             Wr_tile = tl.load(
                 Wh_ptr + 0 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             Wz_tile = tl.load(
                 Wh_ptr + 1 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             Wn_tile = tl.load(
                 Wh_ptr + 2 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
 
             ghr += tl.dot(h_tile, tl.trans(Wr_tile), input_precision="tf32")
@@ -230,9 +240,10 @@ def gru_scan_monarch_fwd_kernel(
             + offs_b[:, None] * sg_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        gir = tl.load(gi_base + 0 * H, mask=mask_b[:, None], other=0.0)
-        giz = tl.load(gi_base + 1 * H, mask=mask_b[:, None], other=0.0)
-        gin = tl.load(gi_base + 2 * H, mask=mask_b[:, None], other=0.0)
+        gi_mask = mask_b[:, None] & mask_oh[None, :]
+        gir = tl.load(gi_base + 0 * H, mask=gi_mask, other=0.0)
+        giz = tl.load(gi_base + 1 * H, mask=gi_mask, other=0.0)
+        gin = tl.load(gi_base + 2 * H, mask=gi_mask, other=0.0)
 
         r = tl.sigmoid(gir + ghr)
         z = tl.sigmoid(giz + ghz)
@@ -244,7 +255,7 @@ def gru_scan_monarch_fwd_kernel(
             + offs_b[:, None] * sh_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        h_old = tl.load(h_old_ptrs, mask=mask_b[:, None], other=0.0)
+        h_old = tl.load(h_old_ptrs, mask=gi_mask, other=0.0)
         h_new = (1.0 - z) * n + z * h_old
 
         if QUANT_H_OUT:
@@ -258,7 +269,7 @@ def gru_scan_monarch_fwd_kernel(
             + offs_b[:, None] * so_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        tl.store(out_ptrs, h_new, mask=mask_b[:, None])
+        tl.store(out_ptrs, h_new, mask=gi_mask)
 
         # Cross-CTA barrier: pair release/acquire same as dense persistent.
         tl.atomic_add(barrier_ptr + t, 1, sem="release")
@@ -313,6 +324,7 @@ def gru_scan_monarch_forward_triton(
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
     grid = (n_pid_b, nblocks)
+    blksz_pad = triton.next_power_of_2(out_blksz)
     gru_scan_monarch_fwd_kernel[grid](
         gi, h0, Wh_struct, bh_cat, out,
         barrier,
@@ -326,6 +338,7 @@ def gru_scan_monarch_forward_triton(
         out_s, out_qmin, out_qmax,
         H=H,
         BLKSZ=out_blksz,
+        BLKSZ_PAD=blksz_pad,
         NBLOCKS=nblocks,
         BLOCK_B=block_b,
         BLOCK_K=block_k,
@@ -377,6 +390,7 @@ def gru_scan_monarch_bwd_kernel(
     h_out_qmax,
     H: tl.constexpr,
     BLKSZ: tl.constexpr,
+    BLKSZ_PAD: tl.constexpr,
     NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -391,19 +405,25 @@ def gru_scan_monarch_bwd_kernel(
     block i's dh_via_W only feeds block i's input slice. So no atomic
     adds or ping-pong buffers — just a single dh_acc scratch with a
     cross-CTA barrier between timesteps.
+
+    BLKSZ may be any positive integer; BLKSZ_PAD is the next power of 2.
+    mask_oh = offs_oh < BLKSZ excludes the padded tail from every memory
+    op so we don't corrupt adjacent block / gate slices.
     """
     pid_b = tl.program_id(0)
     pid_block = tl.program_id(1)
 
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
-    offs_oh = tl.arange(0, BLKSZ)
+    offs_oh = tl.arange(0, BLKSZ_PAD)
+    mask_oh = offs_oh < BLKSZ
+    mask_bo = mask_b[:, None] & mask_oh[None, :]
 
     # Pre-load bias slice (constant across T).
     bh_offset = pid_block * BLKSZ
-    bhr_tile = tl.load(bh_ptr + 0 * H + bh_offset + offs_oh)
-    bhz_tile = tl.load(bh_ptr + 1 * H + bh_offset + offs_oh)
-    bhn_tile = tl.load(bh_ptr + 2 * H + bh_offset + offs_oh)
+    bhr_tile = tl.load(bh_ptr + 0 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
+    bhz_tile = tl.load(bh_ptr + 1 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
+    bhn_tile = tl.load(bh_ptr + 2 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
 
     # Initialize dh_acc[:, this block range] to zero.
     dh_acc_init_ptrs = (
@@ -413,8 +433,8 @@ def gru_scan_monarch_bwd_kernel(
     )
     tl.store(
         dh_acc_init_ptrs,
-        tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32),
-        mask=mask_b[:, None],
+        tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32),
+        mask=mask_bo,
     )
 
     for t_rev in range(0, T):
@@ -428,9 +448,9 @@ def gru_scan_monarch_bwd_kernel(
             sh_prev_b = so_b
 
         # ---- Recompute forward gh for this (block, all gates) ----
-        ghr = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
-        ghz = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
-        ghn = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
+        ghr = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
+        ghz = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
+        ghn = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
         for k in range(0, BLKSZ, BLOCK_K):
             offs_k = k + tl.arange(0, BLOCK_K)
             mask_k = offs_k < BLKSZ
@@ -448,17 +468,18 @@ def gru_scan_monarch_bwd_kernel(
                 h_tile = q * h_in_scale
             W_block_offset = pid_block * sW_n
             W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
+            W_mask = mask_oh[:, None] & mask_k[None, :]
             Wr_tile = tl.load(
                 Wh_ptr + 0 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             Wz_tile = tl.load(
                 Wh_ptr + 1 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             Wn_tile = tl.load(
                 Wh_ptr + 2 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             ghr += tl.dot(h_tile, tl.trans(Wr_tile), input_precision="tf32")
             ghz += tl.dot(h_tile, tl.trans(Wz_tile), input_precision="tf32")
@@ -473,9 +494,9 @@ def gru_scan_monarch_bwd_kernel(
             + offs_b[:, None] * sg_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        gir = tl.load(gi_base + 0 * H, mask=mask_b[:, None], other=0.0)
-        giz = tl.load(gi_base + 1 * H, mask=mask_b[:, None], other=0.0)
-        gin = tl.load(gi_base + 2 * H, mask=mask_b[:, None], other=0.0)
+        gir = tl.load(gi_base + 0 * H, mask=mask_bo, other=0.0)
+        giz = tl.load(gi_base + 1 * H, mask=mask_bo, other=0.0)
+        gin = tl.load(gi_base + 2 * H, mask=mask_bo, other=0.0)
 
         r = tl.sigmoid(gir + ghr)
         z = tl.sigmoid(giz + ghz)
@@ -487,20 +508,16 @@ def gru_scan_monarch_bwd_kernel(
             + offs_b[:, None] * sh_prev_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        h_prev_oh = tl.load(h_prev_oh_ptrs, mask=mask_b[:, None], other=0.0)
+        h_prev_oh = tl.load(h_prev_oh_ptrs, mask=mask_bo, other=0.0)
 
-        # ---- Read incoming dh_acc[this block range]. Uses .cv to bypass
-        # L1 since the previous step's writes from THIS SAME PROGRAM are
-        # always visible (no cross-program writes here), so .cv is
-        # technically unnecessary — but cheap insurance against
-        # compiler-reordering surprises. ----
+        # ---- Read incoming dh_acc[this block range].
         dh_acc_ptrs = (
             dh_acc_ptr
             + offs_b[:, None] * sdh_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
         dh_acc_oh = tl.load(
-            dh_acc_ptrs, mask=mask_b[:, None], other=0.0,
+            dh_acc_ptrs, mask=mask_bo, other=0.0,
         )
         dout_base = (
             dout_ptr
@@ -508,7 +525,7 @@ def gru_scan_monarch_bwd_kernel(
             + offs_b[:, None] * sdo_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        dout_oh = tl.load(dout_base, mask=mask_b[:, None], other=0.0)
+        dout_oh = tl.load(dout_base, mask=mask_bo, other=0.0)
         dh_t = dout_oh + dh_acc_oh
 
         # STE backward of quant_h_out: incoming dh_t is grad on quantized
@@ -544,62 +561,62 @@ def gru_scan_monarch_bwd_kernel(
             + offs_b[:, None] * sdgi_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        tl.store(dgi_base + 0 * H, dgi_r, mask=mask_b[:, None])
-        tl.store(dgi_base + 1 * H, dgi_z, mask=mask_b[:, None])
-        tl.store(dgi_base + 2 * H, dgi_n, mask=mask_b[:, None])
+        tl.store(dgi_base + 0 * H, dgi_r, mask=mask_bo)
+        tl.store(dgi_base + 1 * H, dgi_z, mask=mask_bo)
+        tl.store(dgi_base + 2 * H, dgi_n, mask=mask_bo)
 
         # dbh_partial: each (pid_b, pid_block) is the only writer to its
-        # bias slice rows.
+        # bias slice rows. Padded oh lanes must be masked or they'd land
+        # in the next block / gate slot.
         dbh_base = dbh_partial_ptr + pid_b * sdbp_pid + bh_offset + offs_oh
         tl.store(
             dbh_base + 0 * H,
-            tl.load(dbh_base + 0 * H) + tl.sum(dgh_r, axis=0),
+            tl.load(dbh_base + 0 * H, mask=mask_oh, other=0.0) + tl.sum(dgh_r, axis=0),
+            mask=mask_oh,
         )
         tl.store(
             dbh_base + 1 * H,
-            tl.load(dbh_base + 1 * H) + tl.sum(dgh_z, axis=0),
+            tl.load(dbh_base + 1 * H, mask=mask_oh, other=0.0) + tl.sum(dgh_z, axis=0),
+            mask=mask_oh,
         )
         tl.store(
             dbh_base + 2 * H,
-            tl.load(dbh_base + 2 * H) + tl.sum(dgh_n, axis=0),
+            tl.load(dbh_base + 2 * H, mask=mask_oh, other=0.0) + tl.sum(dgh_n, axis=0),
+            mask=mask_oh,
         )
 
         # ---- dh_prev_via_W and dWh_partial accumulation ----
         # Both are per-block (no cross-block contributions). For each k-tile,
         # compute the dh_via_W contribution to dh_acc[this block, k:k+BLOCK_K]
         # and the dWh contribution dgh^T @ h_prev (per gate).
-        #
-        # We also need to handle dh_prev_direct contribution to dh_acc.
-        # Since dh_prev_direct lives at offs_oh range (same as block range),
-        # we add it once after the k-loop.
         for k in range(0, BLKSZ, BLOCK_K):
             offs_k = k + tl.arange(0, BLOCK_K)
             mask_k = offs_k < BLKSZ
             W_block_offset = pid_block * sW_n
             W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
+            W_mask = mask_oh[:, None] & mask_k[None, :]
             Wr_t = tl.load(
                 Wh_ptr + 0 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             Wz_t = tl.load(
                 Wh_ptr + 1 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
             Wn_t = tl.load(
                 Wh_ptr + 2 * sW_g + W_block_offset + W_oh_offset,
-                mask=mask_k[None, :], other=0.0,
+                mask=W_mask, other=0.0,
             )
 
             # dh_via_W tile: sum over gates of dgh[g] @ W[g, :, :]
-            # dgh_r: [BLOCK_B, BLKSZ], Wr_t: [BLKSZ, BLOCK_K] -> [BLOCK_B, BLOCK_K]
+            # dgh_r: [BLOCK_B, BLKSZ_PAD], Wr_t: [BLKSZ_PAD, BLOCK_K]
+            # -> [BLOCK_B, BLOCK_K]. Padded oh rows of W are 0 (masked
+            # load), so padded-row garbage in dgh contributes nothing.
             contrib = (
                 tl.dot(dgh_r, Wr_t, input_precision="tf32")
                 + tl.dot(dgh_z, Wz_t, input_precision="tf32")
                 + tl.dot(dgh_n, Wn_t, input_precision="tf32")
             )
-            # STE backward of quant_h_in: contrib is grad on the quantized
-            # h_prev (matmul side); zero where the value was clipped.
-            # Reuse the h_prev tile we'll need for dWh below — load once.
             h_prev_k_ptrs = (
                 h_prev_ptr
                 + offs_b[:, None] * sh_prev_b
@@ -619,11 +636,7 @@ def gru_scan_monarch_bwd_kernel(
                 )
                 contrib = tl.where(mask_in, contrib, 0.0)
 
-            # Each k-tile of `contrib` writes to a DIFFERENT range of
-            # dh_acc (offs_k shifts by BLOCK_K per iter), so we always
-            # store — no read-modify-write across k iters. The previous
-            # step's value at this cell has already been consumed (we
-            # read `dh_acc_oh` into `dh_t` at the top of the step).
+            # Each k-tile of `contrib` writes to a DIFFERENT range of dh_acc.
             dh_w_ptrs = (
                 dh_acc_ptr
                 + offs_b[:, None] * sdh_b
@@ -635,15 +648,14 @@ def gru_scan_monarch_bwd_kernel(
             )
 
             # dWh_partial accumulation: dgh^T @ h_prev_chunk, per gate.
-            # Reuse h_prev_tile_raw loaded above for the STE mask.
             h_prev_tile = h_prev_tile_raw
-            # Forward used hq = quant_h_in(h_prev) in the matmul, so dWh
-            # accumulates against hq, not raw h_prev.
             if QUANT_H_IN:
                 q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 h_prev_tile = q * h_in_scale
-            # [BLKSZ, BLOCK_B] @ [BLOCK_B, BLOCK_K] -> [BLKSZ, BLOCK_K]
+            # [BLKSZ_PAD, BLOCK_B] @ [BLOCK_B, BLOCK_K] -> [BLKSZ_PAD, BLOCK_K].
+            # Padded oh rows of dgh^T contain garbage; mask_oh on the
+            # store ensures only real rows reach memory.
             dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
             dWz = tl.dot(tl.trans(dgh_z), h_prev_tile, input_precision="tf32")
             dWn = tl.dot(tl.trans(dgh_n), h_prev_tile, input_precision="tf32")
@@ -656,21 +668,21 @@ def gru_scan_monarch_bwd_kernel(
             Wr_dW_ptrs = dWh_base + 0 * sdWp_g + offs_oh[:, None] * sdWp_o + offs_k[None, :]
             Wz_dW_ptrs = dWh_base + 1 * sdWp_g + offs_oh[:, None] * sdWp_o + offs_k[None, :]
             Wn_dW_ptrs = dWh_base + 2 * sdWp_g + offs_oh[:, None] * sdWp_o + offs_k[None, :]
-            mask_okok = mask_k[None, :]
+            dW_mask = mask_oh[:, None] & mask_k[None, :]
             tl.store(
                 Wr_dW_ptrs,
-                tl.load(Wr_dW_ptrs, mask=mask_okok, other=0.0) + dWr,
-                mask=mask_okok,
+                tl.load(Wr_dW_ptrs, mask=dW_mask, other=0.0) + dWr,
+                mask=dW_mask,
             )
             tl.store(
                 Wz_dW_ptrs,
-                tl.load(Wz_dW_ptrs, mask=mask_okok, other=0.0) + dWz,
-                mask=mask_okok,
+                tl.load(Wz_dW_ptrs, mask=dW_mask, other=0.0) + dWz,
+                mask=dW_mask,
             )
             tl.store(
                 Wn_dW_ptrs,
-                tl.load(Wn_dW_ptrs, mask=mask_okok, other=0.0) + dWn,
-                mask=mask_okok,
+                tl.load(Wn_dW_ptrs, mask=dW_mask, other=0.0) + dWn,
+                mask=dW_mask,
             )
 
         # Add dh_prev_direct to dh_acc[this block range] (offs_oh).
@@ -679,8 +691,8 @@ def gru_scan_monarch_bwd_kernel(
             + offs_b[:, None] * sdh_b
             + (pid_block * BLKSZ + offs_oh)[None, :]
         )
-        existing = tl.load(dh_dir_ptrs, mask=mask_b[:, None], other=0.0)
-        tl.store(dh_dir_ptrs, existing + dh_prev_direct, mask=mask_b[:, None])
+        existing = tl.load(dh_dir_ptrs, mask=mask_bo, other=0.0)
+        tl.store(dh_dir_ptrs, existing + dh_prev_direct, mask=mask_bo)
 
         # Cross-CTA barrier: ensures next iteration sees this step's writes.
         tl.atomic_add(barrier_ptr + t_rev, 1, sem="release")
@@ -695,14 +707,14 @@ def gru_scan_monarch_bwd_kernel(
         + (pid_block * BLKSZ + offs_oh)[None, :]
     )
     dh_final = tl.load(
-        dh_final_ptrs, mask=mask_b[:, None], other=0.0,
+        dh_final_ptrs, mask=mask_bo, other=0.0,
     )
     dh0_ptrs = (
         dh0_ptr
         + offs_b[:, None] * sdh0_b
         + (pid_block * BLKSZ + offs_oh)[None, :]
     )
-    tl.store(dh0_ptrs, dh_final, mask=mask_b[:, None])
+    tl.store(dh0_ptrs, dh_final, mask=mask_bo)
 
 
 def gru_scan_monarch_backward_triton(
@@ -760,6 +772,7 @@ def gru_scan_monarch_backward_triton(
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
     grid = (n_pid_b, nblocks)
+    blksz_pad = triton.next_power_of_2(out_blksz)
     gru_scan_monarch_bwd_kernel[grid](
         gi, h0, Wh_struct, bh_cat, out,
         dout,
@@ -783,6 +796,7 @@ def gru_scan_monarch_backward_triton(
         out_s, out_qmin, out_qmax,
         H=H,
         BLKSZ=out_blksz,
+        BLKSZ_PAD=blksz_pad,
         NBLOCKS=nblocks,
         BLOCK_B=block_b,
         BLOCK_K=block_k,
