@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "gru_triton",
+  "project_id": "daf017c0-5541-4929-9aec-3e49734b870c"
+}
