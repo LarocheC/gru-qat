@@ -281,16 +281,42 @@ def gru_scan_monarch_fwd_kernel(
         sh_b = so_b
 
 
+def _pick_tile(blksz_pad: int, *, fwd: bool) -> tuple[int, int, int]:
+    """Pick (BLOCK_B, BLOCK_K, num_stages) given the padded block size.
+
+    Triton's tl.dot needs all tile dims >= 16, so BLOCK_B and BLOCK_K
+    stay at 16 minimum. The dominant smem consumer is the three W
+    tiles (3 * BLKSZ_PAD * BLOCK_K * 4 bytes), double-buffered when
+    num_stages > 1. Below the threshold the default (32, num_stages=2
+    fwd / 1 bwd) keeps tensor cores fed; at large BLKSZ_PAD we drop to
+    BLOCK_K=16 + num_stages=1 to stay under the 4090's 100KB SMEM/SM.
+    """
+    block_b = 16
+    if blksz_pad <= 128:
+        # Default 4090-comfortable config: W tiles = 3 * 128 * 32 * 4 = 48KB
+        # plus accumulators 3 * 16 * 128 * 4 = 24KB. ~72KB total before
+        # double-buffer — fits at num_stages=2.
+        block_k = 32
+        num_stages = 2 if fwd else 1
+    else:
+        # BLKSZ_PAD=256: with BLOCK_K=16 num_stages=1 the W tiles are
+        # 3 * 256 * 16 * 4 = 48KB and accumulators 48KB = 96KB. Just under
+        # the 100KB limit on a 4090.
+        block_k = 16
+        num_stages = 1
+    return block_b, block_k, num_stages
+
+
 def gru_scan_monarch_forward_triton(
     gi: torch.Tensor,
     h0: torch.Tensor,
     Wh_struct: torch.Tensor,
     bh_cat: torch.Tensor,
     *,
-    block_b: int = 16,
-    block_k: int = 32,
+    block_b: int | None = None,
+    block_k: int | None = None,
     num_warps: int = 4,
-    num_stages: int = 2,
+    num_stages: int | None = None,
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
@@ -310,10 +336,18 @@ def gru_scan_monarch_forward_triton(
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
     barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
 
+    blksz_pad = triton.next_power_of_2(out_blksz)
+    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
+    auto_b, auto_k, auto_s = _pick_tile(blksz_pad, fwd=True)
+    if block_b is None:
+        block_b = auto_b
+    if block_k is None:
+        block_k = auto_k
+    if num_stages is None:
+        num_stages = auto_s
     n_pid_b = triton.cdiv(B, block_b)
     num_programs = n_pid_b * nblocks
 
-    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
     if num_programs > sm_count:
         raise RuntimeError(
             f"persistent grid {num_programs} > SM count {sm_count}; "
@@ -324,7 +358,6 @@ def gru_scan_monarch_forward_triton(
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
     grid = (n_pid_b, nblocks)
-    blksz_pad = triton.next_power_of_2(out_blksz)
     gru_scan_monarch_fwd_kernel[grid](
         gi, h0, Wh_struct, bh_cat, out,
         barrier,
@@ -725,10 +758,10 @@ def gru_scan_monarch_backward_triton(
     out: torch.Tensor,
     dout: torch.Tensor,
     *,
-    block_b: int = 16,
-    block_k: int = 32,
+    block_b: int | None = None,
+    block_k: int | None = None,
     num_warps: int = 4,
-    num_stages: int = 1,
+    num_stages: int | None = None,
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -748,10 +781,18 @@ def gru_scan_monarch_backward_triton(
     dgi = torch.zeros_like(gi)
     dh0 = torch.zeros_like(h0)
 
+    blksz_pad = triton.next_power_of_2(out_blksz)
+    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
+    auto_b, auto_k, auto_s = _pick_tile(blksz_pad, fwd=False)
+    if block_b is None:
+        block_b = auto_b
+    if block_k is None:
+        block_k = auto_k
+    if num_stages is None:
+        num_stages = auto_s
     n_pid_b = triton.cdiv(B, block_b)
     num_programs = n_pid_b * nblocks
 
-    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
     if num_programs > sm_count:
         raise RuntimeError(
             f"persistent grid {num_programs} > SM count {sm_count}; "
@@ -772,7 +813,6 @@ def gru_scan_monarch_backward_triton(
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
     grid = (n_pid_b, nblocks)
-    blksz_pad = triton.next_power_of_2(out_blksz)
     gru_scan_monarch_bwd_kernel[grid](
         gi, h0, Wh_struct, bh_cat, out,
         dout,
