@@ -122,7 +122,7 @@ paths are feature-complete:
 | Triton persistent kernel for Monarch (fp32 + QAT) | ✓ |
 | Triton persistent kernel for Butterfly (fp32 + QAT) | ✓ |
 
-100 tests pass, 1 skipped (the simulator-parity placeholder that's
+101 tests pass, 1 skipped (the simulator-parity placeholder that's
 deferred until the simulator is on `PYTHONPATH`).
 
 ## Train-step speed at `(T=64, B=32, H=512)` — fp32
@@ -138,6 +138,37 @@ deferred until the simulator is on `PYTHONPATH`).
 
 For QAT (frozen int8 hidden), expect ~10–30% overhead on top of the
 fp32 number depending on path.
+
+## Numerical parity vs PyTorch reference at `(T=64, B=32, H=512)`
+
+Measured at bench shape against the `GRULayer(use_triton=False)`
+PyTorch reference path (which itself matches `torch.nn.GRUCell` to
+`< 1e-5`). Both sides use `torch.set_float32_matmul_precision("high")`
+so the Triton kernels and PyTorch's matmul see the same TF32 inputs.
+"fwd"/"dx"/"dh0" are max relative diffs; "weight-grad" is the worst
+per-parameter `dWh` / twiddle / `b_h*` rel diff.
+
+| variant | regime | fwd | dx | dh0 | weight-grad |
+|---|---|---|---|---|---|
+| Dense Triton persistent | fp32 | 4e-4 | 4e-4 | 8e-4 | 1e-3 |
+| Dense Triton persistent | int8 QAT (hidden) | 8% | 7% | 9% | — |
+| Monarch persistent, nb=4 | fp32 | 3e-4 | 5e-4 | 7e-4 | 2e-3 |
+| Monarch persistent, nb=4 | int8 QAT (hidden) | 8% | 7% | 6% | 3% |
+| Monarch persistent, nb=8 | fp32 | 2e-4 | 4e-4 | 6e-4 | 2e-3 |
+| Monarch persistent, nb=8 | int8 QAT (hidden) | 8% | 5% | 8% | 3% |
+| Butterfly persistent | fp32 | 3e-2 | 3e-3 | 1e-3 | 2e-3 |
+| Butterfly persistent | int8 QAT (hidden) | 15% | 15% | 1% | 8% |
+
+QAT rows show ~5–15% relative drift because each step's `round(x/scale)`
+flips at half-integer boundaries when `tl.dot`'s TF32 reduction order
+disagrees with cuBLAS by `O(scale)` — a single rounding flip per
+~100 positions, amplified by the recurrence over T=64 steps. Not a
+kernel bug: `torch.round` and `tl.extra.libdevice.rint` are bit-identical
+on the same fp32 input (verified across 1M values + half-integer
+perturbations). Forcing Triton to `input_precision="ieee"` would tighten
+the QAT rows to ~1e-3 at the cost of ~2-4× slower matmul; current
+choice is speed over bit-parity. The butterfly fp32 row's `3e-2` fwd
+is the same story (kernel TF32 vs `torch_structured`'s CUDA op).
 
 ## Layout
 
