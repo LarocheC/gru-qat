@@ -152,7 +152,7 @@ def gru_scan_butterfly(
 def gru_scan_butterfly_fwd_kernel(
     gi_ptr,             # [T, B, 3H], fp32
     h0_ptr,             # [B, H], fp32
-    twiddle_ptr,        # [3, log_n, n//2, 2, 2], fp32 — one per gate
+    twiddle_ptr,        # [3, NBLOCKS, log_n, n//2, 2, 2], fp32 — one per gate
     bh_ptr,             # [3H], fp32
     out_ptr,            # [T, B, H], fp32
     # Per-program scratch: 3 gate buffers + 1 hq buffer, each [BLOCK_B, H].
@@ -162,7 +162,7 @@ def gru_scan_butterfly_fwd_kernel(
     B,
     sg_t, sg_b,
     sh0_b,
-    st_g, st_s, st_p, st_m_new, st_m_old,
+    st_g, st_block, st_s, st_p, st_m_new, st_m_old,
     so_t, so_b,
     sscr_pid, sscr_buf, sscr_b,
     h_in_scale,
@@ -174,6 +174,7 @@ def gru_scan_butterfly_fwd_kernel(
     H: tl.constexpr,
     H_PAD: tl.constexpr,
     LOG_H_PAD: tl.constexpr,
+    NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
@@ -237,49 +238,53 @@ def gru_scan_butterfly_fwd_kernel(
                 mask=mask_b[:, None],
             )
 
-        # Run LOG_H_PAD butterfly stages on each gate's scratch buffer.
-        for s in range(LOG_H_PAD):
-            stride_s = 1 << s
-            partner = offs_h ^ stride_s
-            # member ∈ {0, 1}: which side of the pair this position is.
-            member = (offs_h >> s) & 1
-            # pair index in the [n//2] flat layout — matches torch_structured's
-            # twiddle.view(n//(2*stride), stride, 2, 2) layout (block * stride + k).
-            pair_idx = (offs_h >> (s + 1)) * stride_s + (offs_h & (stride_s - 1))
+        # Run NBLOCKS butterfly chains, each with LOG_H_PAD stages, on
+        # each gate's scratch buffer. Stride direction alternates by
+        # block index (matches torch_structured with increasing_stride=True
+        # at block 0): block 0 has strides 1,2,...,H_PAD/2 (increasing);
+        # block 1 has strides H_PAD/2,...,1 (decreasing); etc.
+        for blk in range(NBLOCKS):
+            for s in range(LOG_H_PAD):
+                # log_stride resolves at JIT time: blk and s are both
+                # Python-loop variables over constexpr ranges.
+                if (blk % 2) == 0:
+                    log_stride = s
+                else:
+                    log_stride = LOG_H_PAD - 1 - s
+                stride_s = 1 << log_stride
+                partner = offs_h ^ stride_s
+                member = (offs_h >> log_stride) & 1
+                pair_idx = (offs_h >> (log_stride + 1)) * stride_s + (offs_h & (stride_s - 1))
 
-            for g in range(3):
-                scr_g = scr_base + g * sscr_buf
-                # Load self and partner at the current state.
-                a = tl.load(
-                    scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                b = tl.load(
-                    scr_g + offs_b[:, None] * sscr_b + partner[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                # Twiddle entries for this position:
-                #   t_self_self = t[s, pair_idx, member, member]
-                #   t_self_partner = t[s, pair_idx, member, 1 - member]
-                t_offset = (
-                    g * st_g
-                    + s * st_s
-                    + pair_idx * st_p
-                    + member * st_m_new
-                )
-                t_ss = tl.load(twiddle_ptr + t_offset + member * st_m_old)
-                t_sp = tl.load(twiddle_ptr + t_offset + (1 - member) * st_m_old)
-                new_val = t_ss[None, :] * a + t_sp[None, :] * b
-                # Scatter back. We're overwriting `a` (the same offset we
-                # just read from), but `b` (partner) is also being written
-                # by another half of the threads in parallel; the read-then-
-                # -write ordering is safe because we read `b` before any
-                # write happens (Triton sequentializes within the program).
-                tl.store(
-                    scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
-                    new_val,
-                    mask=mask_b[:, None],
-                )
+                for g in range(3):
+                    scr_g = scr_base + g * sscr_buf
+                    a = tl.load(
+                        scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    b = tl.load(
+                        scr_g + offs_b[:, None] * sscr_b + partner[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    # Twiddle indexing: t[g, blk, s, pair_idx, m_new, m_old].
+                    # Note: the second dim is the iteration index `s`, not
+                    # log_stride — torch_structured stores twiddles in
+                    # iteration order regardless of stride direction.
+                    t_offset = (
+                        g * st_g
+                        + blk * st_block
+                        + s * st_s
+                        + pair_idx * st_p
+                        + member * st_m_new
+                    )
+                    t_ss = tl.load(twiddle_ptr + t_offset + member * st_m_old)
+                    t_sp = tl.load(twiddle_ptr + t_offset + (1 - member) * st_m_old)
+                    new_val = t_ss[None, :] * a + t_sp[None, :] * b
+                    tl.store(
+                        scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
+                        new_val,
+                        mask=mask_b[:, None],
+                    )
 
         # After log_H stages, scratch[g] = butterfly_g(h). Now run the
         # gate compose + recurrence to produce h_new.
@@ -356,9 +361,9 @@ def gru_scan_butterfly_forward_triton(
     assert h0.shape == (B, H)
     # H itself may be non-pow2; the butterfly multiply runs on H_PAD =
     # next_pow_2(H). torch_structured.Butterfly already sizes its
-    # twiddles at the padded shape internally, so log_n / n//2 come from
-    # the twiddle tensor, not from H directly.
-    n_gates, log_n_t, n_div_2_t, two1, two2 = twiddles.shape
+    # twiddles at the padded shape internally. NBLOCKS is the number of
+    # stacked butterfly chains (torch_structured's `nblocks` argument).
+    n_gates, nblocks, log_n_t, n_div_2_t, two1, two2 = twiddles.shape
     assert n_gates == 3 and two1 == 2 and two2 == 2
     H_PAD = n_div_2_t * 2
     log_H_pad = log_n_t
@@ -373,10 +378,6 @@ def gru_scan_butterfly_forward_triton(
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
 
     n_pid_b = triton.cdiv(B, block_b)
-    # Scratch: 4 buffers per program (3 gates + 1 unused/aligned), each
-    # [BLOCK_B, H_PAD]. Padded slots hold the butterfly's per-stage
-    # output for "imaginary" positions; they're never written back to
-    # dense H tensors.
     scratch = torch.empty(
         (n_pid_b, 4, block_b, H_PAD), device=gi.device, dtype=gi.dtype,
     )
@@ -391,7 +392,7 @@ def gru_scan_butterfly_forward_triton(
         gi.stride(0), gi.stride(1),
         h0.stride(0),
         twiddles.stride(0), twiddles.stride(1), twiddles.stride(2),
-        twiddles.stride(3), twiddles.stride(4),
+        twiddles.stride(3), twiddles.stride(4), twiddles.stride(5),
         out.stride(0), out.stride(1),
         scratch.stride(0), scratch.stride(1), scratch.stride(2),
         in_s, in_qmin, in_qmax,
@@ -399,6 +400,7 @@ def gru_scan_butterfly_forward_triton(
         H=H,
         H_PAD=H_PAD,
         LOG_H_PAD=log_H_pad,
+        NBLOCKS=nblocks,
         BLOCK_B=block_b,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
@@ -421,21 +423,21 @@ def gru_scan_butterfly_bwd_kernel(
     # outputs
     dgi_ptr,
     dh0_ptr,
-    dtwiddle_partial_ptr,    # [num_pid_b, 3, log_H, H//2, 2, 2]
+    dtwiddle_partial_ptr,    # [num_pid_b, 3, NBLOCKS, log_H, H//2, 2, 2]
     dbh_partial_ptr,         # [num_pid_b, 3H]
-    # per-program state buffers
-    state_ptr,               # [num_pid_b, 3, log_H+1, BLOCK_B, H]
+    # per-program state buffers (NBLOCKS*log_H+1 snapshots)
+    state_ptr,               # [num_pid_b, 3, NBLOCKS*log_H+1, BLOCK_B, H]
     dh_acc_ptr,              # [B, H]
     T,
     B,
     sg_t, sg_b,
     sh0_b,
-    st_g, st_s, st_p, st_m_new, st_m_old,
+    st_g, st_block, st_s, st_p, st_m_new, st_m_old,
     so_t, so_b,
     sdo_t, sdo_b,
     sdgi_t, sdgi_b,
     sdh0_b,
-    sdtp_pid, sdtp_g, sdtp_s, sdtp_p, sdtp_m_new, sdtp_m_old,
+    sdtp_pid, sdtp_g, sdtp_block, sdtp_s, sdtp_p, sdtp_m_new, sdtp_m_old,
     sdbp_pid,
     sst_pid, sst_g, sst_l, sst_b,
     sdh_b,
@@ -448,6 +450,7 @@ def gru_scan_butterfly_bwd_kernel(
     H: tl.constexpr,
     H_PAD: tl.constexpr,
     LOG_H_PAD: tl.constexpr,
+    NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
@@ -530,39 +533,53 @@ def gru_scan_butterfly_bwd_kernel(
                 h_prev_q,
                 mask=mask_b[:, None],
             )
-        # Run stages, saving each output.
-        for s in range(LOG_H_PAD):
-            stride_s = 1 << s
-            partner = offs_h ^ stride_s
-            member = (offs_h >> s) & 1
-            pair_idx = (offs_h >> (s + 1)) * stride_s + (offs_h & (stride_s - 1))
-            for g in range(3):
-                in_base = state_base + g * sst_g + s * sst_l
-                out_base = state_base + g * sst_g + (s + 1) * sst_l
-                a = tl.load(
-                    in_base + offs_b[:, None] * sst_b + offs_h[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                b = tl.load(
-                    in_base + offs_b[:, None] * sst_b + partner[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                t_offset = (
-                    g * st_g + s * st_s + pair_idx * st_p + member * st_m_new
-                )
-                t_ss = tl.load(twiddle_ptr + t_offset + member * st_m_old)
-                t_sp = tl.load(twiddle_ptr + t_offset + (1 - member) * st_m_old)
-                new_val = t_ss[None, :] * a + t_sp[None, :] * b
-                tl.store(
-                    out_base + offs_b[:, None] * sst_b + offs_h[None, :],
-                    new_val,
-                    mask=mask_b[:, None],
-                )
+        # Run NBLOCKS butterfly chains, each LOG_H_PAD stages, saving
+        # state after every stage. Stage index in state buffer is
+        # `blk * LOG_H_PAD + s + 1` (state[0] holds the input).
+        for blk in range(NBLOCKS):
+            for s in range(LOG_H_PAD):
+                if (blk % 2) == 0:
+                    log_stride = s
+                else:
+                    log_stride = LOG_H_PAD - 1 - s
+                stride_s = 1 << log_stride
+                partner = offs_h ^ stride_s
+                member = (offs_h >> log_stride) & 1
+                pair_idx = (offs_h >> (log_stride + 1)) * stride_s + (offs_h & (stride_s - 1))
+                state_l_in = blk * LOG_H_PAD + s
+                state_l_out = state_l_in + 1
+                for g in range(3):
+                    in_base = state_base + g * sst_g + state_l_in * sst_l
+                    out_base = state_base + g * sst_g + state_l_out * sst_l
+                    a = tl.load(
+                        in_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    b = tl.load(
+                        in_base + offs_b[:, None] * sst_b + partner[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    t_offset = (
+                        g * st_g
+                        + blk * st_block
+                        + s * st_s
+                        + pair_idx * st_p
+                        + member * st_m_new
+                    )
+                    t_ss = tl.load(twiddle_ptr + t_offset + member * st_m_old)
+                    t_sp = tl.load(twiddle_ptr + t_offset + (1 - member) * st_m_old)
+                    new_val = t_ss[None, :] * a + t_sp[None, :] * b
+                    tl.store(
+                        out_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        new_val,
+                        mask=mask_b[:, None],
+                    )
 
-        # state[g, LOG_H_PAD] is the final butterfly output. Recompute gh, gates.
-        end_r = state_base + 0 * sst_g + LOG_H_PAD * sst_l
-        end_z = state_base + 1 * sst_g + LOG_H_PAD * sst_l
-        end_n = state_base + 2 * sst_g + LOG_H_PAD * sst_l
+        # state[g, NBLOCKS*LOG_H_PAD] is the final butterfly output. Recompute gh, gates.
+        final_l: tl.constexpr = NBLOCKS * LOG_H_PAD
+        end_r = state_base + 0 * sst_g + final_l * sst_l
+        end_z = state_base + 1 * sst_g + final_l * sst_l
+        end_n = state_base + 2 * sst_g + final_l * sst_l
         gh_r = tl.load(
             end_r + offs_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
@@ -653,16 +670,12 @@ def gru_scan_butterfly_bwd_kernel(
         )
 
         # ---- Backward through butterfly stages, per gate ----
-        # Initialize d_state per gate to dgh_g at state[LOG_H_PAD]. We
-        # reuse the state buffer for d_state during backward (the
-        # forward state at LOG_H_PAD is no longer needed once we've
-        # started). Padded slots of dgh_g are zero (gi/dh_acc/dout were
-        # all zero there via mask_bh, so dh_t and its derived dgh_g are
-        # zero), so initialising state[*, LOG_H_PAD] without mask_h is
-        # safe — padded entries seed the reverse walk at 0.
-        d_dst_r = state_base + 0 * sst_g + LOG_H_PAD * sst_l
-        d_dst_z = state_base + 1 * sst_g + LOG_H_PAD * sst_l
-        d_dst_n = state_base + 2 * sst_g + LOG_H_PAD * sst_l
+        # Initialize d_state per gate to dgh_g at state[NBLOCKS*LOG_H_PAD]
+        # (the final forward butterfly output). We reuse the state
+        # buffer for d_state during backward.
+        d_dst_r = state_base + 0 * sst_g + final_l * sst_l
+        d_dst_z = state_base + 1 * sst_g + final_l * sst_l
+        d_dst_n = state_base + 2 * sst_g + final_l * sst_l
         tl.store(
             d_dst_r + offs_b[:, None] * sst_b + offs_h[None, :],
             dgh_r, mask=mask_b[:, None],
@@ -676,158 +689,167 @@ def gru_scan_butterfly_bwd_kernel(
             dgh_n, mask=mask_b[:, None],
         )
 
-        # Walk stages s from LOG_H_PAD-1 down to 0.
-        for s_rev in range(LOG_H_PAD):
-            s = LOG_H_PAD - 1 - s_rev
-            stride_s = 1 << s
-            partner = offs_h ^ stride_s
-            member = (offs_h >> s) & 1
-            pair_idx = (offs_h >> (s + 1)) * stride_s + (offs_h & (stride_s - 1))
+        # Walk blocks blk from NBLOCKS-1 down to 0; within each block,
+        # stages s from LOG_H_PAD-1 down to 0. Stride direction matches
+        # the forward (even blocks increasing, odd blocks decreasing).
+        for blk_rev in range(NBLOCKS):
+            blk = NBLOCKS - 1 - blk_rev
+            for s_rev in range(LOG_H_PAD):
+                s = LOG_H_PAD - 1 - s_rev
+                if (blk % 2) == 0:
+                    log_stride = s
+                else:
+                    log_stride = LOG_H_PAD - 1 - s
+                stride_s = 1 << log_stride
+                partner = offs_h ^ stride_s
+                member = (offs_h >> log_stride) & 1
+                pair_idx = (offs_h >> (log_stride + 1)) * stride_s + (offs_h & (stride_s - 1))
+                state_l_in = blk * LOG_H_PAD + s        # state[g, this_l] holds old
+                state_l_out = state_l_in + 1            # state[g, this_l+1] holds new/d_new
 
-            for g in range(3):
-                # d_new lives at state[g, s+1] (the output of stage s
-                # during the recompute). state[g, s] holds the input.
-                d_new_base = state_base + g * sst_g + (s + 1) * sst_l
-                old_base = state_base + g * sst_g + s * sst_l
+                for g in range(3):
+                    d_new_base = state_base + g * sst_g + state_l_out * sst_l
+                    old_base = state_base + g * sst_g + state_l_in * sst_l
 
-                d_self = tl.load(
-                    d_new_base + offs_b[:, None] * sst_b + offs_h[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                d_partner = tl.load(
-                    d_new_base + offs_b[:, None] * sst_b + partner[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                old_self = tl.load(
-                    old_base + offs_b[:, None] * sst_b + offs_h[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
-                old_partner = tl.load(
-                    old_base + offs_b[:, None] * sst_b + partner[None, :],
-                    mask=mask_b[:, None], other=0.0,
-                )
+                    d_self = tl.load(
+                        d_new_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    d_partner = tl.load(
+                        d_new_base + offs_b[:, None] * sst_b + partner[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    old_self = tl.load(
+                        old_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
+                    old_partner = tl.load(
+                        old_base + offs_b[:, None] * sst_b + partner[None, :],
+                        mask=mask_b[:, None], other=0.0,
+                    )
 
-                # Twiddle entries.
-                t_offset = (
-                    g * st_g + s * st_s + pair_idx * st_p
-                )
-                # For position i with member=member(i):
-                #   d_old[i] = d_new[i] * t[member, member] + d_new[partner] * t[1-member, member]
-                t_self = tl.load(
-                    twiddle_ptr + t_offset + member * st_m_new + member * st_m_old
-                )
-                t_partner = tl.load(
-                    twiddle_ptr + t_offset + (1 - member) * st_m_new + member * st_m_old
-                )
-                d_old = t_self[None, :] * d_self + t_partner[None, :] * d_partner
+                    # Twiddle entries — indexed by (g, blk, s, pair_idx).
+                    t_offset = (
+                        g * st_g + blk * st_block + s * st_s + pair_idx * st_p
+                    )
+                    # For position i with member=member(i):
+                    #   d_old[i] = d_new[i] * t[member, member] + d_new[partner] * t[1-member, member]
+                    t_self = tl.load(
+                        twiddle_ptr + t_offset + member * st_m_new + member * st_m_old
+                    )
+                    t_partner = tl.load(
+                        twiddle_ptr + t_offset + (1 - member) * st_m_new + member * st_m_old
+                    )
+                    d_old = t_self[None, :] * d_self + t_partner[None, :] * d_partner
 
-                tl.store(
-                    old_base + offs_b[:, None] * sst_b + offs_h[None, :],
-                    d_old,
-                    mask=mask_b[:, None],
-                )
+                    tl.store(
+                        old_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        d_old,
+                        mask=mask_b[:, None],
+                    )
 
-                # dt accumulation: per pair, dt[m_new, m_old] += d_new[m_new] * old[m_old]
-                # Each output position contributes to one (m_new, m_old) entry.
-                # When member(i) = 0: contributes to dt[0, 0] via (d_self, old_self)
-                #                    and dt[0, 1] via (d_self, old_partner)
-                # When member(i) = 1: contributes to dt[1, 0] via (d_self, old_partner)
-                #                    and dt[1, 1] via (d_self, old_self)
-                #
-                # So d_self * old_self (member=0 case) -> dt[0, 0] at this pair.
-                # d_self * old_partner (member=0 case) -> dt[0, 1] at this pair.
-                # d_self * old_partner (member=1 case) -> dt[1, 0] at this pair.
-                # d_self * old_self (member=1 case) -> dt[1, 1] at this pair.
-                #
-                # Each pair has TWO positions (member=0 and member=1), and
-                # they contribute to different rows of dt. They share the
-                # same pair_idx.
-                #
-                # Per-batch contribution: scalar = d_self * old_self. Sum
-                # over batch to get the per-pair contribution to dt.
+                    # dt accumulation: per pair, dt[m_new, m_old] += d_new[m_new] * old[m_old]
+                    # Each output position contributes to one (m_new, m_old) entry.
+                    # When member(i) = 0: contributes to dt[0, 0] via (d_self, old_self)
+                    #                    and dt[0, 1] via (d_self, old_partner)
+                    # When member(i) = 1: contributes to dt[1, 0] via (d_self, old_partner)
+                    #                    and dt[1, 1] via (d_self, old_self)
+                    #
+                    # So d_self * old_self (member=0 case) -> dt[0, 0] at this pair.
+                    # d_self * old_partner (member=0 case) -> dt[0, 1] at this pair.
+                    # d_self * old_partner (member=1 case) -> dt[1, 0] at this pair.
+                    # d_self * old_self (member=1 case) -> dt[1, 1] at this pair.
+                    #
+                    # Each pair has TWO positions (member=0 and member=1), and
+                    # they contribute to different rows of dt. They share the
+                    # same pair_idx.
+                    #
+                    # Per-batch contribution: scalar = d_self * old_self. Sum
+                    # over batch to get the per-pair contribution to dt.
 
-                contrib_dd = tl.sum(d_self * old_self, axis=0)        # [H]
-                contrib_dp = tl.sum(d_self * old_partner, axis=0)     # [H]
+                    contrib_dd = tl.sum(d_self * old_self, axis=0)        # [H]
+                    contrib_dp = tl.sum(d_self * old_partner, axis=0)     # [H]
 
-                # Now route contributions to dt entries.
-                # We accumulate by position into dt_partial[g, s, pair_idx, m_new, m_old]
-                # The mapping by member:
-                #   member=0 positions:
-                #     contrib_dd -> dt[g, s, pair_idx, 0, 0]
-                #     contrib_dp -> dt[g, s, pair_idx, 0, 1]
-                #   member=1 positions:
-                #     contrib_dp -> dt[g, s, pair_idx, 1, 0]
-                #     contrib_dd -> dt[g, s, pair_idx, 1, 1]
-                # Each position contributes ONCE to ONE (m_new, m_old) entry.
-                # Use atomic_add for safety (multiple positions in same batch
-                # tile may share pair_idx? No — within one stage, each pair
-                # has exactly two positions, and they have different m_new.
-                # So writes are to distinct (pair_idx, m_new) cells). But the
-                # m_old varies per position too — m_old = member of THIS
-                # position for the dt[m_new, m_old] entry... wait let me
-                # re-examine.
+                    # Now route contributions to dt entries.
+                    # We accumulate by position into dt_partial[g, s, pair_idx, m_new, m_old]
+                    # The mapping by member:
+                    #   member=0 positions:
+                    #     contrib_dd -> dt[g, s, pair_idx, 0, 0]
+                    #     contrib_dp -> dt[g, s, pair_idx, 0, 1]
+                    #   member=1 positions:
+                    #     contrib_dp -> dt[g, s, pair_idx, 1, 0]
+                    #     contrib_dd -> dt[g, s, pair_idx, 1, 1]
+                    # Each position contributes ONCE to ONE (m_new, m_old) entry.
+                    # Use atomic_add for safety (multiple positions in same batch
+                    # tile may share pair_idx? No — within one stage, each pair
+                    # has exactly two positions, and they have different m_new.
+                    # So writes are to distinct (pair_idx, m_new) cells). But the
+                    # m_old varies per position too — m_old = member of THIS
+                    # position for the dt[m_new, m_old] entry... wait let me
+                    # re-examine.
 
-                # Actually re-derive cleanly:
-                # forward stage: new = t @ old (2x2 matmul per pair)
-                #   new[m_new] = sum_{m_old} t[m_new, m_old] * old[m_old]
-                # Per pair, two positions: m_new in {0, 1}, two equations.
-                #
-                # Backward:
-                #   d_old[m_old] = sum_{m_new} t[m_new, m_old] * d_new[m_new]
-                #   d_t[m_new, m_old] = d_new[m_new] * old[m_old]
-                #
-                # Per output position i with member m_new(i):
-                #   This position has one "new" value (new[m_new(i)]).
-                #   Its d_new[m_new(i)] participates in two d_t entries:
-                #     d_t[m_new(i), 0] += d_self_i * old[member=0]
-                #     d_t[m_new(i), 1] += d_self_i * old[member=1]
-                #
-                # Where:
-                #   - old[member=0] at this pair is old_partner if i is member=1,
-                #     or old_self if i is member=0.
-                #   - old[member=1] at this pair is old_self if i is member=1,
-                #     or old_partner if i is member=0.
-                #
-                # So:
-                #   d_t[m_new(i), 0] += d_self_i * (old_self_i if member(i)=0 else old_partner_i)
-                #   d_t[m_new(i), 1] += d_self_i * (old_partner_i if member(i)=0 else old_self_i)
-                #
-                # Equivalently, defining
-                #   even_old[i] = old_self if member(i)=0 else old_partner
-                #   odd_old[i]  = old_partner if member(i)=0 else old_self
-                # we get:
-                #   d_t[m_new(i), 0] += d_self_i * even_old[i]
-                #   d_t[m_new(i), 1] += d_self_i * odd_old[i]
-                #
-                # Each PAIR has two contributing positions (one with
-                # member=0, one with member=1). They write to different
-                # rows of d_t (different m_new). So writes for the SAME
-                # pair_idx but DIFFERENT m_new come from different positions.
-                # Within one offs_h vector, exactly two positions share
-                # each pair_idx. Their m_new values differ (one is 0, one
-                # is 1). So if we atomic-add, each (pair_idx, m_new) cell
-                # gets exactly one position's contribution. No within-program
-                # contention.
+                    # Actually re-derive cleanly:
+                    # forward stage: new = t @ old (2x2 matmul per pair)
+                    #   new[m_new] = sum_{m_old} t[m_new, m_old] * old[m_old]
+                    # Per pair, two positions: m_new in {0, 1}, two equations.
+                    #
+                    # Backward:
+                    #   d_old[m_old] = sum_{m_new} t[m_new, m_old] * d_new[m_new]
+                    #   d_t[m_new, m_old] = d_new[m_new] * old[m_old]
+                    #
+                    # Per output position i with member m_new(i):
+                    #   This position has one "new" value (new[m_new(i)]).
+                    #   Its d_new[m_new(i)] participates in two d_t entries:
+                    #     d_t[m_new(i), 0] += d_self_i * old[member=0]
+                    #     d_t[m_new(i), 1] += d_self_i * old[member=1]
+                    #
+                    # Where:
+                    #   - old[member=0] at this pair is old_partner if i is member=1,
+                    #     or old_self if i is member=0.
+                    #   - old[member=1] at this pair is old_self if i is member=1,
+                    #     or old_partner if i is member=0.
+                    #
+                    # So:
+                    #   d_t[m_new(i), 0] += d_self_i * (old_self_i if member(i)=0 else old_partner_i)
+                    #   d_t[m_new(i), 1] += d_self_i * (old_partner_i if member(i)=0 else old_self_i)
+                    #
+                    # Equivalently, defining
+                    #   even_old[i] = old_self if member(i)=0 else old_partner
+                    #   odd_old[i]  = old_partner if member(i)=0 else old_self
+                    # we get:
+                    #   d_t[m_new(i), 0] += d_self_i * even_old[i]
+                    #   d_t[m_new(i), 1] += d_self_i * odd_old[i]
+                    #
+                    # Each PAIR has two contributing positions (one with
+                    # member=0, one with member=1). They write to different
+                    # rows of d_t (different m_new). So writes for the SAME
+                    # pair_idx but DIFFERENT m_new come from different positions.
+                    # Within one offs_h vector, exactly two positions share
+                    # each pair_idx. Their m_new values differ (one is 0, one
+                    # is 1). So if we atomic-add, each (pair_idx, m_new) cell
+                    # gets exactly one position's contribution. No within-program
+                    # contention.
 
-                # Compute even_old and odd_old based on member(i).
-                # For i with member=0: even_old = old_self, odd_old = old_partner.
-                # For i with member=1: even_old = old_partner, odd_old = old_self.
-                is_member_0 = (member == 0)
-                even_old = tl.where(is_member_0, old_self, old_partner)
-                odd_old = tl.where(is_member_0, old_partner, old_self)
+                    # Compute even_old and odd_old based on member(i).
+                    # For i with member=0: even_old = old_self, odd_old = old_partner.
+                    # For i with member=1: even_old = old_partner, odd_old = old_self.
+                    is_member_0 = (member == 0)
+                    even_old = tl.where(is_member_0, old_self, old_partner)
+                    odd_old = tl.where(is_member_0, old_partner, old_self)
 
-                contrib_to_m0 = tl.sum(d_self * even_old, axis=0)  # [H]
-                contrib_to_m1 = tl.sum(d_self * odd_old, axis=0)   # [H]
+                    contrib_to_m0 = tl.sum(d_self * even_old, axis=0)  # [H]
+                    contrib_to_m1 = tl.sum(d_self * odd_old, axis=0)   # [H]
 
-                # Each position i writes to:
-                #   d_t[g, s, pair_idx(i), m_new=member(i), m_old=0] += contrib_to_m0[i]
-                #   d_t[g, s, pair_idx(i), m_new=member(i), m_old=1] += contrib_to_m1[i]
-                dt_base = (
-                    dtwiddle_partial_ptr + pid_b * sdtp_pid + g * sdtp_g
-                    + s * sdtp_s + pair_idx * sdtp_p + member * sdtp_m_new
-                )
-                tl.atomic_add(dt_base + 0 * sdtp_m_old, contrib_to_m0)
-                tl.atomic_add(dt_base + 1 * sdtp_m_old, contrib_to_m1)
+                    # Each position i writes to:
+                    #   d_t[g, blk, s, pair_idx(i), m_new=member(i), m_old=0] += contrib_to_m0[i]
+                    #   d_t[g, blk, s, pair_idx(i), m_new=member(i), m_old=1] += contrib_to_m1[i]
+                    dt_base = (
+                        dtwiddle_partial_ptr + pid_b * sdtp_pid + g * sdtp_g
+                        + blk * sdtp_block + s * sdtp_s + pair_idx * sdtp_p
+                        + member * sdtp_m_new
+                    )
+                    tl.atomic_add(dt_base + 0 * sdtp_m_old, contrib_to_m0)
+                    tl.atomic_add(dt_base + 1 * sdtp_m_old, contrib_to_m1)
 
         # After all stages backward, state[g, 0] holds d_h_prev_q for
         # gate g (gradient on the QUANTIZED h_prev — the matmul-side
@@ -896,7 +918,8 @@ def gru_scan_butterfly_backward_triton(
     H = three_H // 3
     # H may be non-pow2; the kernel operates on H_PAD = next_pow_2(H)
     # internally. Twiddle is already at H_PAD via torch_structured.
-    n_gates, log_H_pad, n_div_2_t, two1, two2 = twiddles.shape
+    # NBLOCKS is the stacked-butterfly count from torch_structured.
+    n_gates, nblocks, log_H_pad, n_div_2_t, two1, two2 = twiddles.shape
     assert n_gates == 3 and two1 == 2 and two2 == 2
     H_PAD = n_div_2_t * 2
     assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
@@ -914,17 +937,17 @@ def gru_scan_butterfly_backward_triton(
 
     n_pid_b = triton.cdiv(B, block_b)
     dtwiddle_partial = torch.zeros(
-        (n_pid_b, 3, log_H_pad, H_PAD // 2, 2, 2),
+        (n_pid_b, 3, nblocks, log_H_pad, H_PAD // 2, 2, 2),
         device=gi.device, dtype=gi.dtype,
     )
     dbh_partial = torch.zeros(
         (n_pid_b, 3 * H), device=gi.device, dtype=gi.dtype,
     )
-    # Per-program scratch holds the per-stage state for backward.
-    # Shape: [num_pid_b, 3 (gates), LOG_H_PAD + 1 (stages including input),
-    #         BLOCK_B, H_PAD].
+    # Per-program scratch holds the per-stage state for backward, one
+    # snapshot per (block, stage) plus the input.
+    # Shape: [num_pid_b, 3 (gates), NBLOCKS*LOG_H_PAD + 1, BLOCK_B, H_PAD].
     state = torch.empty(
-        (n_pid_b, 3, log_H_pad + 1, block_b, H_PAD),
+        (n_pid_b, 3, nblocks * log_H_pad + 1, block_b, H_PAD),
         device=gi.device, dtype=gi.dtype,
     )
     dh_acc = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
@@ -943,7 +966,7 @@ def gru_scan_butterfly_backward_triton(
         gi.stride(0), gi.stride(1),
         h0.stride(0),
         twiddles.stride(0), twiddles.stride(1), twiddles.stride(2),
-        twiddles.stride(3), twiddles.stride(4),
+        twiddles.stride(3), twiddles.stride(4), twiddles.stride(5),
         out.stride(0), out.stride(1),
         dout.stride(0), dout.stride(1),
         dgi.stride(0), dgi.stride(1),
@@ -951,12 +974,13 @@ def gru_scan_butterfly_backward_triton(
         dtwiddle_partial.stride(0), dtwiddle_partial.stride(1),
         dtwiddle_partial.stride(2), dtwiddle_partial.stride(3),
         dtwiddle_partial.stride(4), dtwiddle_partial.stride(5),
+        dtwiddle_partial.stride(6),
         dbh_partial.stride(0),
         state.stride(0), state.stride(1), state.stride(2), state.stride(3),
         dh_acc.stride(0),
         in_s, in_qmin, in_qmax,
         out_s, out_qmin, out_qmax,
-        H=H, H_PAD=H_PAD, LOG_H_PAD=log_H_pad, BLOCK_B=block_b,
+        H=H, H_PAD=H_PAD, LOG_H_PAD=log_H_pad, NBLOCKS=nblocks, BLOCK_B=block_b,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps, num_stages=num_stages,
@@ -1032,18 +1056,22 @@ def extract_butterfly_twiddles(
     """Pull the three hidden-side Butterfly twiddles into a single tensor.
 
     Returns:
-        twiddles: [3, log_H, H//2, 2, 2] — gates stacked. Each gate's
-            twiddle has nstacks=1, nblocks=1 squeezed out. The triton
-            kernel works in this flat layout.
+        twiddles: [3, butterfly_nblocks, log_H, H//2, 2, 2] — gates
+            stacked. The nstacks=1 axis is squeezed; butterfly_nblocks
+            (number of stacked butterfly chains in torch_structured) is
+            preserved. The triton kernel handles butterfly_nblocks via
+            an outer JIT-unrolled loop with alternating stride direction
+            between blocks (matching torch_structured.butterfly_multiply
+            with increasing_stride=True).
         bh_cat:   [3H]
     """
     if cell._hidden_dense:
         raise ValueError("cell hidden side is dense; nothing to extract")
-    # cell.struct_Wh_*.b.twiddle: [nstacks=1, nblocks=1, log_n, n//2, 2, 2]
-    Wr = cell.struct_Wh_r.b.twiddle.squeeze(0).squeeze(0)
-    Wz = cell.struct_Wh_z.b.twiddle.squeeze(0).squeeze(0)
-    Wn = cell.struct_Wh_n.b.twiddle.squeeze(0).squeeze(0)
-    twiddles = torch.stack([Wr, Wz, Wn], dim=0)  # [3, log_n, n//2, 2, 2]
+    # cell.struct_Wh_*.b.twiddle: [nstacks=1, butterfly_nblocks, log_n, n//2, 2, 2]
+    Wr = cell.struct_Wh_r.b.twiddle.squeeze(0)
+    Wz = cell.struct_Wh_z.b.twiddle.squeeze(0)
+    Wn = cell.struct_Wh_n.b.twiddle.squeeze(0)
+    twiddles = torch.stack([Wr, Wz, Wn], dim=0)  # [3, nblocks, log_n, n//2, 2, 2]
     if cell.b_hr is None:
         bh_cat = torch.zeros(
             3 * cell.hidden_size, device=twiddles.device, dtype=twiddles.dtype,
