@@ -243,8 +243,27 @@ def test_diagonal_bwd_strict_matches_reference(T: int, B: int, H: int) -> None:
 @cuda_only
 @pytest.mark.parametrize("T,B,H", SLOW_DIAG_GRID)
 def test_diagonal_bwd_strict_matches_reference_slow(T: int, B: int, H: int) -> None:
-    """Identical body to the fast bwd variant; gated behind
-    @pytest.mark.slow per D-16 (T ∈ {512, 1024}) and D-26.
+    """Slow sibling of the fast bwd variant; gated behind @pytest.mark.slow
+    per D-16 (T ∈ {512, 1024}) and D-26.
+
+    Tolerances:
+    - dgi, dh0, dWh_diag: < 1e-5 abs (strict tier — IEEE fp32 throughout,
+      no in-kernel matmul on the hidden side since diagonal collapses
+      Wh @ h to elementwise; these grads carry no TF32-via-tl.dot exposure
+      and pass the tight bound).
+    - dbh: < 2e-5 abs (loosened from 1e-5 per F-02-02-A investigation in
+      Phase 2 Plan 02-06). The Triton kernel and the PyTorch reference both
+      reduce dbh as (sum-over-B per timestep then accumulate over T), but
+      the per-timestep B-reduction uses different reduction-tree orderings
+      (Triton: ``tl.sum(dgh_g, axis=0)`` warp-level butterfly across
+      ``BLOCK_B``; PyTorch: ``dgh_g.sum(dim=0)`` parallel reduction). At
+      T=1024 these per-step rounding differences accumulate to ~1.5e-5 abs
+      — honest fp32 non-associativity drift, not a kernel bug. The
+      slab-zero contract (TRI-05) catches a regressed accumulator at the
+      ~O(0.1) level, which is two orders of magnitude above this bound.
+      Root cause: per-pid_b reduction order vs PyTorch batch-then-sum.
+      Tracked as a bd issue (F-02-02-A) for a future hygiene phase that
+      may align reduction orders explicitly.
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -270,8 +289,9 @@ def test_diagonal_bwd_strict_matches_reference_slow(T: int, B: int, H: int) -> N
     assert diff_dh0 < 1e-5, f"dh0 max abs diff {diff_dh0:.4e} (T={T},B={B},H={H})"
     diff_dWh = (dWh_p - dWh_t).abs().max().item()
     assert diff_dWh < 1e-5, f"dWh_diag max abs diff {diff_dWh:.4e} (T={T},B={B},H={H})"
+    # dbh loosened to 2e-5 per F-02-02-A — see test docstring.
     diff_dbh = (dbh_p - dbh_t).abs().max().item()
-    assert diff_dbh < 1e-5, f"dbh max abs diff {diff_dbh:.4e} (T={T},B={B},H={H})"
+    assert diff_dbh < 2e-5, f"dbh max abs diff {diff_dbh:.4e} (T={T},B={B},H={H})"
 
 
 # ``extract_diagonal_factors`` is imported at module top so this file
