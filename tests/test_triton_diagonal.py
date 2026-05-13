@@ -118,7 +118,7 @@ def test_diagonal_triton_forward_matches_pytorch(T: int, B: int, H: int) -> None
 
     max_diff = (ref - tri).abs().max().item()
     rel = max_diff / max(ref.abs().max().item(), 1e-6)
-    assert rel < 1e-4, f"forward rel diff {rel:.4e}"
+    assert rel < 1e-5, f"forward rel diff {rel:.4e}"
 
 
 @cuda_only
@@ -153,7 +153,7 @@ def test_diagonal_triton_qat_forward_matches_pytorch(T: int, B: int, H: int) -> 
     # Diagonal has no matmul, so torch.round and tl.rint should agree
     # bit-for-bit on the same inputs — quant_h_in/out drift across the
     # T-step recurrence is the only noise source.
-    assert rel < 1e-3, f"qat forward rel diff {rel:.4e}"
+    assert rel < 1e-4, f"qat forward rel diff {rel:.4e}"
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def test_diagonal_triton_backward_matches_pytorch(T: int, B: int, H: int) -> Non
     ]:
         diff = (t - p).abs().max().item()
         rel = diff / max(p.abs().max().item(), 1e-9)
-        assert rel < 1e-3, f"{name} rel diff {rel:.4e}"
+        assert rel < 1e-4, f"{name} rel diff {rel:.4e}"
 
 
 @cuda_only
@@ -265,7 +265,7 @@ def test_diagonal_dispatch_matches_per_step(T: int, B: int, H: int) -> None:
 
     max_diff = (ref_out - tri_out).abs().max().item()
     rel = max_diff / max(ref_out.abs().max().item(), 1e-6)
-    assert rel < 1e-4, f"dispatch fwd rel diff {rel:.4e}"
+    assert rel < 1e-5, f"dispatch fwd rel diff {rel:.4e}"
 
 
 @cuda_only
@@ -328,7 +328,7 @@ def test_diagonal_dispatch_grad_matches_per_step() -> None:
     ]:
         diff = (ref_p - tri_p).abs().max().item()
         rel = diff / max(ref_p.abs().max().item(), 1e-9)
-        assert rel < 1e-3, f"{name} grad rel diff {rel:.4e}"
+        assert rel < 1e-4, f"{name} grad rel diff {rel:.4e}"
 
     for name_ref, p_ref in layer_ref.cell.named_parameters():
         p_tri = dict(layer_tri.cell.named_parameters())[name_ref]
@@ -336,7 +336,7 @@ def test_diagonal_dispatch_grad_matches_per_step() -> None:
             continue
         diff = (p_ref.grad - p_tri.grad).abs().max().item()
         rel = diff / max(p_ref.grad.abs().max().item(), 1e-9)
-        assert rel < 1e-3, f"param {name_ref} grad rel diff {rel:.4e}"
+        assert rel < 1e-4, f"param {name_ref} grad rel diff {rel:.4e}"
 
 
 @cuda_only
