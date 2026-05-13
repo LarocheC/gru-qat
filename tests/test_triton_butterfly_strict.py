@@ -170,3 +170,115 @@ def test_butterfly_fwd_strict_matches_reference_slow(
     assert max_diff < 1e-5, (
         f"butterfly fwd max abs diff {max_diff:.4e} (T={T},B={B},H={H})"
     )
+
+
+def _assert_grad_close(
+    name: str, ref_g: torch.Tensor | None, tri_g: torch.Tensor | None,
+    T: int, B: int, H: int,
+) -> None:
+    """Strict-tier per-grad assertion. Raises on shape mismatch / missing
+    grads so failures are diagnosable per-grad (named) rather than a
+    bare tensor-equality blowup.
+
+    Returns silently when both grads are None (e.g. a frozen parameter
+    that didn't participate in the forward — skip rather than fail).
+    """
+    if ref_g is None and tri_g is None:
+        return
+    assert ref_g is not None, f"{name}: reference grad is None but triton grad is not"
+    assert tri_g is not None, f"{name}: triton grad is None but reference grad is not"
+    max_diff = (ref_g - tri_g).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"{name} grad max abs diff {max_diff:.4e} (T={T},B={B},H={H})"
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H", FAST_BFLY_GRID)
+def test_butterfly_bwd_strict_matches_reference(T: int, B: int, H: int) -> None:
+    """Triton butterfly backward must match autograd through the CUDA-op
+    per-step reference path to < 1e-5 absolute under ``'highest'``.
+
+    Pattern: dual-layer-with-shared-state. ``pt_layer`` runs the per-step
+    PyTorch path (``use_triton=False`` — autograd flows through
+    ``gru_scan_butterfly`` and its ``butterfly_multiply`` closure);
+    ``fast_layer`` runs the Triton kernel. State is shared via
+    ``load_state_dict``, so each parameter sees the same value on both
+    sides — the only difference is the kernel doing the math.
+
+    Compares gradients on (x, h0) AND on every learnable parameter in the
+    layer's ``named_parameters()``.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    pt_layer = _make_layer(H, use_triton=False).to(device)
+    fast_layer = _make_layer(H, use_triton=True).to(device)
+    fast_layer.load_state_dict(pt_layer.state_dict())
+
+    # Inputs require_grad on both sides; allocate the base tensor first
+    # (``* 0.1`` returns a non-leaf tensor and would not preserve
+    # requires_grad on the result), then flip the flag in-place.
+    x_pt = (torch.randn(T, B, H, device=device) * 0.1).requires_grad_()
+    h0_pt = (torch.randn(B, H, device=device) * 0.1).requires_grad_()
+    x_tri = x_pt.detach().clone().requires_grad_()
+    h0_tri = h0_pt.detach().clone().requires_grad_()
+
+    pt_out, _ = pt_layer(x_pt, h0_pt)
+    pt_out.float().pow(2).sum().backward()
+
+    tri_out, _ = fast_layer(x_tri, h0_tri)
+    tri_out.float().pow(2).sum().backward()
+
+    # Per-parameter gradient parity. Strict tier: every learnable parameter
+    # that participated in both forwards must have matching gradients to
+    # < 1e-5 abs.
+    fast_params = dict(fast_layer.named_parameters())
+    for name, p_pt in pt_layer.named_parameters():
+        p_tri = fast_params[name]
+        _assert_grad_close(name, p_pt.grad, p_tri.grad, T, B, H)
+
+    # Input gradients.
+    for name, ref_g, tri_g in [
+        ("x", x_pt.grad, x_tri.grad),
+        ("h0", h0_pt.grad, h0_tri.grad),
+    ]:
+        _assert_grad_close(name, ref_g, tri_g, T, B, H)
+
+
+@pytest.mark.slow
+@cuda_only
+@pytest.mark.parametrize("T,B,H", SLOW_BFLY_GRID)
+def test_butterfly_bwd_strict_matches_reference_slow(
+    T: int, B: int, H: int
+) -> None:
+    """Identical body to the fast variant; gated behind ``@pytest.mark.slow``
+    per D-16 (T ∈ {512, 1024})."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    pt_layer = _make_layer(H, use_triton=False).to(device)
+    fast_layer = _make_layer(H, use_triton=True).to(device)
+    fast_layer.load_state_dict(pt_layer.state_dict())
+
+    x_pt = (torch.randn(T, B, H, device=device) * 0.1).requires_grad_()
+    h0_pt = (torch.randn(B, H, device=device) * 0.1).requires_grad_()
+    x_tri = x_pt.detach().clone().requires_grad_()
+    h0_tri = h0_pt.detach().clone().requires_grad_()
+
+    pt_out, _ = pt_layer(x_pt, h0_pt)
+    pt_out.float().pow(2).sum().backward()
+
+    tri_out, _ = fast_layer(x_tri, h0_tri)
+    tri_out.float().pow(2).sum().backward()
+
+    fast_params = dict(fast_layer.named_parameters())
+    for name, p_pt in pt_layer.named_parameters():
+        p_tri = fast_params[name]
+        _assert_grad_close(name, p_pt.grad, p_tri.grad, T, B, H)
+
+    for name, ref_g, tri_g in [
+        ("x", x_pt.grad, x_tri.grad),
+        ("h0", h0_pt.grad, h0_tri.grad),
+    ]:
+        _assert_grad_close(name, ref_g, tri_g, T, B, H)
