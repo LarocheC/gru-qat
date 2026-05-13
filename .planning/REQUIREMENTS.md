@@ -90,40 +90,40 @@ Populated during roadmap creation by the roadmapper agent.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REF-01 | TBD | Pending |
-| REF-02 | TBD | Pending |
-| REF-03 | TBD | Pending |
-| REF-04 | TBD | Pending |
-| REF-05 | TBD | Pending |
-| TRI-01 | TBD | Pending |
-| TRI-02 | TBD | Pending |
-| TRI-03 | TBD | Pending |
-| TRI-04 | TBD | Pending |
-| TRI-05 | TBD | Pending |
-| TRI-06 | TBD | Pending |
-| STR-01 | TBD | Pending |
-| STR-02 | TBD | Pending |
-| STR-03 | TBD | Pending |
-| QNT-01 | TBD | Pending |
-| QNT-02 | TBD | Pending |
-| QNT-03 | TBD | Pending |
-| QNT-04 | TBD | Pending |
-| CAL-01 | TBD | Pending |
-| CAL-02 | TBD | Pending |
-| CAL-03 | TBD | Pending |
-| EDG-01 | TBD | Pending |
-| EDG-02 | TBD | Pending |
-| EDG-03 | TBD | Pending |
-| EDG-04 | TBD | Pending |
-| RPT-01 | TBD | Pending |
-| RPT-02 | TBD | Pending |
-| RPT-03 | TBD | Pending |
+| REF-01 | Phase 1 | Pending |
+| REF-02 | Phase 1 | Pending |
+| REF-03 | Phase 1 | Pending |
+| REF-04 | Phase 1 | Pending |
+| REF-05 | Phase 1 | Pending |
+| TRI-01 | Phase 2 | Pending |
+| TRI-02 | Phase 2 | Pending |
+| TRI-03 | Phase 2 | Pending |
+| TRI-04 | Phase 2 | Pending |
+| TRI-05 | Phase 2 | Pending |
+| TRI-06 | Phase 2 | Pending |
+| STR-01 | Phase 3 | Pending |
+| STR-02 | Phase 3 | Pending |
+| STR-03 | Phase 3 | Pending |
+| QNT-01 | Phase 4 | Pending |
+| QNT-02 | Phase 4 | Pending |
+| QNT-03 | Phase 4 | Pending |
+| QNT-04 | Phase 4 | Pending |
+| CAL-01 | Phase 5 | Pending |
+| CAL-02 | Phase 5 | Pending |
+| CAL-03 | Phase 5 | Pending |
+| EDG-01 | Phase 6 | Pending |
+| EDG-02 | Phase 6 | Pending |
+| EDG-03 | Phase 6 | Pending |
+| EDG-04 | Phase 6 | Pending |
+| RPT-01 | Phase 7 | Pending |
+| RPT-02 | Phase 7 | Pending |
+| RPT-03 | Phase 7 | Pending |
 
 **Coverage:**
 - v1 requirements: 28 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 28 ⚠️ (resolved by roadmapper)
+- Mapped to phases: 28
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-05-13*
-*Last updated: 2026-05-13 after initial definition*
+*Last updated: 2026-05-13 after roadmap creation (traceability table populated)*
