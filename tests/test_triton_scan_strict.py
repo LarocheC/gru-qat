@@ -33,7 +33,7 @@ duplicated here.
 
 from __future__ import annotations
 
-import pathlib  # noqa: F401  (used by Task 3 D-25 static canary, appended below)
+import pathlib
 
 import pytest
 import torch
@@ -398,3 +398,66 @@ def test_persistent_kernel_deterministic() -> None:
             f"have regressed. max abs diff "
             f"{(out0 - out_i).abs().max().item():.4e} (TRI-06)"
         )
+
+
+# ---------------------------------------------------------------------------
+# D-25 static .cv cache-modifier canary
+# ---------------------------------------------------------------------------
+
+
+def test_no_cv_cache_modifier_live_uses_in_scan_source() -> None:
+    """Static canary for D-25: ``cache_modifier=".cv"`` MUST NOT appear in
+    any *live* (non-comment) line of ``src/gru_qat/triton_kernels/scan*.py``.
+
+    The ``.cv`` cache modifier was historically misused as a cross-CTA fence
+    substitute; see the comment block at
+    ``src/gru_qat/triton_kernels/scan.py:184-208`` and the "What the agent
+    should NOT do" section at ``DEVELOPMENT.md:131-143``. The current fix
+    pattern uses ``atomic_add(sem='release')`` + ``atomic_add(0,
+    sem='acquire')`` for cross-CTA visibility. The dynamic regression guard
+    is ``test_persistent_kernel_deterministic`` above (TRI-06); this static
+    canary is the cheap CI signal that catches reintroduction before any
+    GPU runs.
+
+    At the time this test was authored (2026-05-13), the three occurrences
+    of ``cache_modifier=".cv"`` in ``scan.py`` (lines 192, 431, 625) are
+    ALL inside ``#``-comment lines that *document* why the pattern is
+    forbidden; the live-code baseline is 0. The other ``scan*.py`` files
+    (scan_diagonal.py, scan_monarch.py, scan_butterfly.py) have zero matches
+    of any kind. If a future commit reintroduces ``cache_modifier=".cv"``
+    outside a comment in any of those files, this canary fails with the
+    offending file path + line number.
+
+    Comment-strip rule is ``raw.lstrip().startswith("#")`` — correctly
+    classifies indented Triton-JIT comment lines (which begin with
+    whitespace, then ``#``). ``raw.startswith("#")`` alone would miss them
+    and reintroduce false positives.
+
+    Pure-Python via ``pathlib`` (no shell-out per CONVENTIONS.md). Runs
+    on CPU; no ``@cuda_only`` needed.
+    """
+    src_dir = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "src"
+        / "gru_qat"
+        / "triton_kernels"
+    )
+    assert src_dir.is_dir(), f"expected {src_dir} to exist"
+
+    forbidden = 'cache_modifier=".cv"'
+    live_hits: list[tuple[str, int, str]] = []
+
+    for path in sorted(src_dir.glob("scan*.py")):
+        for line_no, raw in enumerate(path.read_text().splitlines(), start=1):
+            stripped = raw.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if forbidden in stripped:
+                live_hits.append((path.name, line_no, raw.rstrip()))
+
+    assert live_hits == [], (
+        f'Live (non-comment) cache_modifier=".cv" uses found in scan*.py: '
+        f"{live_hits}. See DEVELOPMENT.md anti-pattern note + "
+        "tests/test_triton_scan_strict.py::test_persistent_kernel_deterministic "
+        "for the dynamic guard."
+    )
