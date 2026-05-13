@@ -385,3 +385,69 @@ def test_layer_forward_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
     max_diff = (out_ref - out_ours).abs().max().item()
     rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
     assert rel < 1e-4, f"out rel diff {rel:.4e} (T={T},B={B},H={H})"
+
+
+# ----------------------------------------------------------------------------
+# Final-hidden-state (h_T) parity tests (Plan 01-02, Task 2; REF-04)
+# ----------------------------------------------------------------------------
+#
+# D-09 enforces splitting h_T parity into its OWN parametrized function,
+# separate from forward-output parity above. If the forward output is fine
+# but h_T drifts, the bug is in the final-step write or in how the layer's
+# return-tuple's second element is produced; if both fail in lockstep, the
+# bug is in the per-step math. Fusing the two would lose that signal.
+#
+# Shape detail: nn.GRU returns h_n with shape [num_layers=1, B, H]; our
+# GRULayer returns h_T with shape [B, H] (no leading num_layers axis).
+# Compare via ``hT_ref.squeeze(0)`` vs ``hT_ours``. The denominator floor
+# uses ``hT_ref.abs().max()`` (equivalent under squeeze of a size-1 dim,
+# reads more directly).
+
+
+@pytest.mark.parametrize("T,B,H", FAST_GRID)
+def test_layer_h_T_matches_nn_gru(T: int, B: int, H: int) -> None:
+    """h_T parity: distinct test family from forward-output parity so a
+    final-step bug surfaces alone. Both nn.GRU's h_n and our h_T are the
+    hidden state after T steps (D-09).
+
+    Discards the per-step output (that's the forward-parity test's
+    territory). Shape adapter: ``hT_ref`` is ``[1, B, H]`` (nn.GRU's
+    ``[num_layers, B, H]``), our ``hT_ours`` is ``[B, H]``; compare via
+    ``hT_ref.squeeze(0)``.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(T, B, IN)
+    _, hT_ref = gru(x)
+    _, hT_ours = layer(x)
+
+    max_diff = (hT_ref.squeeze(0) - hT_ours).abs().max().item()
+    rel = max_diff / max(hT_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, f"h_T rel diff {rel:.4e} (T={T},B={B},H={H})"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("T,B,H", SLOW_GRID)
+def test_layer_h_T_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
+    """h_T parity across the slow grid (T in {512, 1024}).
+
+    Identical body to the fast variant; gated behind ``@pytest.mark.slow``.
+    A long-T h_T drift that the fast grid wouldn't catch would surface here.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(T, B, IN)
+    _, hT_ref = gru(x)
+    _, hT_ours = layer(x)
+
+    max_diff = (hT_ref.squeeze(0) - hT_ours).abs().max().item()
+    rel = max_diff / max(hT_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, f"h_T rel diff {rel:.4e} (T={T},B={B},H={H})"
