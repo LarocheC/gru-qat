@@ -323,10 +323,15 @@ def test_autotune_dWh_dbh_zero_init_across_configs() -> None:
     (autotuned bwd). If the slab-zero fix regresses, the SECOND iteration's
     ``dWh_cat`` / ``dbh_cat`` diverge from reference while the first still
     passes — the assertion message includes ``iter=`` so the failure is
-    unambiguous in pytest output.
+    unambiguous in pytest output. The slab-zero contract is preserved
+    regardless of tolerance: a regressed fix produces ~O(0.1) divergence,
+    not ~5e-4.
 
-    Strict tier: < 1e-5 absolute under ``'highest'``. Tighter than the
-    realistic-tier sibling's ``rel < 1e-1`` (TF32 regime).
+    Strict tier: < 5e-4 absolute under ``'highest'`` (tight-TF32 per Phase 2
+    Plan 02-06 / Option C — Triton's ``tl.dot`` defaults to TF32 on Ampere+
+    regardless of the global precision setting). Tighter than the
+    realistic-tier sibling's ``rel < 1e-1`` (TF32 regime) and well below the
+    ~0.1 divergence a slab-leak regression would produce.
     """
     device = torch.device("cuda")
 
@@ -385,7 +390,7 @@ def test_autotune_dWh_dbh_zero_init_across_configs() -> None:
         ]:
             assert ref_g is not None and tri_g is not None
             max_diff = (ref_g - tri_g).abs().max().item()
-            assert max_diff < 1e-5, (
+            assert max_diff < 5e-4, (
                 f"iter={idx} shape={(T, B, H)} {name} max abs diff "
                 f"{max_diff:.4e} (TRI-05: autotune slab leak — second-iter "
                 f"failure means c001a8a fix regressed)"
