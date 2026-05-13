@@ -32,7 +32,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A test-local `_translate_nn_gru_to_cell(...)` helper exists, is documented, and converts `nn.GRU`'s `weight_ih_l0` / `weight_hh_l0` / `bias_ih_l0` / `bias_hh_l0` plus gate-order (`r, z, n` vs. PyTorch's `r, z, n` confirm via doc) into the cell's six per-gate weights; gate-ordering divergence is explicitly tested or documented.
   4. The existing cell-level `< 1e-5` parity gate in `tests/test_parity.py` is unchanged (not loosened).
   5. Any mismatch surfaced during REF triggers a failing test FIRST + a beads issue + a fix landing in this phase; no silent loosening of tolerances.
-**Plans**: TBD
+**Plans**: 5 plans
+- [ ] 01-01-PLAN.md — Translation helpers + 3 gate-ordering micro-tests + round-trip smoke test (foundation; no parametrize)
+- [ ] 01-02-PLAN.md — Forward + h_T parity grid (test_layer_forward_matches_nn_gru + test_layer_h_T_matches_nn_gru, fast + slow each)
+- [ ] 01-03-PLAN.md — Backward (gradient) parity grid covering (dx, dh_0, dW_ih, dW_hh, db_ih, db_hh)
+- [ ] 01-04-PLAN.md — h_0 ≠ 0 random initial state parity (out + h_T together)
+- [ ] 01-05-PLAN.md — Audit kickoff: run full suite, triage failures, file bd issues, drive Commit A → Commit B per finding, write phase-exit SUMMARY
 
 ### Phase 2: Triton fast-path parity vs reference
 **Goal**: Every Triton variant (dense, diagonal, monarch, butterfly) matches the reference path fwd+bwd at < 1e-5 on the shape grid, with explicit regression coverage for the recent fix cluster (butterfly OOB, autotuned-bwd accumulator slab zeroing, cross-CTA fence).
@@ -111,7 +116,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Reference-path parity vs nn.GRU | 0/TBD | Not started | - |
+| 1. Reference-path parity vs nn.GRU | 0/5 | Planned | - |
 | 2. Triton fast-path parity vs reference | 0/TBD | Not started | - |
 | 3. Structured PyTorch fallback parity | 0/TBD | Not started | - |
 | 4. Quant-on bit-identity | 0/TBD | Not started | - |
