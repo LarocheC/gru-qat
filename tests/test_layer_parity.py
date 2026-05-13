@@ -451,3 +451,159 @@ def test_layer_h_T_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
     max_diff = (hT_ref.squeeze(0) - hT_ours).abs().max().item()
     rel = max_diff / max(hT_ref.abs().max().item(), 1e-6)
     assert rel < 1e-4, f"h_T rel diff {rel:.4e} (T={T},B={B},H={H})"
+
+
+# ----------------------------------------------------------------------------
+# Backward / gradient parity tests (Plan 01-03, Task 1; REF-03)
+# ----------------------------------------------------------------------------
+#
+# Third test family per D-09: backward parity is its OWN parametrized function
+# (and OWN _slow sibling), distinct from forward-output and h_T parity. If the
+# forward passes but the backward fails, the bug is in the autograd graph for
+# the backward step (e.g. the n-gate's `r * gh_n` derivative), not the
+# forward math. Splitting backward into its own family means a gradient bug
+# surfaces with a test id that points at exactly which gradient drifted (the
+# `{name}` token in the assertion message — see the per-param loop below).
+#
+# The audit philosophy: "bwd is where bugs hide." The recent fix cluster in
+# DEVELOPMENT.md (butterfly OOB at last program, dWh/dbh accumulator slabs,
+# cross-CTA fence) all surfaced in backward passes. This family is the
+# layer-level analog of the per-Triton-kernel backward-parity tests at
+# tests/test_triton_diagonal.py:299-339 — six weight grads (cat'd against
+# nn.GRU's [3H, IN] / [3H, H] / [3H] layouts), both bias families, dx, and
+# dh_0, all compared via the same < 1e-4 relative-error idiom.
+#
+# Shape detail: nn.GRU's h_0 has shape [num_layers=1, B, H], so h0_ref.grad
+# has shape [1, B, H]. Our GRULayer's h_0 has shape [B, H], so h0_ours.grad
+# has shape [B, H]. Compare via `h0_ref.grad.squeeze(0)` vs `h0_ours.grad`.
+#
+# Detach-clone idiom: x_ours = x_ref.detach().clone().requires_grad_(True)
+# (and same for h0) — each implementation owns its own autograd graph. Reusing
+# x_ref as the input to GRULayer would build one tape across both graphs and
+# the second `.backward(g)` would crash.
+
+
+@pytest.mark.parametrize("T,B,H", FAST_GRID)
+def test_layer_backward_matches_nn_gru(T: int, B: int, H: int) -> None:
+    """Backward parity: all six weight grads (cat'd against nn.GRU's [3H, IN]
+    / [3H, H] layouts), both bias grads, dx, and dh_0 match nn.GRU autograd
+    to < 1e-4 relative across the fast grid.
+
+    Separate from forward parity per D-09: if forward passes but backward
+    fails, the bug is in the autograd graph for the backward step (e.g. the
+    n-gate's ``r * gh_n`` derivative), not the forward math. The ``{name}``
+    token in the failure message identifies which of {dx, dh_0, dW_ih, dW_hh,
+    db_ih, db_hh} drifted — the single most diagnostic thing in this test.
+
+    Uses a shared random ``g = torch.randn_like(out_ref)`` so both autograd
+    graphs see the same upstream gradient signal — every output element
+    contributes independently, which is more discriminating than
+    ``out.sum().backward()``.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    # Two separate requires_grad=True leaf tensors so each implementation
+    # owns its own autograd graph. Detach-clone is mandatory — sharing the
+    # same leaf would build one tape across both and the second
+    # `.backward(g)` would crash on a second-backward through a graph that
+    # was already freed. Note h0 is squeezed BEFORE the clone so the clone's
+    # storage matches GRULayer's [B, H] shape and `.grad` accumulates with
+    # that shape directly.
+    x_ref = torch.randn(T, B, IN, requires_grad=True)
+    h0_ref = torch.zeros(1, B, H, requires_grad=True)  # nn.GRU's [1, B, H]
+    x_ours = x_ref.detach().clone().requires_grad_(True)
+    h0_ours = h0_ref.detach().squeeze(0).clone().requires_grad_(True)  # [B, H]
+
+    out_ref, _ = gru(x_ref, h0_ref)
+    out_ours, _ = layer(x_ours, h0_ours)
+
+    # Shared downstream gradient — same g sent into both autograd graphs.
+    # randn_like(out_ref) is fine because out_ref and out_ours have the
+    # same shape (forward parity passes; that's REF-01's job, gated by the
+    # preceding test family).
+    g = torch.randn_like(out_ref)
+    out_ref.backward(g)
+    out_ours.backward(g)
+
+    # Build cell-side cat tensors to match nn.GRU's concatenated [3H, *]
+    # / [3H] layouts. Gate order is (r, z, n) on both sides — same order
+    # as the forward translation in `_translate_cell_to_nn_gru`, so the
+    # gradients land in the same rows.
+    cell = layer.cell
+    our_W_ih = torch.cat([cell.W_ir.grad, cell.W_iz.grad, cell.W_in.grad], dim=0)
+    our_W_hh = torch.cat([cell.W_hr.grad, cell.W_hz.grad, cell.W_hn.grad], dim=0)
+    our_b_ih = torch.cat([cell.b_ir.grad, cell.b_iz.grad, cell.b_in.grad])
+    our_b_hh = torch.cat([cell.b_hr.grad, cell.b_hz.grad, cell.b_hn.grad])
+
+    # Per-gradient relative-error loop. The `{name}` token in the failure
+    # message points at exactly which of the six gradient tensors drifted —
+    # if a backward bug surfaces, the bd issue title should include this
+    # name (e.g. `test_layer_backward_matches_nn_gru[1-1-1] dW_hh drift`).
+    for name, ref_t, our_t in [
+        ("dx", x_ref.grad, x_ours.grad),
+        ("dh_0", h0_ref.grad.squeeze(0), h0_ours.grad),
+        ("dW_ih", gru.weight_ih_l0.grad, our_W_ih),
+        ("dW_hh", gru.weight_hh_l0.grad, our_W_hh),
+        ("db_ih", gru.bias_ih_l0.grad, our_b_ih),
+        ("db_hh", gru.bias_hh_l0.grad, our_b_hh),
+    ]:
+        rel = (ref_t - our_t).abs().max().item() / max(
+            ref_t.abs().max().item(), 1e-6
+        )
+        assert rel < 1e-4, f"{name} rel diff {rel:.4e} (T={T},B={B},H={H})"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("T,B,H", SLOW_GRID)
+def test_layer_backward_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
+    """Backward parity across the slow grid (T in {512, 1024}).
+
+    Identical body to the fast variant; gated behind ``@pytest.mark.slow``
+    so default ``pytest -q`` doesn't pay the long-T autograd cost (backward
+    through 1024 timesteps is the longest single autograd graph in the
+    audit). A long-T backward drift that the fast grid wouldn't catch would
+    surface here — if drift is uniform across the grid, it's a math bug;
+    if it's scale-dependent (large-H, large-T), it indicates accumulated
+    numerical drift that informs Phase 6 (edge sweeps) rather than
+    reopening Phase 1.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x_ref = torch.randn(T, B, IN, requires_grad=True)
+    h0_ref = torch.zeros(1, B, H, requires_grad=True)
+    x_ours = x_ref.detach().clone().requires_grad_(True)
+    h0_ours = h0_ref.detach().squeeze(0).clone().requires_grad_(True)
+
+    out_ref, _ = gru(x_ref, h0_ref)
+    out_ours, _ = layer(x_ours, h0_ours)
+
+    g = torch.randn_like(out_ref)
+    out_ref.backward(g)
+    out_ours.backward(g)
+
+    cell = layer.cell
+    our_W_ih = torch.cat([cell.W_ir.grad, cell.W_iz.grad, cell.W_in.grad], dim=0)
+    our_W_hh = torch.cat([cell.W_hr.grad, cell.W_hz.grad, cell.W_hn.grad], dim=0)
+    our_b_ih = torch.cat([cell.b_ir.grad, cell.b_iz.grad, cell.b_in.grad])
+    our_b_hh = torch.cat([cell.b_hr.grad, cell.b_hz.grad, cell.b_hn.grad])
+
+    for name, ref_t, our_t in [
+        ("dx", x_ref.grad, x_ours.grad),
+        ("dh_0", h0_ref.grad.squeeze(0), h0_ours.grad),
+        ("dW_ih", gru.weight_ih_l0.grad, our_W_ih),
+        ("dW_hh", gru.weight_hh_l0.grad, our_W_hh),
+        ("db_ih", gru.bias_ih_l0.grad, our_b_ih),
+        ("db_hh", gru.bias_hh_l0.grad, our_b_hh),
+    ]:
+        rel = (ref_t - our_t).abs().max().item() / max(
+            ref_t.abs().max().item(), 1e-6
+        )
+        assert rel < 1e-4, f"{name} rel diff {rel:.4e} (T={T},B={B},H={H})"
