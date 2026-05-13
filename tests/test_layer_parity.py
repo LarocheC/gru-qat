@@ -607,3 +607,112 @@ def test_layer_backward_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
             ref_t.abs().max().item(), 1e-6
         )
         assert rel < 1e-4, f"{name} rel diff {rel:.4e} (T={T},B={B},H={H})"
+
+
+# ----------------------------------------------------------------------------
+# h_0 != 0 parity tests (Plan 01-04, Task 1; REF-02)
+# ----------------------------------------------------------------------------
+#
+# Fourth and final D-09 test family: random initial hidden state. The first
+# three families (forward, h_T, backward) all run with h_0 defaulted to zeros;
+# this one explicitly constructs a random h_0 and threads it through both
+# implementations. Purpose: a time-loop that special-cases ``h0=None`` (e.g.
+# initializing differently on the None-branch than on the explicit-tensor
+# branch) can pass the zero-h0 tests by accident — the random-h0 family is
+# the only way to surface that. Per REF-02 + CONTEXT D-09.
+#
+# Per CONTEXT.md Specifics (line 117): this family asserts BOTH ``out`` and
+# ``h_T`` in the SAME test — the isolation is "h_0 != 0", not the family
+# split. Splitting it into out-only and h_T-only siblings would create 8 grid
+# families instead of 4 (D-09 explicitly rejects that — fwd vs h_T family
+# split is the relevant axis only for the zero-h0 grids).
+#
+# Shape contract: GRULayer takes h0 as [B, H]; nn.GRU takes h0 as
+# [num_layers=1, B, H]. Build the [1, B, H] tensor first (the nn.GRU shape)
+# then ``.squeeze(0)`` to the [B, H] shape we hand to GRULayer. ``squeeze(0)``
+# returns a view with shared storage, which is safe here because the test is
+# forward-only (no in-place writes, no autograd state shared between the two
+# calls).
+#
+# No autograd in this family: random-h0 backward is implicitly covered by
+# Plan 01-03's ``test_layer_backward_matches_nn_gru`` (which sets ``dh_0``
+# parity at zero-h0; the bwd graph is the same path regardless of the h0
+# value used in the forward). If a random-h0-specific backward bug existed,
+# the gradient test would have caught it via the ``dh_0`` slot. No need to
+# duplicate the autograd machinery here.
+#
+# Per-name assertion loop pattern: same idiom as the backward test, but the
+# triples list has only two entries (out + h_T). The ``h0=rand`` tag in the
+# failure message distinguishes this family from the zero-h0 fwd / h_T
+# grids — pytest test id alone says "T=8,B=4,H=64", we want the failure
+# context to scream "...AND h0 was random" so the bd-issue title is
+# unambiguous on a glance.
+
+
+@pytest.mark.parametrize("T,B,H", FAST_GRID)
+def test_layer_with_random_h0_matches_nn_gru(T: int, B: int, H: int) -> None:
+    """h_0 != 0 parity over the fast grid.
+
+    Asserts both ``out`` and ``h_T`` in the same test — this is the h_0 != 0
+    isolation, not a fwd-vs-h_T family split (D-09 + CONTEXT Specifics).
+    Catches initialization bugs where a path special-cases ``h_0=None`` but
+    mishandles a real tensor. The ``h0_3d`` (nn.GRU shape) and ``h0_2d``
+    (GRULayer shape) views share storage via ``.squeeze(0)`` — both
+    implementations see the same initial values, modulo the leading
+    ``num_layers`` axis.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(T, B, IN)
+    h0_3d = torch.randn(1, B, H)  # nn.GRU shape: [num_layers=1, B, H]
+    h0_2d = h0_3d.squeeze(0)      # GRULayer shape: [B, H] — view, shared storage
+
+    out_ref, hT_ref = gru(x, h0_3d)
+    out_ours, hT_ours = layer(x, h0_2d)
+
+    for name, ref_t, our_t in [
+        ("out", out_ref, out_ours),
+        ("h_T", hT_ref.squeeze(0), hT_ours),
+    ]:
+        rel = (ref_t - our_t).abs().max().item() / max(
+            ref_t.abs().max().item(), 1e-6
+        )
+        assert rel < 1e-4, f"{name} rel diff {rel:.4e} (T={T},B={B},H={H},h0=rand)"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("T,B,H", SLOW_GRID)
+def test_layer_with_random_h0_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
+    """h_0 != 0 parity across the slow grid (T in {512, 1024}).
+
+    Identical body to the fast variant; gated behind ``@pytest.mark.slow``.
+    A long-T accumulation drift in the random-h0 path that the fast grid
+    wouldn't catch would surface here — the initial-state influence
+    propagates through 512+ recurrent steps, and any subtle asymmetry between
+    the two implementations' h0 handling compounds over T.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(T, B, IN)
+    h0_3d = torch.randn(1, B, H)
+    h0_2d = h0_3d.squeeze(0)
+
+    out_ref, hT_ref = gru(x, h0_3d)
+    out_ours, hT_ours = layer(x, h0_2d)
+
+    for name, ref_t, our_t in [
+        ("out", out_ref, out_ours),
+        ("h_T", hT_ref.squeeze(0), hT_ours),
+    ]:
+        rel = (ref_t - our_t).abs().max().item() / max(
+            ref_t.abs().max().item(), 1e-6
+        )
+        assert rel < 1e-4, f"{name} rel diff {rel:.4e} (T={T},B={B},H={H},h0=rand)"
