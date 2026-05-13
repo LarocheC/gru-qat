@@ -245,7 +245,7 @@ def test_monarch_triton_backward_matches_pytorch(
     ]:
         diff = (t - p).abs().max().item()
         rel = diff / max(p.abs().max().item(), 1e-9)
-        assert rel < 5e-2, f"{name} rel diff {rel:.4e}"
+        assert rel < 1e-2, f"{name} rel diff {rel:.4e}"
 
 
 @cuda_only
@@ -284,8 +284,8 @@ def test_grulayer_use_triton_matches_pytorch_path(
 
     rel_out = (pt_out - tri_out).abs().max().item() / max(pt_out.abs().max().item(), 1e-6)
     rel_hT = (pt_hT - tri_hT).abs().max().item() / max(pt_hT.abs().max().item(), 1e-6)
-    assert rel_out < 5e-2, f"out rel diff {rel_out:.4e}"
-    assert rel_hT < 5e-2, f"hT rel diff {rel_hT:.4e}"
+    assert rel_out < 5e-3, f"out rel diff {rel_out:.4e}"
+    assert rel_hT < 5e-3, f"hT rel diff {rel_hT:.4e}"
 
 
 @cuda_only
@@ -401,14 +401,14 @@ def test_monarch_pytorch_backward_matches_cell(
     # Compare h0 gradients
     diff_h0 = (dh0 - ref_h0.grad).abs().max().item()
     rel_h0 = diff_h0 / max(ref_h0.grad.abs().max().item(), 1e-6)
-    assert rel_h0 < 1e-4, f"dh0 rel diff {rel_h0:.4e}"
+    assert rel_h0 < 1e-5, f"dh0 rel diff {rel_h0:.4e}"
 
     # Compare Wh gradients
     diff_Wh = (dWh_struct - ref_dWh).abs().max().item()
     rel_Wh = diff_Wh / max(ref_dWh.abs().max().item(), 1e-6)
-    assert rel_Wh < 1e-4, f"dWh rel diff {rel_Wh:.4e}"
+    assert rel_Wh < 1e-5, f"dWh rel diff {rel_Wh:.4e}"
 
     # Compare bh gradients
     diff_bh = (dbh - ref_dbh).abs().max().item()
     rel_bh = diff_bh / max(ref_dbh.abs().max().item(), 1e-6)
-    assert rel_bh < 1e-4, f"dbh rel diff {rel_bh:.4e}"
+    assert rel_bh < 1e-5, f"dbh rel diff {rel_bh:.4e}"
