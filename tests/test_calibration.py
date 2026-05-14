@@ -9,6 +9,8 @@ Validates the typical QAT-to-deployment flow:
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
@@ -25,6 +27,44 @@ from gru_qat.structure import StructureConfig
 cuda_only = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GRULayer fast-path requires CUDA"
 )
+
+
+def _load_strict_helpers() -> dict[str, object]:
+    """Lazy-import Phase 4 strict-file helpers used by CAL-03.
+
+    Imports the four ``tests/test_triton_*_strict.py`` modules at FIRST
+    call (not at module level) so the existing 5 CPU-only tests in this
+    file plus CAL-02 still run on CPU-only hosts. The strict files do
+    ``pytest.importorskip("triton")`` at module level, which would skip
+    the whole importing file (i.e. test_calibration.py) on CPU hosts —
+    not what we want here.
+
+    Cross-file imports work via pytest's default ``prepend`` import mode:
+    ``tests/`` has no ``__init__.py``, so each collected test file's
+    directory is prepended to ``sys.path`` and sibling files import as
+    top-level modules. No ``conftest.py`` is required — CONTEXT
+    Decision B's "alternative" path (extracting helpers into a separate
+    module) is intentionally NOT taken; the strict files are imported
+    as-is per the Phase 5 must_haves "Cross-file import contract".
+
+    Importing the strict files triggers ``torch.set_float32_matmul_precision
+    ("highest")`` at their module top level — this persists for the
+    pytest session. Phase 5's CAL-03 needs matched-precision parity
+    anyway, so this is desirable.
+    """
+    scan = importlib.import_module("test_triton_scan_strict")
+    diag = importlib.import_module("test_triton_diagonal_strict")
+    mono = importlib.import_module("test_triton_monarch_strict")
+    butt = importlib.import_module("test_triton_butterfly_strict")
+    return {
+        "_assert_quant_parity": scan._assert_quant_parity,
+        "_adversarial_inputs": scan._adversarial_inputs,
+        "_make_dense_layer_quant_int8": scan._make_dense_layer_quant_int8,
+        "_make_diagonal_layer_quant_int8": diag._make_diagonal_layer_quant_int8,
+        "_make_monarch_layer_quant_int8": mono._make_monarch_layer_quant_int8,
+        "_skip_if_monarch_bwd_hw_limit": mono._skip_if_monarch_bwd_hw_limit,
+        "_make_butterfly_layer_quant_int8": butt._make_butterfly_layer_quant_int8,
+    }
 
 
 def _make_qat_layer(in_size: int = 16, hid: int = 32) -> GRULayer:
@@ -416,3 +456,245 @@ def test_freeze_all_matches_dynamic_on_last_batch() -> None:
         "quant_x.scale changed across a post-freeze forward — frozen mode "
         "did not short-circuit _update_observer"
     )
+
+
+# ---------------------------------------------------------------------------
+# CAL-03 parametrize grid (per CONTEXT Decision G: 1 shape × 3 classes × 4
+# kernels = 12 cases). Phase 4 strict-file helpers provide the per-(kernel,
+# class) tolerance contract via _assert_quant_parity + per-cluster h_scale_mult
+# from .planning/phases/04-quant-on-bit-identity/04-DISPOSITION.md.
+# ---------------------------------------------------------------------------
+_CAL03_PARAMS = [
+    # (kernel, T, B, H, nblocks_or_none)
+    ("dense", 8, 4, 64, None),
+    ("diagonal", 8, 4, 64, None),
+    # blksz = H // nblocks = 16 → outside _skip_if_monarch_bwd_hw_limit's
+    # skip range (CAL-03 is fwd-only, but the shape is sound for parity).
+    ("monarch", 8, 4, 64, 4),
+    # H=32 because butterfly requires power-of-2 hidden dim; tests/test_
+    # triton_butterfly_strict.py uses the same H values (32/128/512).
+    ("butterfly", 8, 4, 32, None),
+]
+_CAL03_CLASSES = ["realistic", "near-saturation", "large-magnitude"]
+
+
+@cuda_only
+@pytest.mark.parametrize("kernel,T,B,H,nblocks", _CAL03_PARAMS)
+@pytest.mark.parametrize("cls", _CAL03_CLASSES)
+def test_triton_matches_reference_after_freeze(
+    cls: str, kernel: str, T: int, B: int, H: int, nblocks: int | None
+) -> None:
+    """CAL-03 + Success Criterion #3 — forward round-trip after the full
+    calibrate → freeze → deploy lifecycle, across all 4 Triton-eligible
+    kernels and all 3 D-46 adversarial classes.
+
+    Builds a frozen-INT8 layer per kernel using the Phase 4 strict-file
+    factories (``_make_{dense,diagonal,monarch,butterfly}_layer_quant_int8``)
+    which already perform the inline ``calibrate → freeze_quantizers``
+    pattern Phase 5 audits. Then on a held-out batch from each D-46
+    adversarial class, asserts the Triton (fast dispatch) output matches
+    the reference (per-step) output **within the Phase 4 per-cluster
+    ``h_scale_mult`` contract** from
+    ``.planning/phases/04-quant-on-bit-identity/04-DISPOSITION.md``.
+
+    Per-kernel disposition (matches strict-file per-case logic verbatim):
+
+    +-----------+--------------------------------+------------------+
+    | Kernel    | Class                          | Bound            |
+    +===========+================================+==================+
+    | dense     | all                            | torch.equal      |
+    | diagonal  | realistic / near-saturation    | torch.equal      |
+    | diagonal  | large-magnitude                | h_scale_mult=2.0 |
+    | monarch   | all                            | h_scale_mult=4.0 |
+    | butterfly | realistic                      | h_scale_mult=50  |
+    | butterfly | near-saturation / large-magn.  | h_scale_mult=100 |
+    +-----------+--------------------------------+------------------+
+
+    Forward-only per Success Criterion #3 ("Triton output vs use_triton=False").
+    Backward parity inherits from the Phase 4 strict files at the per-
+    (kernel, direction, class) bounds — Phase 5 does NOT re-test bwd.
+
+    bd issue references on the loosened-bound call sites (per CONTEXT
+    Decision B's "Every call site that overrides h_scale_mult must
+    reference the bd issue"): see inline comments — gru-triton-fpl
+    (diagonal large-mag), gru-triton-in0 (monarch all), gru-triton-lqk
+    (butterfly all).
+    """
+    pytest.importorskip("triton")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H  # mirror Phase 4 strict-file convention
+    helpers = _load_strict_helpers()
+    _assert_quant_parity = helpers["_assert_quant_parity"]
+    _adversarial_inputs = helpers["_adversarial_inputs"]
+
+    if kernel == "dense":
+        # Dense uses pre_batch_input=True; round-trip is per-step layer
+        # vs explicit gru_scan call (mirrors strict-file _run_dense_quant_
+        # fwd_case lines 850-906).
+        import torch.nn.functional as F
+        from gru_qat.triton_kernels.scan import gru_scan as _gru_scan
+        layer = helpers["_make_dense_layer_quant_int8"](IN, H).to(device).eval()
+        x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+        with torch.no_grad():
+            ref_out, ref_hT = layer(x.clone(), h0.clone())
+            w = layer.cell.quantize_weights()
+            xq = layer.cell.quant_x(x.clone())
+            gi = F.linear(xq, w.Wi_cat, w.bi_cat)
+            h_scale = float(layer.cell.quant_h_in.scale.item())
+            tri_out = _gru_scan(
+                gi, h0.clone(), w.Wh_cat, w.bh_cat,
+                h_in_quant=(h_scale, -127, 127),
+                h_out_quant=(h_scale, -127, 127),
+            )
+            tri_hT = tri_out[-1]
+        # Dense fwd disposition: torch.equal across all classes (04-DISPOSITION
+        # line 33). No bd issue — this is the clean cluster.
+        _assert_quant_parity(
+            f"dense out[cls={cls}]", ref_out, tri_out, h_scale, strict=True
+        )
+        _assert_quant_parity(
+            f"dense h_T[cls={cls}]", ref_hT, tri_hT, h_scale, strict=True
+        )
+
+    elif kernel == "diagonal":
+        # Diagonal: low-level kernel-pair round-trip (mirrors strict-file
+        # test_diagonal_quant_fwd at lines 538-597). The full layer.forward
+        # path through cell.step_structured invokes quant_struct_Wh_*
+        # quantizers which use the known-broken per-channel min_max observer
+        # (CLAUDE.md "Per-channel min_max observer is known-broken for
+        # activations") and produce wrong scale shapes — that's a different
+        # Phase 1 finding, unrelated to the calibrate->freeze lifecycle CAL-03
+        # audits. The kernel-pair pattern (gru_scan_diagonal_forward_pytorch
+        # vs ..._forward_triton consuming extracted factors) isolates the
+        # Triton kernel from the per-step structured wiring and is the
+        # canonical "Triton vs reference under the same calibrated recipe"
+        # round-trip Phase 4 defined for diagonal.
+        import torch.nn.functional as F
+        from gru_qat.triton_kernels.scan_diagonal import (
+            extract_diagonal_factors,
+            gru_scan_diagonal_forward_pytorch,
+            gru_scan_diagonal_forward_triton,
+        )
+        layer = helpers["_make_diagonal_layer_quant_int8"](IN, H).to(device).eval()
+        x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+        with torch.no_grad():
+            Wh_diag, bh_cat = extract_diagonal_factors(layer.cell)
+            # Build qgi mirroring strict-file _build_qgi_from_layer
+            # (test_triton_diagonal_strict.py:511-527): quant_x BEFORE F.linear.
+            Wi_cat, bi_cat = layer.cell.quantize_input_weights()
+            xq = layer.cell.quant_x(x)
+            gi = F.linear(xq, Wi_cat, bi_cat)
+            h_scale = float(layer.cell.quant_h_in.scale.item())
+            h_in_q = (h_scale, -127, 127)
+            h_out_q = (h_scale, -127, 127)
+            ref_out = gru_scan_diagonal_forward_pytorch(
+                gi, h0, Wh_diag, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+            tri_out = gru_scan_diagonal_forward_triton(
+                gi, h0, Wh_diag, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+            ref_hT = ref_out[-1]
+            tri_hT = tri_out[-1]
+        if cls == "large-magnitude":
+            # F-04-VERIFIER-E (bd gru-triton-fpl): diagonal fwd large-magnitude
+            # requires h_scale_mult=2.0 (04-DISPOSITION line 39).
+            _assert_quant_parity(
+                f"diag out[cls={cls}]", ref_out, tri_out, h_scale,
+                strict=False, h_scale_mult=2.0,
+            )
+            _assert_quant_parity(
+                f"diag h_T[cls={cls}]", ref_hT, tri_hT, h_scale,
+                strict=False, h_scale_mult=2.0,
+            )
+        else:
+            # Diagonal fwd realistic / near-saturation: torch.equal
+            # (04-DISPOSITION line 38). No bd issue — clean cluster.
+            _assert_quant_parity(
+                f"diag out[cls={cls}]", ref_out, tri_out, h_scale, strict=True
+            )
+            _assert_quant_parity(
+                f"diag h_T[cls={cls}]", ref_hT, tri_hT, h_scale, strict=True
+            )
+
+    elif kernel == "monarch":
+        # Monarch: low-level kernel-pair round-trip (mirrors strict-file
+        # test_monarch_quant_fwd at lines 554-612). Same rationale as
+        # diagonal — the per-step structured path goes through
+        # quant_struct_Wh_* which has the known-broken per-channel
+        # min_max observer; the kernel-pair pattern isolates the Triton
+        # kernel from that wiring.
+        import torch.nn.functional as F
+        from gru_qat.triton_kernels.scan_monarch import (
+            extract_monarch_factors,
+            gru_scan_monarch_forward_pytorch,
+            gru_scan_monarch_forward_triton,
+        )
+        assert nblocks is not None
+        layer = helpers["_make_monarch_layer_quant_int8"](
+            IN, H, nblocks=nblocks
+        ).to(device).eval()
+        x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+        with torch.no_grad():
+            Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+            Wi_cat, bi_cat = layer.cell.quantize_input_weights()
+            xq = layer.cell.quant_x(x)
+            gi = F.linear(xq, Wi_cat, bi_cat)
+            h_scale = float(layer.cell.quant_h_in.scale.item())
+            h_in_q = (h_scale, -127, 127)
+            h_out_q = (h_scale, -127, 127)
+            ref_out = gru_scan_monarch_forward_pytorch(
+                gi, h0, Wh_struct, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+            tri_out = gru_scan_monarch_forward_triton(
+                gi, h0, Wh_struct, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+            ref_hT = ref_out[-1]
+            tri_hT = tri_out[-1]
+        # F-04-VERIFIER-A (bd gru-triton-in0): monarch fwd all classes require
+        # h_scale_mult=4.0 (04-DISPOSITION line 41). TF32 reduction-order
+        # non-associativity in tile-by-tile tl.dot vs reference einsum.
+        _assert_quant_parity(
+            f"monarch out[cls={cls}]", ref_out, tri_out, h_scale,
+            strict=False, h_scale_mult=4.0,
+        )
+        _assert_quant_parity(
+            f"monarch h_T[cls={cls}]", ref_hT, tri_hT, h_scale,
+            strict=False, h_scale_mult=4.0,
+        )
+
+    elif kernel == "butterfly":
+        # Dual-layer comparator (mirrors strict-file _run_butterfly_quant_
+        # fwd_case lines 638-683). load_state_dict propagates frozen scales.
+        pt_layer = helpers["_make_butterfly_layer_quant_int8"](
+            H, use_triton=False
+        ).to(device).eval()
+        fast_layer = helpers["_make_butterfly_layer_quant_int8"](
+            H, use_triton=True
+        ).to(device).eval()
+        fast_layer.load_state_dict(pt_layer.state_dict())
+        h_scale = float(pt_layer.cell.quant_h_in.scale.item())
+        # Butterfly uses H for the input dim too (square hidden).
+        x, h0 = _adversarial_inputs(cls, T, B, H, device, h_scale=h_scale)
+        with torch.no_grad():
+            ref_out, ref_hT = pt_layer(x.clone(), h0.clone())
+            tri_out, tri_hT = fast_layer(x.clone(), h0.clone())
+        # F-04-VERIFIER-D (bd gru-triton-lqk): butterfly fwd realistic ->
+        # h_scale_mult=50, others -> 100 (matches inline mult in
+        # _run_butterfly_quant_fwd_case at strict-file line 675;
+        # 04-DISPOSITION lines 46-47).
+        fwd_mult = 50.0 if cls == "realistic" else 100.0
+        _assert_quant_parity(
+            f"butterfly out[cls={cls}]", ref_out, tri_out, h_scale,
+            strict=False, h_scale_mult=fwd_mult,
+        )
+        _assert_quant_parity(
+            f"butterfly h_T[cls={cls}]", ref_hT, tri_hT, h_scale,
+            strict=False, h_scale_mult=fwd_mult,
+        )
+    else:
+        raise AssertionError(f"unknown kernel: {kernel}")
