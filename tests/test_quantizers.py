@@ -90,3 +90,60 @@ def test_freeze_locks_scale() -> None:
 @pytest.mark.skip(reason="phase=2 — requires simulator import")
 def test_matches_simulator_quantize_dequantize() -> None:
     pass
+
+
+def test_per_channel_min_max_observer_per_channel_running_stats() -> None:
+    """QNT-04 (D-44 / D-45): the per-channel ``min_max`` observer must produce
+    PER-CHANNEL ``running_min`` / ``running_max`` tensors, not scalars.
+
+    The current implementation at ``src/gru_qat/quantizers.py:135-146`` calls
+    ``x.detach().min()`` / ``.max()`` — global scalar reductions, broken for
+    per-channel axes. After the fix in Commit B (per-axis reduction via
+    ``x.amin(dim=other_dims)``), ``running_min`` / ``running_max`` should be
+    shape ``[num_channels]`` with channel-distinct values.
+
+    Construct a tensor with channel 0 in ``[-1, 1]`` and channel 1 in
+    ``[-10, 10]`` (per CONTEXT specifics). After one forward, assert:
+
+    - ``running_min.shape == (2,)`` — NOT scalar.
+    - ``running_min[0] != running_min[1]`` — channel-distinct values.
+
+    Two-commit failing-test-before-fix per D-37 / D-45: this test is
+    Commit A (failing-before-fix); Commit B fixes ``_update_observer`` at
+    ``src/gru_qat/quantizers.py:135-146``; CI green => ``bd close`` for the
+    QNT-04 / ACT-01 issue.
+
+    Pattern mirrors ``test_per_channel_independent_scales`` at lines 34-41
+    but exercises the ``min_max`` observer path (``mode='min_max'``) rather
+    than the default ``dynamic`` ``_compute_scale_zp`` path.
+    """
+    cfg = QuantizerConfig(bits=8, axis=0, symmetric=True, mode="min_max")
+    q = FakeQuantizePerChannel(cfg)
+    # Channel 0 in [-1, 1]; channel 1 in [-10, 10]. Distinct per-channel.
+    x = torch.stack([torch.randn(16) * 1.0, torch.randn(16) * 10.0])
+    # Force values to span the intended range so min/max are unambiguous.
+    x[0, 0] = -1.0
+    x[0, -1] = 1.0
+    x[1, 0] = -10.0
+    x[1, -1] = 10.0
+    q(x)  # one forward; min_max observer updates running stats
+    # Assertions that FAIL pre-fix (scalar reduction produces 0-d running_min):
+    assert q.running_min.ndim > 0, (
+        f"running_min should be per-channel; got scalar "
+        f"(ndim={q.running_min.ndim}, shape={tuple(q.running_min.shape)})"
+    )
+    assert q.running_min.shape == (2,), (
+        f"running_min should be shape (2,); got {tuple(q.running_min.shape)}"
+    )
+    assert q.running_max.shape == (2,), (
+        f"running_max should be shape (2,); got {tuple(q.running_max.shape)}"
+    )
+    # Channel 0 in [-1, 1]; channel 1 in [-10, 10] => running_min must differ.
+    assert q.running_min[0] != q.running_min[1], (
+        f"running_min should differ per channel; got values "
+        f"{q.running_min.tolist()}"
+    )
+    assert q.running_max[1] > q.running_max[0], (
+        f"running_max[1] should exceed running_max[0]; got values "
+        f"{q.running_max.tolist()}"
+    )
