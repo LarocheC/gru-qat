@@ -698,3 +698,109 @@ def test_triton_matches_reference_after_freeze(
         )
     else:
         raise AssertionError(f"unknown kernel: {kernel}")
+
+
+@cuda_only
+def test_use_triton_bypass_keeps_observers_at_inf() -> None:
+    """Success Criterion #4 / anti-pattern — calling
+    ``calibration.calibrate(layer, ...)`` DIRECTLY (bypassing
+    ``GRULayer.calibrate``'s wrapper) leaves the hidden-side activation
+    quantizers at the ±inf sentinel state, proving the wrapper at
+    ``src/gru_qat/gru_layer.py:283-288`` is the only correct calibration
+    entry point.
+
+    Negative companion to ``test_calibrate_uses_per_step_path`` (Task 1).
+    Together they pin the contract: the wrapper transiently disables
+    ``use_triton`` (lines 290-299) so the per-step path fires and every
+    activation quantizer's ``forward()`` is invoked. Without it, the
+    fast dispatch's
+    ``_extract_h_quant_params`` (gru_layer.py:28) READS the scales from
+    ``quant_h_in`` / ``quant_h_out`` directly without calling them —
+    those modules' observers therefore never update, and stay at
+    ``running_min=+inf`` / ``running_max=-inf``.
+
+    Asymmetric assertion (this is the SUBTLE part the plan calls out):
+
+    - ``quant_x.running_min`` ends up FINITE because the fast dispatch's
+      pre-projection step at gru_layer.py:213 (``xq = self.cell.quant_x(x)``)
+      DOES call ``quant_x.forward()``. So ``quant_x``'s observer fires
+      regardless of which path is used.
+    - ``quant_h_in`` / ``quant_h_out`` end up at the ±inf SENTINEL
+      because the fast dispatch only reads their scales via
+      ``_extract_h_quant_params`` — their ``.forward()`` is NEVER
+      invoked. So their observers stay at the buffer init state set by
+      ``calibrate``'s reset block (calibration.py:86-89).
+
+    This asymmetry is the test's binding statement. If a future kernel
+    refactor starts calling ``quant_h_in.forward()`` from the fast
+    dispatch (which would make the wrapper redundant), this test must
+    be updated alongside the wrapper's docstring at gru_layer.py:283-288.
+    """
+    pytest.importorskip("triton")
+    device = torch.device("cuda")
+
+    torch.manual_seed(0)
+    layer = _make_fastpath_qat_layer(in_size=16, hid=32).to(device).eval()
+    assert layer.use_triton is True
+    assert layer._fast_dispatch_eligible is True
+
+    # Snapshot the ±inf sentinel state for all three activation quantizers.
+    for name in ("quant_x", "quant_h_in", "quant_h_out"):
+        q = getattr(layer.cell, name)
+        assert torch.isposinf(q.running_min).all()
+        assert torch.isneginf(q.running_max).all()
+        assert q._initialized is False
+
+    # Bypass the wrapper: call the module-level calibration.calibrate
+    # function directly, leaving layer.use_triton=True. This is the
+    # anti-pattern Success Criterion #4 audits.
+    from gru_qat.calibration import calibrate as _calibrate
+    _calibrate(
+        layer,
+        _realistic_loader(n=4, T=8, B=4, in_size=16, hid=32, device=device, seed=0),
+        n_batches=4,
+    )
+
+    # calibrate flipped every activation quantizer's mode to "min_max"
+    # (calibration.py:86) and reset their running stats (lines 87-89).
+    # use_triton was NOT disabled by the bypass — confirm it's still on.
+    assert layer.use_triton is True
+
+    # quant_x IS invoked by the fast dispatch's pre-projection step
+    # (gru_layer.py:213: xq = self.cell.quant_x(x)). So even on the
+    # bypass path, quant_x's observer DOES update — running stats become
+    # finite.
+    q_x = layer.cell.quant_x
+    assert q_x.config.mode == "min_max"
+    assert torch.isfinite(q_x.running_min).all(), (
+        "quant_x.running_min stayed at +inf — but the fast dispatch's "
+        "pre-projection at gru_layer.py:213 should have called "
+        "quant_x.forward(). Either the fast dispatch is no longer "
+        "running or quant_x.forward is not updating observers."
+    )
+    assert torch.isfinite(q_x.running_max).all()
+    assert q_x._initialized is True
+
+    # BUT quant_h_in / quant_h_out are NEVER called by the fast dispatch
+    # — the Triton kernel reads their scales via _extract_h_quant_params
+    # (gru_layer.py:28-46) and applies in-kernel fake-quant. So bypassing
+    # the wrapper leaves these at the ±inf sentinel that calibrate's
+    # reset block set.
+    for name in ("quant_h_in", "quant_h_out"):
+        q = getattr(layer.cell, name)
+        assert q.config.mode == "min_max", (
+            f"{name}: calibrate did set mode to min_max"
+        )
+        assert torch.isposinf(q.running_min).all(), (
+            f"{name}: running_min={q.running_min} — bypass anti-pattern "
+            "stopped manifesting. The fast dispatch now invokes activation "
+            "quantizer modules; the wrapper at gru_layer.py:283-288 is no "
+            "longer the only correct calibration entry point. Update this "
+            "test or the wrapper docstring."
+        )
+        assert torch.isneginf(q.running_max).all(), (
+            f"{name}: running_max={q.running_max} — see running_min message"
+        )
+        assert q._initialized is False, (
+            f"{name}: _initialized became True via the bypass path"
+        )
