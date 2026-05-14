@@ -300,3 +300,392 @@ def test_diagonal_bwd_strict_matches_reference_slow(T: int, B: int, H: int) -> N
 # realistic-tier file's Stage A test; the strict tier does not duplicate
 # (D-20). Reference: tests/test_triton_diagonal.py:75-100.
 _ = extract_diagonal_factors  # explicit no-op anchor for the import.
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Quant-on bit-identity (frozen INT8 per-channel weight +
+#                                  per-tensor activation)
+# Tolerance: per D-42 disposition (resolved at Plan 04-01 checkpoint)
+# ---------------------------------------------------------------------------
+#
+# Disposition (resolved 2026-05-14, Plan 04-01 checkpoint:human-verify; see
+# .planning/phases/04-quant-on-bit-identity/04-DISPOSITION.md): ASYMMETRIC.
+#
+#   - Forward (``out`` / ``h_T``):  ``torch.equal`` (Result A — bit-identical;
+#     INT8 post-quant rounding collapses both Triton-TF32 and PyTorch-fp32
+#     matmul outputs to the same INT8 grid).
+#   - Backward (``dgi`` / ``dh0`` / ``dWh_diag`` / ``dbh``): ``abs_diff <
+#     h_scale`` (Result B — one INT8 step; fp32 reduction-order drift via
+#     ``tl.dot`` vs PyTorch matmul accumulates over batch + time but stays
+#     well within one INT8 step; STE backward through ``fake_quant_ste``
+#     does not re-quantize gradients).
+#
+# The ``_assert_quant_parity`` helper below is byte-for-byte identical to
+# the helper introduced in Plan 04-02 (`tests/test_triton_scan_strict.py`)
+# and Plan 04-04 (`tests/test_triton_butterfly_strict.py`) per D-43 (the
+# verifier asserts cross-file uniformity in Plan 04-05).
+
+
+def _assert_quant_parity(
+    name: str,
+    ref: torch.Tensor,
+    tri: torch.Tensor,
+    h_scale: float,
+    *,
+    strict: bool,
+) -> None:
+    """Assert quant-on parity per the Phase 4 D-42 disposition.
+
+    strict=True (forward / h_T):    torch.equal contract.
+    strict=False (backward grads):  abs_diff < h_scale (one INT8 step).
+    """
+    if strict:
+        assert torch.equal(ref, tri), (
+            f"quant-on bit-identity failed for {name}: "
+            f"max_abs_diff={(ref - tri).abs().max().item():.4e} "
+            f"(expected 0.0)"
+        )
+    else:
+        max_diff = (ref - tri).abs().max().item()
+        assert max_diff < h_scale, (
+            f"quant-on tight-INT8-step bound failed for {name}: "
+            f"max_abs_diff={max_diff:.4e}, h_scale={h_scale:.4e}, "
+            f"ratio={max_diff/h_scale:.2%}"
+        )
+
+
+def _make_diagonal_layer_quant_int8(
+    in_size: int, hid: int, h_scale: float = 0.02
+) -> GRULayer:
+    """Frozen INT8 per-channel weight + per-tensor activation + per-tensor
+    hidden, diagonal hidden GEMM.
+
+    Recipe per CONTEXT D-41 (full INT8 audit recipe — NOT the looser
+    fp32-weight + frozen-INT8-hidden shortcut from
+    ``tests/test_triton_diagonal.py:124-156``):
+
+    - weight:    ``bits=8, axis=0, mode='min_max', symmetric=True`` —
+      per-channel scale per row of W; ``axis=0`` is the ``hidden_size`` axis.
+    - input_act: ``bits=8, axis=None, mode='min_max', symmetric=True`` — per-tensor.
+    - hidden:    ``bits=8, axis=None, mode='frozen', symmetric=True`` — per-tensor;
+      scale is set manually to ``h_scale``.
+
+    Hidden side uses ``StructureConfig(kind='diagonal')`` — the H×H hidden
+    GEMM collapses to elementwise multiply by a [3, H] tensor (one diagonal
+    per gate).
+
+    Freeze procedure (inline; Phase 5 owns full ``calibrate → freeze_all``
+    plumbing via ``src/gru_qat/calibration.py`` — this helper mirrors the
+    same end state via ``min_max`` + ``cell.freeze_quantizers()``):
+
+    1. Manually freeze the hidden quantizers at ``h_scale`` BEFORE the
+       calibration pass — ``mode='frozen'`` short-circuits
+       ``_update_observer`` (``src/gru_qat/quantizers.py:88-95``), so the
+       pass does not touch them.
+    2. Run one forward over realistic-scale random data
+       (``torch.randn * 0.5``). This populates ``running_min`` /
+       ``running_max`` on the input_act quantizer AND on every weight
+       quantizer.
+    3. Call ``layer.cell.freeze_quantizers()`` — switches every
+       observer-mode quantizer to frozen mode by copying running stats
+       into ``scale`` / ``zp``.
+
+    NOTE: requires the QNT-04 fix landing first (per-channel ``min_max``
+    observer must produce per-channel ``running_stats`` for the weight
+    quantizers to freeze with per-channel scales). Pre-fix, weight
+    quantizers would freeze with a single scalar scale that broadcasts
+    across all channels — losing the per-channel granularity D-41 requires.
+    """
+    from gru_qat.quantizers import FakeQuantizePerTensor
+    bits = 8
+    rec = QuantRecipe(
+        weight=QuantizerConfig(
+            bits=bits, axis=0, mode="min_max", symmetric=True, name="W_int8_pc"
+        ),
+        input_act=QuantizerConfig(
+            bits=bits, axis=None, mode="min_max", symmetric=True, name="x_int8_pt"
+        ),
+        hidden=QuantizerConfig(
+            bits=bits, axis=None, mode="frozen", symmetric=True, name="h_int8_pt"
+        ),
+    )
+    cfg = StructureConfig(kind="diagonal")
+    layer = GRULayer(
+        in_size, hid, recipe=rec, gate_layout="fused",
+        structure_input=None, structure_hidden=cfg,
+    )
+    for q in (layer.cell.quant_h_in, layer.cell.quant_h_out):
+        assert isinstance(q, FakeQuantizePerTensor)
+        q.scale = torch.tensor(h_scale)
+        q.zero_point = torch.tensor(0.0)
+    layer.eval()
+    with torch.no_grad():
+        cal_x = torch.randn(8, 4, in_size) * 0.5
+        cal_h0 = torch.randn(4, hid) * 0.5
+        layer(cal_x, cal_h0)
+    layer.cell.freeze_quantizers()
+    return layer
+
+
+def _adversarial_inputs(
+    cls: str,
+    T: int,
+    B: int,
+    H: int,
+    device: torch.device,
+    h_scale: float = 0.02,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``(x, h0)`` inputs per D-46 adversarial class.
+
+    Three classes per kernel direction:
+
+    - ``"realistic"``: ``torch.randn(...) * 0.5`` — baseline, scaled to fit
+      INT8 dynamic range. Mirrors ``tests/test_triton_diagonal.py:147``
+      scaling.
+    - ``"near-saturation"``: values at the INT8 boundary. ``h_scale * qmax``
+      is the maximum representable value before clipping; use
+      ``torch.linspace(-0.99, 0.99, ...) * (h_scale * 127)`` to land just
+      inside.
+    - ``"large-magnitude"``: ``torch.randn(...) * 5`` — forces in-kernel
+      clipping; tests that reference and Triton clip identically. Less
+      extreme than ``tests/test_parity.py:100-101``'s ``* 100`` (kernel
+      reasonable-range, not stress).
+    """
+    qmax = 127  # int8 symmetric
+    x_max = h_scale * qmax  # value at the saturation boundary
+    if cls == "realistic":
+        x = torch.randn(T, B, H, device=device) * 0.5
+        h0 = torch.randn(B, H, device=device) * 0.5
+    elif cls == "near-saturation":
+        x = (
+            torch.linspace(-0.99, 0.99, T * B * H, device=device).reshape(T, B, H)
+            * x_max
+        ).contiguous()
+        h0 = (
+            torch.linspace(-0.99, 0.99, B * H, device=device).reshape(B, H) * x_max
+        ).contiguous()
+    elif cls == "large-magnitude":
+        x = torch.randn(T, B, H, device=device) * 5.0
+        h0 = torch.randn(B, H, device=device) * 5.0
+    else:
+        raise ValueError(f"unknown adversarial class: {cls}")
+    return x, h0
+
+
+# Phase 4 D-49: smaller grid than Phase 2 (bit-identity is binary, not a
+# distribution sweep). T x B x H grid; T in {8, 64} (fast), T in {512} slow.
+# NO H ∈ {1, 2, 8} — those are Phase 6 edge-case territory per D-49 (Phase 2's
+# FAST_DIAG_GRID / SLOW_DIAG_GRID at lines 116-127 include them for the fp32
+# diagonal-elementwise probe; Phase 4 deliberately excludes them).
+QUANT_FAST_GRID = [
+    (T, B, H)
+    for T in (8, 64)
+    for B in (1, 4, 32)
+    for H in (32, 128, 512)
+]  # 18 cases per D-49
+
+QUANT_SLOW_GRID = [
+    (T, B, H)
+    for T in (512,)
+    for B in (1, 4, 32)
+    for H in (32, 128, 512)
+]  # 9 cases per D-49
+
+
+def _build_qgi_from_layer(
+    layer: GRULayer, x: torch.Tensor
+) -> torch.Tensor:
+    """Apply ``layer.cell.quant_x(x)`` BEFORE ``F.linear`` (D-41 recipe).
+
+    With D-41's recipe, ``input_act`` is now frozen-INT8 per-tensor. Apply
+    the input-side fake-quant before the linear projection so the Triton
+    path sees the same ``gi`` as the reference (which quantizes inside
+    ``cell.step()`` per ``src/gru_qat/gru_cell.py:311``). The reference and
+    Triton sides both consume this same ``gi``, so the assertion isolates
+    the recurrence kernel.
+    """
+    import torch.nn.functional as F
+    cell = layer.cell
+    Wi_cat, bi_cat = cell.quantize_input_weights()
+    xq = cell.quant_x(x)
+    return F.linear(xq, Wi_cat, bi_cat)
+
+
+# --------------------------------------------------------------------------- #
+# Forward parity (Phase 4 — strict=True per D-42; torch.equal).              #
+# --------------------------------------------------------------------------- #
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_FAST_GRID)
+@pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
+def test_diagonal_quant_fwd(cls: str, T: int, B: int, H: int) -> None:
+    """Frozen-INT8 diagonal forward must match the PyTorch reference per
+    D-42 disposition: ``torch.equal`` on ``out`` AND on ``h_T = out[-1]``.
+
+    Mirrors ``tests/test_triton_diagonal.py:124-156`` (realistic-tier QAT
+    forward analog) shape, with two extensions per D-41:
+
+    1. The helper builds a fully frozen INT8 per-channel weight +
+       per-tensor activation layer (not the bits=32 Identity-weight
+       shortcut from the realistic-tier analog).
+    2. The test body applies ``layer.cell.quant_x(x)`` BEFORE ``F.linear``
+       so the input projection's ``gi`` matches what the reference
+       ``cell.step()`` computes internally.
+
+    Direct kernel call (NOT autograd) — same pattern as the Phase 2
+    strict-tier diagonal fwd at lines 137-159.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H
+    layer = _make_diagonal_layer_quant_int8(IN, H).to(device).eval()
+
+    x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+    with torch.no_grad():
+        Wh_diag, bh_cat = extract_diagonal_factors(layer.cell)
+        gi = _build_qgi_from_layer(layer, x)
+        h_scale = float(layer.cell.quant_h_in.scale.item())
+        h_in_q = (h_scale, -127, 127)
+        h_out_q = (h_scale, -127, 127)
+        ref = gru_scan_diagonal_forward_pytorch(
+            gi, h0, Wh_diag, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        tri = gru_scan_diagonal_forward_triton(
+            gi, h0, Wh_diag, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+
+    # Forward parity per D-42 Result A: strict=True (torch.equal).
+    # Per-tensor failure messages include cls + shape for triage.
+    name_suffix = f"[{cls}-T={T}-B={B}-H={H}]"
+    _assert_quant_parity(f"out{name_suffix}", ref, tri, h_scale, strict=True)
+    _assert_quant_parity(f"h_T{name_suffix}", ref[-1], tri[-1], h_scale, strict=True)
+
+
+@pytest.mark.slow
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_SLOW_GRID)
+@pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
+def test_diagonal_quant_fwd_slow(cls: str, T: int, B: int, H: int) -> None:
+    """Slow sibling of ``test_diagonal_quant_fwd``; gated behind
+    ``@pytest.mark.slow`` per D-49 (T=512)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H
+    layer = _make_diagonal_layer_quant_int8(IN, H).to(device).eval()
+
+    x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+    with torch.no_grad():
+        Wh_diag, bh_cat = extract_diagonal_factors(layer.cell)
+        gi = _build_qgi_from_layer(layer, x)
+        h_scale = float(layer.cell.quant_h_in.scale.item())
+        h_in_q = (h_scale, -127, 127)
+        h_out_q = (h_scale, -127, 127)
+        ref = gru_scan_diagonal_forward_pytorch(
+            gi, h0, Wh_diag, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        tri = gru_scan_diagonal_forward_triton(
+            gi, h0, Wh_diag, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+
+    name_suffix = f"[{cls}-T={T}-B={B}-H={H}]"
+    _assert_quant_parity(f"out{name_suffix}", ref, tri, h_scale, strict=True)
+    _assert_quant_parity(f"h_T{name_suffix}", ref[-1], tri[-1], h_scale, strict=True)
+
+
+# --------------------------------------------------------------------------- #
+# Backward parity (Phase 4 — strict=False per D-42; abs_diff < h_scale).     #
+# --------------------------------------------------------------------------- #
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_FAST_GRID)
+@pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
+def test_diagonal_quant_bwd(cls: str, T: int, B: int, H: int) -> None:
+    """Frozen-INT8 diagonal backward must match the PyTorch reference per
+    D-42 disposition: ``abs_diff < h_scale`` (one INT8 step) on each of
+    ``(dgi, dh0, dWh_diag, dbh)`` independently.
+
+    Direct kernel call (NOT autograd) — same pattern as Phase 2 strict-tier
+    diagonal bwd at lines 200-239, plus D-41 input-quant before ``F.linear``.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H
+    layer = _make_diagonal_layer_quant_int8(IN, H).to(device).eval()
+
+    x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+    with torch.no_grad():
+        Wh_diag, bh_cat = extract_diagonal_factors(layer.cell)
+        gi = _build_qgi_from_layer(layer, x)
+        h_scale = float(layer.cell.quant_h_in.scale.item())
+        h_in_q = (h_scale, -127, 127)
+        h_out_q = (h_scale, -127, 127)
+        out_fwd = gru_scan_diagonal_forward_triton(
+            gi, h0, Wh_diag, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        dout = (torch.randn(T, B, H, device=device) * 0.5).contiguous()
+
+        dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_diagonal_backward_triton(
+            gi, h0, Wh_diag, bh_cat, out_fwd, dout,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_diagonal_backward_pytorch(
+            gi, h0, Wh_diag, bh_cat, out_fwd, dout,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+
+    # Backward parity per D-42 Result B: strict=False (abs_diff < h_scale).
+    # Per-grad explicit calls so a single-grad failure surfaces with its
+    # tensor name + cls + shape.
+    name_suffix = f"[{cls}-T={T}-B={B}-H={H}]"
+    _assert_quant_parity(f"dgi{name_suffix}", dgi_p, dgi_t, h_scale, strict=False)
+    _assert_quant_parity(f"dh0{name_suffix}", dh0_p, dh0_t, h_scale, strict=False)
+    _assert_quant_parity(f"dWh_diag{name_suffix}", dWh_p, dWh_t, h_scale, strict=False)
+    _assert_quant_parity(f"dbh{name_suffix}", dbh_p, dbh_t, h_scale, strict=False)
+
+
+@pytest.mark.slow
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_SLOW_GRID)
+@pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
+def test_diagonal_quant_bwd_slow(cls: str, T: int, B: int, H: int) -> None:
+    """Slow sibling of ``test_diagonal_quant_bwd``; gated behind
+    ``@pytest.mark.slow`` per D-49 (T=512)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H
+    layer = _make_diagonal_layer_quant_int8(IN, H).to(device).eval()
+
+    x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+    with torch.no_grad():
+        Wh_diag, bh_cat = extract_diagonal_factors(layer.cell)
+        gi = _build_qgi_from_layer(layer, x)
+        h_scale = float(layer.cell.quant_h_in.scale.item())
+        h_in_q = (h_scale, -127, 127)
+        h_out_q = (h_scale, -127, 127)
+        out_fwd = gru_scan_diagonal_forward_triton(
+            gi, h0, Wh_diag, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        dout = (torch.randn(T, B, H, device=device) * 0.5).contiguous()
+
+        dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_diagonal_backward_triton(
+            gi, h0, Wh_diag, bh_cat, out_fwd, dout,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_diagonal_backward_pytorch(
+            gi, h0, Wh_diag, bh_cat, out_fwd, dout,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+
+    name_suffix = f"[{cls}-T={T}-B={B}-H={H}]"
+    _assert_quant_parity(f"dgi{name_suffix}", dgi_p, dgi_t, h_scale, strict=False)
+    _assert_quant_parity(f"dh0{name_suffix}", dh0_p, dh0_t, h_scale, strict=False)
+    _assert_quant_parity(f"dWh_diag{name_suffix}", dWh_p, dWh_t, h_scale, strict=False)
+    _assert_quant_parity(f"dbh{name_suffix}", dbh_p, dbh_t, h_scale, strict=False)
