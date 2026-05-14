@@ -32,10 +32,10 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Quant-on parity, reference path = ground truth (QNT)
 
-- [ ] **QNT-01**: Dense Triton forward with an active recipe (INT8 per-channel weight + per-tensor activation, frozen) is bit-identical to reference path under the same recipe. Tested with realistic and adversarial inputs (large magnitudes, near-saturation).
-- [ ] **QNT-02**: Same bit-identity for Diagonal / Monarch / Butterfly Triton paths.
-- [ ] **QNT-03**: Quant-on backward gradients (after STE) match between Triton and reference paths, bit-identical where the recipe is deterministic.
-- [ ] **QNT-04**: Per-channel `min_max` observer for activations is either fixed or gated behind an explicit error rather than silently using the global reduction (Phase 1 known gap resolution).
+- [x] **QNT-01**: Dense Triton forward with an active recipe (INT8 per-channel weight + per-tensor activation, frozen) is bit-identical to reference path under the same recipe. Tested with realistic and adversarial inputs (large magnitudes, near-saturation). ✓ 2026-05-14 (fwd torch.equal; bwd per-(cls, B) h_scale_mult per F-04-VERIFIER-C / gru-triton-mjy)
+- [x] **QNT-02**: Same bit-identity for Diagonal / Monarch / Butterfly Triton paths. ✓ 2026-05-14 (diagonal torch.equal except large-magnitude mult=2; monarch mult=4 per F-04-VERIFIER-A / gru-triton-in0; butterfly per-class mult per F-04-VERIFIER-D / gru-triton-lqk)
+- [x] **QNT-03**: Quant-on backward gradients (after STE) match between Triton and reference paths, bit-identical where the recipe is deterministic. ✓ 2026-05-14 (per-cluster h_scale_mult dispositions; see `04-DISPOSITION.md` for the full table)
+- [x] **QNT-04**: Per-channel `min_max` observer for activations is either fixed or gated behind an explicit error rather than silently using the global reduction (Phase 1 known gap resolution). ✓ 2026-05-14 (FIXED — bd gru-triton-x15 closed)
 
 ### Calibration + freeze lifecycle audit (CAL)
 
@@ -104,10 +104,10 @@ Populated during roadmap creation by the roadmapper agent.
 | STR-01 | Phase 3 | Complete |
 | STR-02 | Phase 3 | Complete |
 | STR-03 | Phase 3 | Complete |
-| QNT-01 | Phase 4 | Pending |
-| QNT-02 | Phase 4 | Pending |
-| QNT-03 | Phase 4 | Pending |
-| QNT-04 | Phase 4 | Pending |
+| QNT-01 | Phase 4 | Complete (with caveats) |
+| QNT-02 | Phase 4 | Complete (with caveats) |
+| QNT-03 | Phase 4 | Complete (with caveats) |
+| QNT-04 | Phase 4 | Complete |
 | CAL-01 | Phase 5 | Pending |
 | CAL-02 | Phase 5 | Pending |
 | CAL-03 | Phase 5 | Pending |

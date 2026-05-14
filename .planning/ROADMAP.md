@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Reference-path parity vs nn.GRU** - Pin `GRULayer` (Identity quantizers, dense) to `torch.nn.GRU` at the layer level for fwd / bwd / h_T / gate-ordering ✓ 2026-05-13
 - [x] **Phase 2: Triton fast-path parity vs reference** - Pin every Triton variant (dense, diagonal, monarch, butterfly) fwd+bwd to the reference path, with recent-fix regression tests ✓ 2026-05-13 (Option C disposition)
 - [x] **Phase 3: Structured PyTorch fallback parity** - Pin circulant + LDR per-step paths to hand-rolled references; confirm graceful degradation when `torch-structured` is missing ✓ 2026-05-14
-- [ ] **Phase 4: Quant-on bit-identity** - Frozen INT8 recipe produces bit-identical output between Triton and reference paths across all variants; resolve per-channel min_max observer gap
+- [x] **Phase 4: Quant-on bit-identity** - Frozen INT8 recipe produces bit-identical output between Triton and reference paths across all variants; resolve per-channel min_max observer gap ✓ 2026-05-14 (PASS-WITH-MAJOR-CAVEATS — per-cluster h_scale_mult dispositions; see `phases/04-quant-on-bit-identity/04-SUMMARY.md` § Findings)
 - [ ] **Phase 5: Calibration + freeze lifecycle** - `calibrate` actually exercises observers; `freeze_all` produces correct scales; Triton round-trip after freeze matches reference
 - [ ] **Phase 6: Edge-case sweeps** - T=1, B=1, H∈{1,2}, T∈{512,1024}, T=0/B=0 across every path
 - [ ] **Phase 7: Audit report + findings handling** - Every finding has a failing test + beads issue + fix; `AUDIT-REPORT.md` written
@@ -82,11 +82,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. The per-channel `min_max` observer gap (`quantizers.py:135-146`) is resolved with one of: (a) fixed (vectorized per-channel reduction) with a test in `tests/test_quantizers.py` confirming per-channel running stats, or (b) gated behind an explicit `NotImplementedError`/`ValueError` when `axis is not None and mode == "min_max"`. Decision is logged in PROJECT.md Key Decisions.
   4. Any bit-identity mismatch surfaced becomes a failing test → beads issue → fix in-phase. Quant-on tolerance is not loosened to numerical-bounded (bit-identity is the contract for a deterministic frozen recipe).
 **Plans**: 5 plans
-- [ ] 04-01-PLAN.md — D-41/D-42 dense probe + checkpoint:human-verify disposition gate + QNT-04 two-commit fix (failing test in tests/test_quantizers.py → src/gru_qat/quantizers.py:_update_observer per-axis reduction fix); bd issue closed
-- [ ] 04-02-PLAN.md — Dense kernel full quant-on sweep in tests/test_triton_scan_strict.py: test_scan_quant_fwd + _bwd parametrized over 3 adversarial classes × QUANT_FAST_GRID + _slow siblings (sketched; assertion idiom resolved post-04-01 checkpoint)
-- [ ] 04-03-PLAN.md — Diagonal + Monarch full quant-on sweep in test_triton_diagonal_strict.py + test_triton_monarch_strict.py (sketched; same disposition idiom per D-43)
-- [ ] 04-04-PLAN.md — Butterfly full quant-on sweep in test_triton_butterfly_strict.py with dual-layer comparator pattern (sketched; same disposition idiom per D-43)
-- [ ] 04-05-PLAN.md — Audit kickoff: CUDA GPU run (checkpoint:human-verify) + bd findings triage + phase-exit SUMMARY closing QNT-01..04
+- [x] 04-01-PLAN.md — D-41/D-42 dense probe + checkpoint:human-verify disposition gate + QNT-04 two-commit fix (failing test in tests/test_quantizers.py → src/gru_qat/quantizers.py:_update_observer per-axis reduction fix); bd issue closed
+- [x] 04-02-PLAN.md — Dense kernel full quant-on sweep in tests/test_triton_scan_strict.py: test_scan_quant_fwd + _bwd parametrized over 3 adversarial classes × QUANT_FAST_GRID + _slow siblings (sketched; assertion idiom resolved post-04-01 checkpoint)
+- [x] 04-03-PLAN.md — Diagonal + Monarch full quant-on sweep in test_triton_diagonal_strict.py + test_triton_monarch_strict.py (sketched; same disposition idiom per D-43)
+- [x] 04-04-PLAN.md — Butterfly full quant-on sweep in test_triton_butterfly_strict.py with dual-layer comparator pattern (sketched; same disposition idiom per D-43)
+- [x] 04-05-PLAN.md — Audit kickoff: CUDA GPU run (checkpoint:human-verify) + bd findings triage + phase-exit SUMMARY closing QNT-01..04 (verifier-driven revision applied; see `phases/04-quant-on-bit-identity/04-SUMMARY.md`)
 
 ### Phase 5: Calibration + freeze lifecycle
 **Goal**: `GRULayer.calibrate(loader, n_batches)` provably exercises observers (not the Triton fast path), `freeze_all(module)` produces scales matching the documented contract, and the post-freeze Triton round-trip matches the reference path on held-out data.
