@@ -98,7 +98,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. `tests/test_calibration.py` gains a CUDA-only `test_triton_matches_reference_after_freeze`: build a layer, calibrate, freeze, then on a held-out batch assert `use_triton=True` output is bit-identical to `use_triton=False` (this is the QNT round-trip with a calibrated recipe rather than a hand-built one).
   4. The "calibrate without disabling use_triton" anti-pattern (`gru_layer.py:289-299` warning) is preserved or strengthened — observer stats stay at ±inf if a user bypasses the wrapper. Tested.
   5. Any mismatch surfaced becomes a failing test → beads issue → fix in-phase.
-**Plans**: TBD
+**Plans**: 1 plan
+- [ ] 05-01-PLAN.md — Single sequential plan covering CAL-01 + CAL-02 + CAL-03 (4 kernels × 3 classes × 1 shape) + anti-pattern test + timestamped pytest-output artifact (Decision E: no Wave 2 parallelism)
 
 ### Phase 6: Edge-case sweeps
 **Goal**: Every path (reference, dense Triton, diagonal Triton, monarch Triton, butterfly Triton, circulant per-step, LDR per-step) survives T=1, B=1, H∈{1, 2}, T∈{512, 1024}, and T=0/B=0 with either correct output or a clear tested error.
@@ -134,6 +135,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 2. Triton fast-path parity vs reference | 6/6 | Complete ✓ (Option C) | 2026-05-13 |
 | 3. Structured PyTorch fallback parity | 3/3 | Complete ✓ | 2026-05-14 |
 | 4. Quant-on bit-identity | 0/5 | Planned | - |
-| 5. Calibration + freeze lifecycle | 0/TBD | Not started | - |
+| 5. Calibration + freeze lifecycle | 0/1 | Planned | - |
 | 6. Edge-case sweeps | 0/TBD | Not started | - |
 | 7. Audit report + findings handling | 0/TBD | Not started | - |
