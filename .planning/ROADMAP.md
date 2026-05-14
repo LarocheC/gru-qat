@@ -81,7 +81,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Quant-on backward gradients are bit-identical between Triton and reference paths under the same frozen recipe across all variants (dense, diagonal, monarch, butterfly).
   3. The per-channel `min_max` observer gap (`quantizers.py:135-146`) is resolved with one of: (a) fixed (vectorized per-channel reduction) with a test in `tests/test_quantizers.py` confirming per-channel running stats, or (b) gated behind an explicit `NotImplementedError`/`ValueError` when `axis is not None and mode == "min_max"`. Decision is logged in PROJECT.md Key Decisions.
   4. Any bit-identity mismatch surfaced becomes a failing test → beads issue → fix in-phase. Quant-on tolerance is not loosened to numerical-bounded (bit-identity is the contract for a deterministic frozen recipe).
-**Plans**: TBD
+**Plans**: 5 plans
+- [ ] 04-01-PLAN.md — D-41/D-42 dense probe + checkpoint:human-verify disposition gate + QNT-04 two-commit fix (failing test in tests/test_quantizers.py → src/gru_qat/quantizers.py:_update_observer per-axis reduction fix); bd issue closed
+- [ ] 04-02-PLAN.md — Dense kernel full quant-on sweep in tests/test_triton_scan_strict.py: test_scan_quant_fwd + _bwd parametrized over 3 adversarial classes × QUANT_FAST_GRID + _slow siblings (sketched; assertion idiom resolved post-04-01 checkpoint)
+- [ ] 04-03-PLAN.md — Diagonal + Monarch full quant-on sweep in test_triton_diagonal_strict.py + test_triton_monarch_strict.py (sketched; same disposition idiom per D-43)
+- [ ] 04-04-PLAN.md — Butterfly full quant-on sweep in test_triton_butterfly_strict.py with dual-layer comparator pattern (sketched; same disposition idiom per D-43)
+- [ ] 04-05-PLAN.md — Audit kickoff: CUDA GPU run (checkpoint:human-verify) + bd findings triage + phase-exit SUMMARY closing QNT-01..04
 
 ### Phase 5: Calibration + freeze lifecycle
 **Goal**: `GRULayer.calibrate(loader, n_batches)` provably exercises observers (not the Triton fast path), `freeze_all(module)` produces scales matching the documented contract, and the post-freeze Triton round-trip matches the reference path on held-out data.
@@ -128,7 +133,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 1. Reference-path parity vs nn.GRU | 5/5 | Complete ✓ | 2026-05-13 |
 | 2. Triton fast-path parity vs reference | 6/6 | Complete ✓ (Option C) | 2026-05-13 |
 | 3. Structured PyTorch fallback parity | 3/3 | Complete ✓ | 2026-05-14 |
-| 4. Quant-on bit-identity | 0/TBD | Not started | - |
+| 4. Quant-on bit-identity | 0/5 | Planned | - |
 | 5. Calibration + freeze lifecycle | 0/TBD | Not started | - |
 | 6. Edge-case sweeps | 0/TBD | Not started | - |
 | 7. Audit report + findings handling | 0/TBD | Not started | - |
