@@ -39,9 +39,9 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Calibration + freeze lifecycle audit (CAL)
 
-- [ ] **CAL-01**: `GRULayer.calibrate(loader, n_batches)` actually exercises the per-step path (not Triton) so observers update. Verified by inspecting observer state before/after.
-- [ ] **CAL-02**: `freeze_all(module)` produces scales identical to what `dynamic` mode would compute on the calibration data's final batch, within the documented contract.
-- [ ] **CAL-03**: After `freeze_all`, switching `use_triton=True` produces the same output as `use_triton=False` on a held-out batch (Triton/reference round-trip with the calibrated recipe).
+- [x] **CAL-01**: `GRULayer.calibrate(loader, n_batches)` actually exercises the per-step path (not Triton) so observers update. Verified by inspecting observer state before/after. ✓ 2026-05-14 (`test_calibrate_uses_per_step_path` at `tests/test_calibration.py:231`)
+- [x] **CAL-02**: `freeze_all(module)` produces scales identical to what `dynamic` mode would compute on the calibration data's final batch, within the documented contract. ✓ 2026-05-14 (`test_freeze_all_matches_dynamic_on_last_batch` at `tests/test_calibration.py:350`; scoped to `quant_x` per bd:gru-triton-n20 cross-phase deferral)
+- [x] **CAL-03**: After `freeze_all`, switching `use_triton=True` produces the same output as `use_triton=False` on a held-out batch (Triton/reference round-trip with the calibrated recipe). ✓ 2026-05-14 (`test_triton_matches_reference_after_freeze` — 4 kernels × 3 D-46 classes = 12 cases; per-cluster `h_scale_mult` bounds inherited from `04-DISPOSITION.md`)
 
 ### Edge-case coverage (EDG)
 
@@ -108,9 +108,9 @@ Populated during roadmap creation by the roadmapper agent.
 | QNT-02 | Phase 4 | Complete (with caveats) |
 | QNT-03 | Phase 4 | Complete (with caveats) |
 | QNT-04 | Phase 4 | Complete |
-| CAL-01 | Phase 5 | Pending |
-| CAL-02 | Phase 5 | Pending |
-| CAL-03 | Phase 5 | Pending |
+| CAL-01 | Phase 5 | Complete |
+| CAL-02 | Phase 5 | Complete |
+| CAL-03 | Phase 5 | Complete |
 | EDG-01 | Phase 6 | Pending |
 | EDG-02 | Phase 6 | Pending |
 | EDG-03 | Phase 6 | Pending |

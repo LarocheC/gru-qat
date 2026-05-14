@@ -99,7 +99,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. The "calibrate without disabling use_triton" anti-pattern (`gru_layer.py:289-299` warning) is preserved or strengthened — observer stats stay at ±inf if a user bypasses the wrapper. Tested.
   5. Any mismatch surfaced becomes a failing test → beads issue → fix in-phase.
 **Plans**: 1 plan
-- [ ] 05-01-PLAN.md — Single sequential plan covering CAL-01 + CAL-02 + CAL-03 (4 kernels × 3 classes × 1 shape) + anti-pattern test + timestamped pytest-output artifact (Decision E: no Wave 2 parallelism)
+- [x] 05-01-PLAN.md — Single sequential plan covering CAL-01 + CAL-02 + CAL-03 (4 kernels × 3 classes × 1 shape) + anti-pattern test + timestamped pytest-output artifact (Decision E: no Wave 2 parallelism)
 
 ### Phase 6: Edge-case sweeps
 **Goal**: Every path (reference, dense Triton, diagonal Triton, monarch Triton, butterfly Triton, circulant per-step, LDR per-step) survives T=1, B=1, H∈{1, 2}, T∈{512, 1024}, and T=0/B=0 with either correct output or a clear tested error.
