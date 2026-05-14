@@ -1,0 +1,41 @@
+=== Phase 5 pytest output ===
+Captured: 2026-05-14T19:50:32Z
+Host: GN-PW083HG9
+CUDA device: NVIDIA RTX 2000 Ada Generation Laptop GPU
+Torch: 2.11.0+cu130
+Triton: 3.6.0
+Commit: 5bd47d594a644d7663f6340eac93ebae2be3c823
+Branch: worktree-agent-a382c0ddcf2e4de83
+---
+============================= test session starts ==============================
+platform linux -- Python 3.13.12, pytest-9.0.3, pluggy-1.5.0 -- /home/claroche/miniconda3/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/claroche/gru-triton/.claude/worktrees/agent-a382c0ddcf2e4de83
+configfile: pyproject.toml
+plugins: xdist-3.8.0, anyio-4.10.0
+collecting ... collected 20 items
+
+tests/test_calibration.py::test_calibrate_populates_running_stats PASSED [  5%]
+tests/test_calibration.py::test_calibrate_then_freeze_locks_scales PASSED [ 10%]
+tests/test_calibration.py::test_calibrate_handles_tuple_loader PASSED    [ 15%]
+tests/test_calibration.py::test_calibrate_only_activations_skips_weight_quantizers PASSED [ 20%]
+tests/test_calibration.py::test_calibrate_truncates_to_n_batches PASSED  [ 25%]
+tests/test_calibration.py::test_calibrate_uses_per_step_path PASSED      [ 30%]
+tests/test_calibration.py::test_freeze_all_matches_dynamic_on_last_batch PASSED [ 35%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[realistic-dense-8-4-64-None] PASSED [ 40%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[realistic-diagonal-8-4-64-None] PASSED [ 45%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[realistic-monarch-8-4-64-4] PASSED [ 50%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[realistic-butterfly-8-4-32-None] PASSED [ 55%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[near-saturation-dense-8-4-64-None] PASSED [ 60%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[near-saturation-diagonal-8-4-64-None] PASSED [ 65%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[near-saturation-monarch-8-4-64-4] PASSED [ 70%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[near-saturation-butterfly-8-4-32-None] PASSED [ 75%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[large-magnitude-dense-8-4-64-None] PASSED [ 80%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[large-magnitude-diagonal-8-4-64-None] PASSED [ 85%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[large-magnitude-monarch-8-4-64-4] PASSED [ 90%]
+tests/test_calibration.py::test_triton_matches_reference_after_freeze[large-magnitude-butterfly-8-4-32-None] PASSED [ 95%]
+tests/test_calibration.py::test_use_triton_bypass_keeps_observers_at_inf PASSED [100%]
+
+============================== 20 passed in 6.77s ==============================
+---
+Exit code: 0
