@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 4 closed (PASS-WITH-MAJOR-CAVEATS); Phase 5 ready to start
-last_updated: "2026-05-14T19:30:00.000Z"
-last_activity: 2026-05-14 -- Phase 4 closed via Path A mass-disposition; Phase 5 starting
+stopped_at: Phase 5 context gathered
+last_updated: "2026-05-14T17:03:09.039Z"
+last_activity: 2026-05-14 -- Phase 5 CONTEXT.md captured; ready for plan-phase
 progress:
   total_phases: 7
   completed_phases: 4
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-05-13)
 
 ## Current Position
 
-Phase: 5 (calibration + freeze lifecycle) — READY TO START
-Plan: 0 of TBD
-Status: Phase 4 complete (PASS-WITH-MAJOR-CAVEATS); Phase 5 awaiting discuss-phase
-Last activity: 2026-05-14 -- Phase 4 closed via Path A mass-disposition
+Phase: 5 (calibration + freeze lifecycle) — DISCUSS COMPLETE; PLAN PHASE NEXT
+Plan: 0 of TBD (single plan per CONTEXT § E)
+Status: Phase 5 CONTEXT.md captured; ready for /gsd-plan-phase
+Last activity: 2026-05-14 -- Phase 5 discuss-phase completed (5 decisions captured)
 
 Progress: [████████████░░] 84%
 
@@ -66,9 +66,9 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ### Pending Todos
 
-- **Phase 5 kick-off:** run `/gsd-discuss-phase` to gather Phase 5 (CAL-01/02/03) context.
-- **Phase 5 process recommendation (from Phase 4 retrospective):** serialize Wave 2 plans on the calibration file OR use `git worktree`-based isolation (F-04-05-D / `gru-triton-u00`).
-- **Phase 5 reuse target:** the Phase 4 helper layer infrastructure (`_make_{dense,diagonal,monarch,butterfly}_layer_quant_int8`, `_adversarial_inputs`, `_assert_quant_parity`, per-cluster mult helpers, `_skip_if_monarch_bwd_hw_limit`).
+- **Phase 5 plan-phase:** run `/gsd-plan-phase 5` to produce the single-plan implementation breakdown (5 tests: CAL-01 + CAL-02 + parametrized CAL-03 over 4 kernels + anti-pattern test). CONTEXT.md at `.planning/phases/05-calibration-freeze-lifecycle/05-CONTEXT.md` is consumed by the researcher + planner.
+- **Phase 5 architectural decision (captured in CONTEXT § E):** single plan covers all 4 kernels — no Wave 2 parallelism on `tests/test_calibration.py` (sidesteps F-04-05-D race).
+- **Phase 5 reuse target:** Phase 4 helper layer infrastructure imported into `tests/test_calibration.py` via cross-file imports from the 4 strict files.
 - **Phase 5 tolerance contract:** consumes Phase 4's per-cluster post-freeze tolerance table; CAL-03 round-trip asserts at those bounds.
 
 ### Blockers/Concerns
@@ -94,6 +94,6 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-05-14T19:30:00.000Z (Phase 4 closed via Path A mass-disposition)
-Stopped at: Phase 5 ready to start. Phase 4 fast-grid quant suite green (584 passed, 73 skipped, 0 failed); D-51 locked files unchanged (216 passed). All Phase 4 commits pushed to origin; bd dolt remote synced.
+Last session: 2026-05-14T17:03:09.019Z
+Stopped at: Phase 5 context gathered
 Resuming: Run `/gsd-discuss-phase` for Phase 5 (CAL-01/02/03 — calibration + freeze lifecycle). Phase 5 inherits Phase 4's per-cluster post-freeze tolerance contract from `phases/04-quant-on-bit-identity/04-DISPOSITION.md`.
