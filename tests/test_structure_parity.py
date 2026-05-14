@@ -29,6 +29,7 @@ import warnings
 
 import pytest
 import torch
+import torch.nn as nn
 
 # Per Phase 3 CONTEXT D-40: pure PyTorch (no tl.dot), so 'highest' is
 # achievable and < 1e-5 abs is the strict bound. Diverges from the Triton
@@ -458,3 +459,212 @@ def test_handrolled_ldr_matches_production_micro() -> None:
         f"check the K_A @ K_B vs K_A @ K_B.T convention in "
         f"_build_ldr_matrix_from_factors against krylov.py:309-317"
     )
+
+
+# ---------------------------------------------------------------------------
+# Parametrized LDR parity tests (Plan 03-02 Task 2):
+#   - Forward: _LDRLinear(LDRSubdiagonal(H, r)) vs x @ M.T with M built by
+#     _build_ldr_matrix_from_factors. Fast (FAST_LDR_GRID, 27 cases) + slow
+#     sibling (SLOW_LDR_GRID, 9 cases).
+#   - Backward: autograd-vs-autograd on 4 leaves (subd_A, subd_B, G, H).
+#     Fast + slow sibling. Per-tensor named-failure loop with 4 entries.
+#
+# All at < 1e-5 abs. Per CONTEXT D-30, backward uses the detach-clone-twice
+# idiom from tests/test_layer_parity.py:516-519 and the shared-g pattern
+# from :524-528. Per plan 03-01 SUMMARY (decisions section), g is scaled by
+# 1/sqrt(B*H) to keep gradient magnitudes O(1) so the absolute bound stays
+# meaningful at large (B, H, rank).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("B,H,rank", FAST_LDR_GRID)
+def test_ldr_matches_handrolled_reference(B: int, H: int, rank: int) -> None:
+    """``_LDRLinear(LDRSubdiagonal(H, r=rank))(x)`` must match the explicit
+    hand-rolled matrix ``x @ M.T`` (with M from
+    ``_build_ldr_matrix_from_factors``) at < 1e-5 abs across FAST_LDR_GRID.
+
+    Hand-rolled M uses the slow Krylov form (krylov.py:264-272 +
+    krylov.py:309-317); production path uses the FFT-based fast form
+    (krylov.py:245-259). The two should agree algebraically — < 1e-5 abs
+    under 'highest' precision.
+    """
+    torch.manual_seed(0)
+    ldr = LDRSubdiagonal(layer_size=H, r=rank, bias=False)
+    layer = _LDRLinear(ldr)
+
+    subd_A = ldr.subd_A.detach().clone()
+    subd_B = ldr.subd_B.detach().clone()
+    G = ldr.G.detach().clone()
+    H_factor = ldr.H.detach().clone()
+
+    x = torch.randn(B, H)
+
+    y_prod = layer(x)
+    M = _build_ldr_matrix_from_factors(subd_A, subd_B, G, H_factor)
+    y_ref = x @ M.T
+
+    max_diff = (y_prod - y_ref).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"ldr fwd max abs diff {max_diff:.4e} (B={B},H={H},rank={rank})"
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("B,H,rank", SLOW_LDR_GRID)
+def test_ldr_matches_handrolled_reference_slow(B: int, H: int, rank: int) -> None:
+    """Slow sibling of ``test_ldr_matches_handrolled_reference`` at H=512.
+    Same body, same bound."""
+    torch.manual_seed(0)
+    ldr = LDRSubdiagonal(layer_size=H, r=rank, bias=False)
+    layer = _LDRLinear(ldr)
+
+    subd_A = ldr.subd_A.detach().clone()
+    subd_B = ldr.subd_B.detach().clone()
+    G = ldr.G.detach().clone()
+    H_factor = ldr.H.detach().clone()
+
+    x = torch.randn(B, H)
+
+    y_prod = layer(x)
+    M = _build_ldr_matrix_from_factors(subd_A, subd_B, G, H_factor)
+    y_ref = x @ M.T
+
+    max_diff = (y_prod - y_ref).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"ldr fwd max abs diff {max_diff:.4e} (B={B},H={H},rank={rank})"
+    )
+
+
+@pytest.mark.parametrize("B,H,rank", FAST_LDR_GRID)
+def test_ldr_backward_matches_autograd_reference(B: int, H: int, rank: int) -> None:
+    """Backward parity: autograd gradients on all four LDR factors (subd_A,
+    subd_B, G, H) must match between the hand-rolled reference path and the
+    production path at < 1e-5 abs.
+
+    Pattern mirrors tests/test_layer_parity.py:480-557 (detach-clone-twice
+    per leaf + shared-g + per-tensor named-failure loop), extended to four
+    leaves. Production-side leaves are installed as the layer's actual
+    Parameters via direct ``nn.Parameter`` assignment so ``backward(g)``
+    populates ``..._prod.grad`` (NOT the layer's pre-existing parameter
+    grads — those would dangle).
+
+    g is scaled by 1/sqrt(B*H) so gradient magnitudes stay O(1); without
+    this the fp32 round-off floor between two algorithmically distinct
+    paths exceeds 1e-5 at large (B, H, rank). See plan 03-01 SUMMARY
+    decision on g-scaling for the empirical justification.
+    """
+    torch.manual_seed(0)
+
+    # Source initial factor values from a one-shot LDRSubdiagonal so the
+    # reference and production paths start bitwise-equal.
+    ldr_init = LDRSubdiagonal(layer_size=H, r=rank, bias=False)
+    subd_A_init = ldr_init.subd_A.detach().clone()
+    subd_B_init = ldr_init.subd_B.detach().clone()
+    G_init = ldr_init.G.detach().clone()
+    H_init = ldr_init.H.detach().clone()
+
+    # 8 leaves: 4 ref + 4 prod, each detach-cloned-then-requires_grad.
+    subd_A_ref = subd_A_init.detach().clone().requires_grad_(True)
+    subd_B_ref = subd_B_init.detach().clone().requires_grad_(True)
+    G_ref = G_init.detach().clone().requires_grad_(True)
+    H_ref = H_init.detach().clone().requires_grad_(True)
+
+    subd_A_prod = subd_A_init.detach().clone().requires_grad_(True)
+    subd_B_prod = subd_B_init.detach().clone().requires_grad_(True)
+    G_prod = G_init.detach().clone().requires_grad_(True)
+    H_prod = H_init.detach().clone().requires_grad_(True)
+
+    x = torch.randn(B, H)
+    # Shared downstream gradient, scaled to keep gradient magnitudes O(1).
+    g = torch.randn(B, H) / (B * H) ** 0.5
+
+    # Reference path: build M as a function of the 4 ref leaves so autograd
+    # flows back to each.
+    M = _build_ldr_matrix_from_factors(subd_A_ref, subd_B_ref, G_ref, H_ref)
+    y_ref = x @ M.T
+    y_ref.backward(g)
+
+    # Production path: install the 4 prod leaves as the layer's
+    # Parameters via direct nn.Parameter assignment. The Parameters'
+    # ``.grad`` then equals each *_prod leaf's .grad (because the leaf IS
+    # the Parameter's underlying tensor — nn.Parameter wraps the existing
+    # tensor without copying, and requires_grad is preserved).
+    ldr_prod = LDRSubdiagonal(layer_size=H, r=rank, bias=False)
+    ldr_prod.subd_A = nn.Parameter(subd_A_prod)
+    ldr_prod.subd_B = nn.Parameter(subd_B_prod)
+    ldr_prod.G = nn.Parameter(G_prod)
+    ldr_prod.H = nn.Parameter(H_prod)
+    layer_prod = _LDRLinear(ldr_prod)
+
+    y_prod = layer_prod(x)
+    y_prod.backward(g)
+
+    # Read gradients from the Parameters (which share storage with the
+    # *_prod leaves, so ldr_prod.subd_A.grad is the same tensor that an
+    # autograd-aware caller would read).
+    for name, ref_t, prod_t in [
+        ("subd_A", subd_A_ref.grad, ldr_prod.subd_A.grad),
+        ("subd_B", subd_B_ref.grad, ldr_prod.subd_B.grad),
+        ("G", G_ref.grad, ldr_prod.G.grad),
+        ("H", H_ref.grad, ldr_prod.H.grad),
+    ]:
+        assert ref_t is not None, f"{name} ref_t is None (B={B},H={H},rank={rank})"
+        assert prod_t is not None, f"{name} prod_t is None (B={B},H={H},rank={rank})"
+        max_diff = (ref_t - prod_t).abs().max().item()
+        assert max_diff < 1e-5, (
+            f"{name} max abs diff {max_diff:.4e} (B={B},H={H},rank={rank})"
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("B,H,rank", SLOW_LDR_GRID)
+def test_ldr_backward_matches_autograd_reference_slow(B: int, H: int, rank: int) -> None:
+    """Slow sibling of ``test_ldr_backward_matches_autograd_reference`` at
+    H=512. Same body, same bound (g scaled by 1/sqrt(B*H))."""
+    torch.manual_seed(0)
+
+    ldr_init = LDRSubdiagonal(layer_size=H, r=rank, bias=False)
+    subd_A_init = ldr_init.subd_A.detach().clone()
+    subd_B_init = ldr_init.subd_B.detach().clone()
+    G_init = ldr_init.G.detach().clone()
+    H_init = ldr_init.H.detach().clone()
+
+    subd_A_ref = subd_A_init.detach().clone().requires_grad_(True)
+    subd_B_ref = subd_B_init.detach().clone().requires_grad_(True)
+    G_ref = G_init.detach().clone().requires_grad_(True)
+    H_ref = H_init.detach().clone().requires_grad_(True)
+
+    subd_A_prod = subd_A_init.detach().clone().requires_grad_(True)
+    subd_B_prod = subd_B_init.detach().clone().requires_grad_(True)
+    G_prod = G_init.detach().clone().requires_grad_(True)
+    H_prod = H_init.detach().clone().requires_grad_(True)
+
+    x = torch.randn(B, H)
+    g = torch.randn(B, H) / (B * H) ** 0.5
+
+    M = _build_ldr_matrix_from_factors(subd_A_ref, subd_B_ref, G_ref, H_ref)
+    y_ref = x @ M.T
+    y_ref.backward(g)
+
+    ldr_prod = LDRSubdiagonal(layer_size=H, r=rank, bias=False)
+    ldr_prod.subd_A = nn.Parameter(subd_A_prod)
+    ldr_prod.subd_B = nn.Parameter(subd_B_prod)
+    ldr_prod.G = nn.Parameter(G_prod)
+    ldr_prod.H = nn.Parameter(H_prod)
+    layer_prod = _LDRLinear(ldr_prod)
+
+    y_prod = layer_prod(x)
+    y_prod.backward(g)
+
+    for name, ref_t, prod_t in [
+        ("subd_A", subd_A_ref.grad, ldr_prod.subd_A.grad),
+        ("subd_B", subd_B_ref.grad, ldr_prod.subd_B.grad),
+        ("G", G_ref.grad, ldr_prod.G.grad),
+        ("H", H_ref.grad, ldr_prod.H.grad),
+    ]:
+        assert ref_t is not None, f"{name} ref_t is None (B={B},H={H},rank={rank})"
+        assert prod_t is not None, f"{name} prod_t is None (B={B},H={H},rank={rank})"
+        max_diff = (ref_t - prod_t).abs().max().item()
+        assert max_diff < 1e-5, (
+            f"{name} max abs diff {max_diff:.4e} (B={B},H={H},rank={rank})"
+        )
