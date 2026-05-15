@@ -25,6 +25,16 @@ Forward kernel layout (Triton path):
   twiddle for this stage's pair index, scatter back. Triton's register
   tensors don't allow dynamic gather/scatter so the running state
   passes through global memory between stages — L2 absorbs the cost.
+
+Intra-CTA barrier (bd gru-triton-c2a): the per-program scratch buffer
+is shared across all warps of the CTA, and every butterfly stage reads
+``partner`` positions written by a *different* warp in the previous
+stage. Triton orders loads/stores only within a single warp — so a
+``tl.debug_barrier()`` (CTA-wide barrier + memory fence) is required
+between consecutive stages. Without it, with ``num_warps >= 4`` a
+warp's stage-s store is not guaranteed visible to another warp's
+stage-(s+1) partner load, which produced a warp-layout-dependent,
+batch-index-dependent corruption.
 """
 
 from __future__ import annotations
@@ -192,6 +202,11 @@ def gru_scan_butterfly_fwd_kernel(
     not H_PAD; mask_h = offs_h < H excludes the padded tail from those
     loads/stores. Scratch (program-local) and twiddle are at H_PAD,
     which torch_structured.Butterfly already produces for non-pow2 H.
+
+    The scratch round-trip between butterfly stages crosses warp
+    boundaries (a position's ``partner`` may be owned by a different
+    warp), so ``tl.debug_barrier()`` separates consecutive stages — see
+    the module docstring (bd gru-triton-c2a).
     """
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -241,6 +256,10 @@ def gru_scan_butterfly_fwd_kernel(
                 h_self_q,
                 mask=mask_b[:, None],
             )
+        # CTA-wide barrier: the copy-in above is read by the first
+        # butterfly stage at `partner` positions that may be owned by a
+        # different warp. See module docstring (bd gru-triton-c2a).
+        tl.debug_barrier()
 
         # Run NBLOCKS butterfly chains, each with LOG_H_PAD stages, on
         # each gate's scratch buffer. Stride direction alternates by
@@ -289,6 +308,11 @@ def gru_scan_butterfly_fwd_kernel(
                         new_val,
                         mask=mask_b[:, None],
                     )
+                # CTA-wide barrier: this stage's stores feed the next
+                # stage's `partner` loads across warp boundaries. Without
+                # the fence the next stage reads stale scratch with
+                # num_warps >= 4 (bd gru-triton-c2a).
+                tl.debug_barrier()
 
         # After log_H stages, scratch[g] = butterfly_g(h). Now run the
         # gate compose + recurrence to produce h_new.
@@ -481,6 +505,11 @@ def gru_scan_butterfly_bwd_kernel(
     mathematically equivalent to multiplying x by the top-left H x H
     submatrix of the H_PAD butterfly; the H_PAD twiddle parameters all
     receive non-zero gradient and are co-trained.
+
+    Like the forward kernel, the per-stage state buffer is shared across
+    the CTA's warps; ``tl.debug_barrier()`` separates each stage's
+    stores from the next stage's cross-warp ``partner`` loads — both in
+    the forward recompute and the reverse-stage walk (bd gru-triton-c2a).
     """
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -540,6 +569,9 @@ def gru_scan_butterfly_bwd_kernel(
                 h_prev_q,
                 mask=mask_b[:, None],
             )
+        # CTA-wide barrier: the state[g, 0] write above feeds the first
+        # recompute stage's cross-warp `partner` loads (bd gru-triton-c2a).
+        tl.debug_barrier()
         # Run NBLOCKS butterfly chains, each LOG_H_PAD stages, saving
         # state after every stage. Stage index in state buffer is
         # `blk * LOG_H_PAD + s + 1` (state[0] holds the input).
@@ -581,6 +613,10 @@ def gru_scan_butterfly_bwd_kernel(
                         new_val,
                         mask=mask_b[:, None],
                     )
+                # CTA-wide barrier: state[g, state_l_out] is read as the
+                # next recompute stage's input (cross-warp `partner`
+                # positions) (bd gru-triton-c2a).
+                tl.debug_barrier()
 
         # state[g, NBLOCKS*LOG_H_PAD] is the final butterfly output. Recompute gh, gates.
         final_l: tl.constexpr = NBLOCKS * LOG_H_PAD
@@ -695,6 +731,9 @@ def gru_scan_butterfly_bwd_kernel(
             d_dst_n + local_b[:, None] * sst_b + offs_h[None, :],
             dgh_n, mask=mask_b[:, None],
         )
+        # CTA-wide barrier: the d_state seed above is read by the first
+        # reverse stage's cross-warp `partner` loads (bd gru-triton-c2a).
+        tl.debug_barrier()
 
         # Walk blocks blk from NBLOCKS-1 down to 0; within each block,
         # stages s from LOG_H_PAD-1 down to 0. Stride direction matches
@@ -857,6 +896,11 @@ def gru_scan_butterfly_bwd_kernel(
                     )
                     tl.atomic_add(dt_base + 0 * sdtp_m_old, contrib_to_m0)
                     tl.atomic_add(dt_base + 1 * sdtp_m_old, contrib_to_m1)
+                # CTA-wide barrier: this reverse stage overwrites
+                # state[g, state_l_in] with d_old, which the next reverse
+                # stage reads as its d_new at cross-warp `partner`
+                # positions (bd gru-triton-c2a).
+                tl.debug_barrier()
 
         # After all stages backward, state[g, 0] holds d_h_prev_q for
         # gate g (gradient on the QUANTIZED h_prev — the matmul-side
