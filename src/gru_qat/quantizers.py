@@ -26,6 +26,7 @@ quantization), subclass FakeQuantize and register a factory in
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -243,7 +244,17 @@ QuantizerFactory = Callable[[], FakeQuantize]
 
 
 def make_quantizer(config: QuantizerConfig) -> FakeQuantize:
-    """Construct a quantizer from a config. Use this at model-build time."""
+    """Construct a quantizer from a config. Use this at model-build time.
+
+    The config is deep-copied so every quantizer owns an independent
+    ``QuantizerConfig`` instance. ``FakeQuantize.__init__`` stores the config
+    by reference and ``FakeQuantize.freeze()`` mutates ``config.mode`` in
+    place — without this copy, sibling quantizers built from the same recipe
+    field (e.g. ``quant_h_in``/``quant_h_out`` from ``recipe.hidden``, the six
+    ``quant_W_*`` from ``recipe.weight``) would share one config object, so
+    freezing the first would silently no-op the rest (bd gru-triton-n20).
+    """
+    config = deepcopy(config)
     if config.bits >= 32:
         return Identity(config)
     if config.axis is None:

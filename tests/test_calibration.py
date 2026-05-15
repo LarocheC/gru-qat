@@ -458,6 +458,102 @@ def test_freeze_all_matches_dynamic_on_last_batch() -> None:
     )
 
 
+def test_freeze_all_isolates_sibling_quantizer_configs() -> None:
+    """CAL-02 (extended) + bd gru-triton-n20 — after calibrate + freeze_all,
+    BOTH ``quant_h_in`` AND ``quant_h_out`` (the sibling pair sharing
+    ``recipe.hidden``) must hold independently-frozen scales matching the
+    dynamic-mode derivation on their own snapshotted running stats.
+
+    Root cause this test exposes (``bd gru-triton-n20``): ``GRUCellQuant``
+    builds ``quant_h_in`` and ``quant_h_out`` both from
+    ``make_quantizer(recipe.hidden)``. Before the deepcopy fix,
+    ``make_quantizer`` stored the passed ``QuantizerConfig`` *by reference*
+    (``quantizers.py:73``), so the two quantizers shared ONE config object.
+    ``freeze_all`` iterates the modules; the first ``.freeze()`` flips the
+    shared ``config.mode='frozen'``; the second ``.freeze()`` then
+    short-circuits at ``quantizers.py:99`` (``mode != 'min_max'``) and never
+    copies its running stats into ``scale`` — it stays at the ``1.0`` buffer
+    init. Identical sharing bug for the six ``quant_W_*`` weight quantizers
+    built from ``recipe.weight``.
+
+    This is the failing-test-before-fix commit (D-02 / D-37 two-commit
+    discipline) for the n20 ``deepcopy`` fix in ``make_quantizer``.
+
+    CPU-OK: the freeze derivation is platform-independent.
+    """
+    layer = _make_qat_layer(in_size=16, hid=32)
+
+    torch.manual_seed(0)
+    x_cal = torch.randn(8, 4, 16) * 0.5
+    h0_cal = torch.randn(4, 32) * 0.5
+
+    def _single_batch_loader():
+        yield (x_cal, h0_cal)
+
+    calibrate(layer, _single_batch_loader(), n_batches=1)
+
+    # --- The two sibling hidden-activation quantizers. ---
+    q_in = layer.cell.quant_h_in
+    q_out = layer.cell.quant_h_out
+
+    # The siblings must NOT share a config instance — that is the n20 bug.
+    assert q_in.config is not q_out.config, (
+        "quant_h_in and quant_h_out share a single QuantizerConfig instance "
+        "(gru-triton-n20). make_quantizer must deepcopy its config so each "
+        "quantizer freezes independently."
+    )
+
+    # Both must have observed in min_max mode during calibration.
+    for name, q in (("quant_h_in", q_in), ("quant_h_out", q_out)):
+        assert q.config.mode == "min_max", f"{name}: not in min_max mode"
+        assert q._initialized is True, f"{name}: never observed"
+        assert torch.isfinite(q.running_min).all(), f"{name}: running_min sentinel"
+        assert torch.isfinite(q.running_max).all(), f"{name}: running_max sentinel"
+
+    # Snapshot running stats and derive the dynamic-mode scale for EACH
+    # sibling on its own stats — same helper FakeQuantizePerTensor uses.
+    expected = {}
+    for name, q in (("quant_h_in", q_in), ("quant_h_out", q_out)):
+        rmin = q.running_min.clone()
+        rmax = q.running_max.clone()
+        scale, zp = q._scale_zp_from_min_max(rmin, rmax)
+        expected[name] = (scale.detach().clone(), zp.detach().clone())
+
+    freeze_all(layer)
+
+    # Binding contract: BOTH siblings' frozen scale equals the dynamic-mode
+    # derivation on their OWN snapshotted running stats. Pre-fix, quant_h_out
+    # stays at scale=1.0 because the shared config short-circuited freeze().
+    for name, q in (("quant_h_in", q_in), ("quant_h_out", q_out)):
+        exp_scale, exp_zp = expected[name]
+        assert q.config.mode == "frozen", f"{name}: not frozen"
+        assert torch.equal(q.scale, exp_scale), (
+            f"{name}: frozen scale {q.scale} != dynamic-mode derivation "
+            f"{exp_scale}. The shared-QuantizerConfig bug (gru-triton-n20) "
+            "made freeze_all silently no-op this quantizer."
+        )
+        assert torch.equal(q.zero_point, exp_zp), (
+            f"{name}: frozen zero_point {q.zero_point} != derived {exp_zp}"
+        )
+
+    # --- The six weight quantizers built from recipe.weight must also each
+    #     hold an independent config instance (no shared mutation). ---
+    weight_q_names = [
+        "quant_W_ir", "quant_W_iz", "quant_W_in",
+        "quant_W_hr", "quant_W_hz", "quant_W_hn",
+    ]
+    weight_configs = [
+        getattr(layer.cell, n).config for n in weight_q_names
+    ]
+    for i in range(len(weight_configs)):
+        for j in range(i + 1, len(weight_configs)):
+            assert weight_configs[i] is not weight_configs[j], (
+                f"{weight_q_names[i]} and {weight_q_names[j]} share a single "
+                "QuantizerConfig instance (gru-triton-n20). make_quantizer "
+                "must deepcopy its config."
+            )
+
+
 # ---------------------------------------------------------------------------
 # CAL-03 parametrize grid (per CONTEXT Decision G: 1 shape × 3 classes × 4
 # kernels = 12 cases). Phase 4 strict-file helpers provide the per-(kernel,
@@ -477,9 +573,30 @@ _CAL03_PARAMS = [
 ]
 _CAL03_CLASSES = ["realistic", "near-saturation", "large-magnitude"]
 
+# Phase 7 D-05 `divergence` marker: post the gru-triton-n20 deepcopy fix, the
+# dense kernel's calibrate→freeze→deploy round-trip no longer holds the
+# `torch.equal` bit-identity contract — reference and Triton TF32-tiled tl.dot
+# land on different INT8 rounding boundaries (residual = exactly 1×h_scale).
+# This is the same accepted TF32 divergence the strict-file dense quant cases
+# carry; mark the 3 dense cases per-parametrize-case so the diagonal / monarch
+# / butterfly CAL-03 cases stay in the `pytest -q -m "not divergence"` gate.
+_CAL03_DIVERGENCE_KERNELS = {"dense"}  # gru-triton-n20 re-baseline (D-07)
+
+
+def _cal03_param(kernel, T, B, H, nblocks):
+    """Build a CAL-03 `(cls, kernel, ...)` pytest.param, tagging `divergence`
+    for the kernels whose post-n20 round-trip is a TF32 accepted divergence."""
+    vals = (kernel, T, B, H, nblocks)
+    if kernel in _CAL03_DIVERGENCE_KERNELS:
+        return pytest.param(*vals, marks=pytest.mark.divergence)
+    return pytest.param(*vals)
+
 
 @cuda_only
-@pytest.mark.parametrize("kernel,T,B,H,nblocks", _CAL03_PARAMS)
+@pytest.mark.parametrize(
+    "kernel,T,B,H,nblocks",
+    [_cal03_param(*row) for row in _CAL03_PARAMS],
+)
 @pytest.mark.parametrize("cls", _CAL03_CLASSES)
 def test_triton_matches_reference_after_freeze(
     cls: str, kernel: str, T: int, B: int, H: int, nblocks: int | None

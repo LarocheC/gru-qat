@@ -67,4 +67,5 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "divergence: marks a strict-tier case whose failure is an irreducible TF32 tl.dot / tl.sum reduction-order ACCEPTED-DIVERGENCE (run with '-m divergence' to reproduce; deselect with '-m \"not divergence\"'). See AUDIT-REPORT.md.",
 ]
