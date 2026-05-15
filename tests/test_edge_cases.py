@@ -583,3 +583,32 @@ def test_butterfly_partial_batch_tile(B: int) -> None:
         f"per-batch dev={[f'{d:.2e}' for d in dev_per_b]} — batch-tiling "
         f"correctness bug in scan_butterfly.py (bd gru-triton-c2a)"
     )
+
+
+# ===========================================================================
+# Task 4 — EDG-03: long-T slow-tier accumulated-drift sweep.
+# ===========================================================================
+#
+# T in {512, 1024} long-sequence parity for every path. @pytest.mark.slow so
+# `pytest -m "not slow"` skips them (ROADMAP SC#3). Tolerances reused verbatim
+# (D-09) — the same per-path tiers as the T=1 / B=1 sweeps; a long sequence
+# must not accumulate drift past the tier-A bound.
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("path", ALL_PATHS)
+@pytest.mark.parametrize("T", [512, 1024])
+def test_long_t_drift(path: str, T: int) -> None:
+    """T in {512, 1024} long-sequence parity for every path with no
+    accumulated drift beyond the tier-A tolerance (EDG-03, ROADMAP SC#3).
+
+    @pytest.mark.slow — deselected by ``pytest -m "not slow"``. At (B=4,
+    H=8) over 512-1024 timesteps the recurrence runs long enough that any
+    per-step asymmetry between a path and its reference would compound
+    into a visible drift. Tolerances are the same per-path tiers as the
+    shorter sweeps (D-09 — no new long-T bounds): reference vs ``nn.GRU``
+    < 1e-4; dense/monarch/diagonal full-layer < 5e-4; butterfly < 5e-2;
+    circulant/ldr deterministic replay < 1e-5.
+    """
+    _gate_off(path)
+    _run_path_vs_reference(path, T, 4, 8, backward=False)
