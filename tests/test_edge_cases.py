@@ -179,6 +179,142 @@ def _monarch_nblocks(hid: int) -> int:
     return 1
 
 
+def _path_tol(path: str) -> float:
+    """Absolute tolerance for a path's Triton-vs-reference comparison.
+
+    Tolerances reused verbatim from PROJECT.md Constraints (D-09 — no new
+    bounds):
+      - diagonal Triton (no ``tl.dot``):           < 1e-5
+      - dense / monarch / butterfly (``tl.dot``):  < 5e-4
+      - circulant / ldr per-step PyTorch:          < 1e-5 (deterministic
+        same-recipe replay — algebraic equality)
+    """
+    if path in ("dense_triton", "monarch_triton", "butterfly_triton"):
+        return 5e-4
+    # diagonal_triton, circulant, ldr — non-tl.dot / deterministic replay.
+    return 1e-5
+
+
+def _rel(ref: torch.Tensor, got: torch.Tensor) -> float:
+    """Relative max-abs error with the 1e-6 denominator floor.
+
+    Matches the relative-error reporting idiom used across the repo
+    (TESTING.md "Relative-error reporting"; test_layer_parity.py:181).
+    The floor prevents division by near-zero on degenerate outputs.
+    """
+    max_diff = (ref - got).abs().max().item()
+    return max_diff / max(ref.abs().max().item(), 1e-6)
+
+
+def _run_path_vs_reference(
+    path: str, T: int, B: int, H: int, *, backward: bool
+) -> None:
+    """Run ``path`` at shape (T, B, H) and assert parity at its tier.
+
+    The comparison strategy per path:
+      - reference: vs ``torch.nn.GRU`` (via the D-11 imported
+        ``_translate_nn_gru_to_cell``) at < 1e-4.
+      - dense_triton: per-step dense layer vs the explicit dense
+        ``gru_scan`` Triton kernel at < 5e-4 (mirrors the strict-file
+        pre_batch_input round-trip pattern).
+      - diagonal/monarch/butterfly_triton: a ``use_triton=True`` layer vs
+        a same-weights ``use_triton=False`` layer at the path tier.
+      - circulant/ldr: per-step PyTorch — a deterministic same-recipe
+        re-run; assert finite + correct shape and < 1e-5 replay equality.
+
+    ``backward`` extends the check to gradient finiteness + parity.
+    """
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    in_size = H
+
+    if path == "reference":
+        device = torch.device("cpu")
+        gru = nn.GRU(in_size, H, num_layers=1, bidirectional=False, batch_first=False)
+        layer = _translate_nn_gru_to_cell(gru)
+        x_ref = torch.randn(T, B, in_size, requires_grad=backward)
+        x_ours = x_ref.detach().clone().requires_grad_(backward)
+        out_ref, hT_ref = gru(x_ref)
+        out_ours, hT_ours = layer(x_ours)
+        assert torch.isfinite(out_ours).all(), f"reference out non-finite (T={T},B={B},H={H})"
+        assert tuple(out_ours.shape) == (T, B, H)
+        rel = _rel(out_ref, out_ours)
+        assert rel < 1e-4, f"reference out rel diff {rel:.4e} (T={T},B={B},H={H})"
+        rel_h = _rel(hT_ref.squeeze(0), hT_ours)
+        assert rel_h < 1e-4, f"reference h_T rel diff {rel_h:.4e} (T={T},B={B},H={H})"
+        if backward:
+            g = torch.randn_like(out_ref)
+            out_ref.backward(g)
+            out_ours.backward(g)
+            assert x_ours.grad is not None and torch.isfinite(x_ours.grad).all()
+            rel_dx = _rel(x_ref.grad, x_ours.grad)
+            assert rel_dx < 1e-4, f"reference dx rel diff {rel_dx:.4e} (T={T},B={B},H={H})"
+        return
+
+    device = torch.device("cuda") if path in _TRITON_PATHS else torch.device("cpu")
+
+    if path == "dense_triton":
+        # Dense hidden has no use_triton-eligible GRULayer config; the
+        # dense Triton kernel is exercised via the explicit gru_scan call,
+        # mirroring tests/test_triton_scan.py. Reference = the per-step
+        # dense layer (use_triton=False).
+        import torch.nn.functional as F
+        from gru_qat.triton_kernels.scan import gru_scan
+        layer = _make_layer("dense_triton", in_size, H).to(device)
+        x = torch.randn(T, B, in_size, device=device, requires_grad=backward)
+        ref_out, ref_hT = layer(x)
+        w = layer.cell.quantize_weights()
+        xq = layer.cell.quant_x(x.detach())
+        gi = F.linear(xq, w.Wi_cat, w.bi_cat).detach().requires_grad_(backward)
+        tri_out = gru_scan(gi, x.new_zeros(B, H), w.Wh_cat, w.bh_cat)
+        tri_hT = tri_out[-1]
+    else:
+        # Structured Triton + circulant/ldr per-step: build a use_triton
+        # pair (or, for circulant/ldr, two identical per-step layers) and
+        # propagate weights via load_state_dict so both see identical math.
+        ref_layer = _make_layer(path, in_size, H).to(device)
+        got_layer = _make_layer(path, in_size, H).to(device)
+        got_layer.load_state_dict(ref_layer.state_dict())
+        if path in _TRITON_PATHS:
+            ref_layer.use_triton = False  # force the per-step reference path
+        x = torch.randn(T, B, in_size, device=device, requires_grad=backward)
+        x_ref = x.detach().clone().requires_grad_(backward)
+        ref_out, ref_hT = ref_layer(x_ref)
+        got_out, got_hT = got_layer(x)
+        tri_out, tri_hT = got_out, got_hT
+
+    assert torch.isfinite(tri_out).all(), f"{path} out non-finite (T={T},B={B},H={H})"
+    assert tuple(tri_out.shape) == (T, B, H), (
+        f"{path} out shape {tuple(tri_out.shape)} != {(T, B, H)}"
+    )
+    tol = _path_tol(path)
+    rel = _rel(ref_out, tri_out)
+    assert rel < tol, f"{path} out rel diff {rel:.4e} >= {tol:.0e} (T={T},B={B},H={H})"
+    rel_h = _rel(ref_hT, tri_hT)
+    assert rel_h < tol, f"{path} h_T rel diff {rel_h:.4e} >= {tol:.0e} (T={T},B={B},H={H})"
+
+    if backward:
+        g = torch.randn_like(ref_out)
+        ref_out.backward(g.clone())
+        tri_out.backward(g.clone())
+        # Gradients must exist and be finite on every learnable parameter.
+        if path == "dense_triton":
+            assert gi.grad is not None and torch.isfinite(gi.grad).all(), (
+                f"dense_triton gi.grad missing/non-finite (T={T},B={B},H={H})"
+            )
+        else:
+            for name, p in got_layer.named_parameters():
+                assert p.grad is not None, f"{path} {name}.grad is None"
+                assert torch.isfinite(p.grad).all(), (
+                    f"{path} {name}.grad non-finite (T={T},B={B},H={H})"
+                )
+            assert x.grad is not None and torch.isfinite(x.grad).all()
+            rel_dx = _rel(x_ref.grad, x.grad)
+            assert rel_dx < tol, (
+                f"{path} dx rel diff {rel_dx:.4e} >= {tol:.0e} (T={T},B={B},H={H})"
+            )
+
+
 # ===========================================================================
 # Task 1 — EDG-04: T=0 / B=0 raises a clear ValueError naming the dimension.
 # ===========================================================================
@@ -220,3 +356,57 @@ def test_t0_b0_raises_valueerror(
     # The guard raises before any kernel launch; match the offending dim.
     with pytest.raises(ValueError, match=bad_dim):
         layer(x)
+
+
+def _maybe_skip_monarch_bwd(path: str, T: int, B: int, H: int) -> None:
+    """Apply the legitimate monarch-bwd HW-limit skip from the D-51 LOCKED
+    test_triton_monarch_strict.py.
+
+    ``_skip_if_monarch_bwd_hw_limit`` skips shapes the RTX 2000 Ada
+    monarch bwd kernel genuinely cannot launch (SMEM OOM, tl.dot K<16).
+    A HW-limit skip is DISTINCT from a BLOCK-assumption bug — a real bug
+    must be FIXED in-phase (D-04), not hidden behind a skip.
+    """
+    if path != "monarch_triton":
+        return
+    mono = importlib.import_module("test_triton_monarch_strict")
+    mono._skip_if_monarch_bwd_hw_limit(T, B, H, _monarch_nblocks(H))
+
+
+# ===========================================================================
+# Task 2 — EDG-01: T=1 single-timestep fwd + bwd parity sweep.
+# ===========================================================================
+#
+# T=1 is the single-timestep boundary; B=4 / H=8 are non-degenerate so this
+# test isolates the single-timestep concern (B=1 / small-H is Task 3). Every
+# path is compared at its PROJECT.md tolerance tier (D-09).
+
+
+@pytest.mark.parametrize("path", ALL_PATHS)
+@pytest.mark.parametrize("T,B,H", [(1, 4, 8)])
+def test_t1_forward_parity(path: str, T: int, B: int, H: int) -> None:
+    """T=1 forward parity for every path at its normal tolerance tier
+    (EDG-01, ROADMAP SC#1).
+
+    reference vs ``nn.GRU`` < 1e-4; diagonal_triton < 1e-5; dense /
+    monarch / butterfly < 5e-4; circulant / ldr deterministic replay
+    < 1e-5. Tolerances reused verbatim from PROJECT.md (D-09).
+    """
+    _gate_off(path)
+    _run_path_vs_reference(path, T, B, H, backward=False)
+
+
+@pytest.mark.parametrize("path", ALL_PATHS)
+@pytest.mark.parametrize("T,B,H", [(1, 4, 8)])
+def test_t1_backward_parity(path: str, T: int, B: int, H: int) -> None:
+    """T=1 backward parity for every path: gradients exist, are finite,
+    and match the reference path within the per-path tolerance tier
+    (EDG-01, ROADMAP SC#1).
+
+    The monarch backward case applies the legitimate
+    ``_skip_if_monarch_bwd_hw_limit`` HW-limit skip — a BLOCK-assumption
+    bug at T=1 (non-HW reason) would instead be fixed in-phase (D-04).
+    """
+    _gate_off(path)
+    _maybe_skip_monarch_bwd(path, T, B, H)
+    _run_path_vs_reference(path, T, B, H, backward=True)
