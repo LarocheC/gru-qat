@@ -123,7 +123,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. `AUDIT-REPORT.md` exists at repo root and contains: (a) a table of all 28 v1 requirements with PASS/FIX/ACCEPTED-DIVERGENCE status, (b) per-phase summary of what was checked and how, (c) a "residual known-but-accepted divergences" section with the rationale for each, (d) a pointer to the beads issues that resolved each finding.
   3. `pytest -q` and `pytest -m slow -q` both pass on a CUDA machine; `pytest -q` passes on a CPU-only machine; `mypy` and `ruff check src tests` are green.
   4. `bd ready` shows no unresolved audit findings (all closed or explicitly deferred to v2 with a beads issue reference in `REQUIREMENTS.md`).
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 07-01-PLAN.md — gru-triton-7rj wrapper assert→ValueError hardening + gru-triton-4m6 mypy/ruff cleanup to 0/0 (Wave 1)
+- [ ] 07-02-PLAN.md — gru-triton-n20 deepcopy fix + Phase 4 strict-test re-baseline + `divergence` pytest marker (Wave 2, CUDA host)
+- [ ] 07-03-PLAN.md — git-log test-before-fix audit + close all 14 bd issues, `bd ready` empty (Wave 3)
+- [ ] 07-04-PLAN.md — AUDIT-REPORT.md authored at repo root + REQUIREMENTS.md RPT-01/02/03 closure (Wave 4)
 
 ## Progress
 
@@ -138,4 +142,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 4. Quant-on bit-identity | 0/5 | Planned | - |
 | 5. Calibration + freeze lifecycle | 0/1 | Planned | - |
 | 6. Edge-case sweeps | 0/1 | Planned | - |
-| 7. Audit report + findings handling | 0/TBD | Not started | - |
+| 7. Audit report + findings handling | 0/4 | Planned | - |
