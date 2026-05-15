@@ -112,7 +112,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. `T=0` and `B=0` either produce correctly-shaped empty output OR raise a clear `ValueError` with a message that mentions the offending dimension. No NaN output, no kernel hang. Behaviour decided in plan-phase and logged in PROJECT.md.
   5. Any mismatch surfaced becomes a failing test → beads issue → fix in-phase.
 **Plans**: 1 plan
-- [ ] 06-01-PLAN.md — Single race-free plan: T=0/B=0 ValueError guards + EDG-04 tests + PROJECT.md policy log, T=1 fwd+bwd sweep (EDG-01), B=1 + small-H BLOCK-size sweep (EDG-02), long-T slow-tier sweep (EDG-03), full-suite run + timestamped pytest-output artifact
+- [x] 06-01-PLAN.md — Single race-free plan: T=0/B=0 ValueError guards + EDG-04 tests + PROJECT.md policy log, T=1 fwd+bwd sweep (EDG-01), B=1 + small-H BLOCK-size sweep (EDG-02), long-T slow-tier sweep (EDG-03), full-suite run + timestamped pytest-output artifact
 
 ### Phase 7: Audit report + findings handling
 **Goal**: Every finding from Phases 1–6 is captured with a failing-test-before-fix discipline and a beads issue; the audit closes with an `AUDIT-REPORT.md` summarizing what was checked, what passed, what was fixed, and any residual known-but-accepted divergences.

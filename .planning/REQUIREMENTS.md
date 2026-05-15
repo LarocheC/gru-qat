@@ -45,10 +45,10 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Edge-case coverage (EDG)
 
-- [ ] **EDG-01**: T=1 single-timestep produces correct output and gradient for every path (reference + every Triton kernel).
-- [ ] **EDG-02**: B=1 single-batch and H ∈ {1, 2} small-hidden cases produce correct output for every path (Triton kernels often have BLOCK assumptions that break at tiny shapes).
-- [ ] **EDG-03**: T ∈ {512, 1024} long-sequence parity: no accumulated numerical drift exceeds the tier-A tolerance at the layer level (marked `slow`).
-- [ ] **EDG-04**: Empty inputs (T=0 or B=0) either work or raise a clear, tested error (not a silent NaN / kernel hang).
+- [x] **EDG-01**: T=1 single-timestep produces correct output and gradient for every path (reference + every Triton kernel). ✓ 2026-05-15 (`tests/test_edge_cases.py` T=1 fwd+bwd sweep, 7 paths)
+- [x] **EDG-02**: B=1 single-batch and H ∈ {1, 2} small-hidden cases produce correct output for every path (Triton kernels often have BLOCK assumptions that break at tiny shapes). ✓ 2026-05-15 (surfaced + fixed 2 bugs: butterfly H=1 crash bd:gru-triton-ehf, butterfly batch-invariance race bd:gru-triton-c2a)
+- [x] **EDG-03**: T ∈ {512, 1024} long-sequence parity: no accumulated numerical drift exceeds the tier-A tolerance at the layer level (marked `slow`). ✓ 2026-05-15 (`@pytest.mark.slow` long-T drift sweep)
+- [x] **EDG-04**: Empty inputs (T=0 or B=0) either work or raise a clear, tested error (not a silent NaN / kernel hang). ✓ 2026-05-15 (`GRULayer.forward` raises `ValueError` naming the offending dim for all 7 paths; policy logged in PROJECT.md)
 
 ### Findings handling & reporting (RPT)
 
@@ -111,10 +111,10 @@ Populated during roadmap creation by the roadmapper agent.
 | CAL-01 | Phase 5 | Complete |
 | CAL-02 | Phase 5 | Complete |
 | CAL-03 | Phase 5 | Complete |
-| EDG-01 | Phase 6 | Pending |
-| EDG-02 | Phase 6 | Pending |
-| EDG-03 | Phase 6 | Pending |
-| EDG-04 | Phase 6 | Pending |
+| EDG-01 | Phase 6 | Complete |
+| EDG-02 | Phase 6 | Complete |
+| EDG-03 | Phase 6 | Complete |
+| EDG-04 | Phase 6 | Complete |
 | RPT-01 | Phase 7 | Pending |
 | RPT-02 | Phase 7 | Pending |
 | RPT-03 | Phase 7 | Pending |
