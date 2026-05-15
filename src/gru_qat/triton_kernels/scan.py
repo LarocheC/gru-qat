@@ -30,6 +30,8 @@ fake-quant come in follow-on commits.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import triton
 import triton.language as tl
@@ -71,8 +73,8 @@ _MIN_AUTOTUNE_BLOCK_B = 16
 # concurrently — scheduled-but-not-running CTAs would block forever waiting
 # on their unscheduled siblings. The wrapper is responsible for keeping the
 # total program count <= the GPU's SM count.
-@triton.jit
-def gru_scan_fwd_persistent_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_fwd_persistent_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
     Wh_ptr,            # [3H, H], fp32
@@ -227,12 +229,20 @@ def gru_scan_forward_persistent(
     Constraint: ``cdiv(B, block_b) * cdiv(H, block_oh) <= num_SMs`` —
     otherwise the spin-wait barrier deadlocks. Wrapper raises if exceeded.
     """
-    assert gi.is_cuda
+    if not gi.is_cuda:
+        raise ValueError(f"gi must be a CUDA tensor; got device={gi.device}")
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -283,8 +293,8 @@ def gru_scan_forward_persistent(
     return out
 
 
-@triton.jit
-def gru_scan_bwd_persistent_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_bwd_persistent_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (read-only)
     gi_ptr,           # [T, B, 3H]
     h0_ptr,           # [B, H]
@@ -657,11 +667,24 @@ def gru_scan_backward_persistent(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
-    assert out.shape == (T, B, H)
-    assert dout.shape == (T, B, H)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
+    if out.shape != (T, B, H):
+        raise ValueError(
+            f"out shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(out.shape)}"
+        )
+    if dout.shape != (T, B, H):
+        raise ValueError(
+            f"dout shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(dout.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -729,9 +752,9 @@ def gru_scan_backward_persistent(
     return dgi, dh0, dWh, dbh
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])
-@triton.jit
-def gru_scan_fwd_kernel(
+@triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])  # type: ignore[untyped-decorator]
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
     Wh_ptr,            # [3H, H], fp32 (rows: r, z, n stacked)
@@ -890,9 +913,9 @@ def gru_scan_fwd_kernel(
         sh_b = so_b
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS_BWD, key=["T", "B"])
-@triton.jit
-def gru_scan_bwd_kernel(
+@triton.autotune(configs=_AUTOTUNE_CONFIGS_BWD, key=["T", "B"])  # type: ignore[untyped-decorator]
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_bwd_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (saved tensors, read-only)
     gi_ptr,           # [T, B, 3H]
     h0_ptr,           # [B, H]
@@ -1346,11 +1369,24 @@ def gru_scan_backward_triton(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
-    assert out.shape == (T, B, H)
-    assert dout.shape == (T, B, H)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
+    if out.shape != (T, B, H):
+        raise ValueError(
+            f"out shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(out.shape)}"
+        )
+    if dout.shape != (T, B, H):
+        raise ValueError(
+            f"dout shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(dout.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -1379,7 +1415,9 @@ def gru_scan_backward_triton(
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
-    grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
+    def grid(meta: dict[str, int]) -> tuple[int]:
+        return (triton.cdiv(B, meta["BLOCK_B"]),)
+
     gru_scan_bwd_kernel[grid](
         gi, h0, Wh_cat, bh_cat, out,
         dout,
@@ -1527,8 +1565,8 @@ class GRUScanFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         Wh_cat: torch.Tensor,
@@ -1546,9 +1584,9 @@ class GRUScanFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(  # type: ignore[override]
-        ctx, dout: torch.Tensor
-    ):
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
         h_in_quant = ctx.h_in_quant
         h_out_quant = ctx.h_out_quant
@@ -1581,8 +1619,11 @@ def gru_scan(
     ``(scale, qmin, qmax)`` tuple), the kernel applies in-kernel fake-quant
     on the hidden state on every step. Per-tensor symmetric, frozen scale.
     """
-    return GRUScanFunction.apply(
-        gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+    return cast(
+        torch.Tensor,
+        GRUScanFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+        ),
     )
 
 
@@ -1593,8 +1634,8 @@ class GRUScanPersistentFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         Wh_cat: torch.Tensor,
@@ -1612,7 +1653,9 @@ class GRUScanPersistentFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, dout):  # type: ignore[override]
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
         grads = gru_scan_backward_persistent(
             gi, h0, Wh_cat, bh_cat, out, dout,
@@ -1634,8 +1677,11 @@ def gru_scan_persistent(
     use 2D grids with cross-CTA barriers; better SM utilization at modest
     batch sizes. ``h_in_quant`` / ``h_out_quant`` enable in-kernel
     fake-quant on the hidden state, same semantics as gru_scan."""
-    return GRUScanPersistentFunction.apply(
-        gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+    return cast(
+        torch.Tensor,
+        GRUScanPersistentFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+        ),
     )
 
 
@@ -1658,13 +1704,26 @@ def gru_scan_forward(
     Returns:
         out:    [T, B, H]   hidden state at each timestep
     """
-    assert gi.is_cuda and h0.is_cuda and Wh_cat.is_cuda and bh_cat.is_cuda
-    assert gi.dtype == torch.float32, "Phase 1 fp32 only"
+    if not (gi.is_cuda and h0.is_cuda and Wh_cat.is_cuda and bh_cat.is_cuda):
+        raise ValueError(
+            "gi, h0, Wh_cat, bh_cat must all be CUDA tensors; got devices "
+            f"gi={gi.device}, h0={h0.device}, Wh_cat={Wh_cat.device}, "
+            f"bh_cat={bh_cat.device}"
+        )
+    if gi.dtype != torch.float32:
+        raise ValueError(f"gi dtype must be float32 (Phase 1 fp32 only); got {gi.dtype}")
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
 
     # Make sure inputs are contiguous in their last dim — strides below assume
     # last-dim stride = 1.
@@ -1678,9 +1737,11 @@ def gru_scan_forward(
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
-    # Autotune picks BLOCK_B/OH/K. Grid is a meta-lambda so it sizes from
+    # Autotune picks BLOCK_B/OH/K. Grid is a meta-function so it sizes from
     # whatever BLOCK_B the autotuner chose for this (T, B, H) cell.
-    grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
+    def grid(meta: dict[str, int]) -> tuple[int]:
+        return (triton.cdiv(B, meta["BLOCK_B"]),)
+
     gru_scan_fwd_kernel[grid](
         gi,
         h0,

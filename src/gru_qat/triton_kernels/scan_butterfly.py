@@ -39,7 +39,7 @@ batch-index-dependent corruption.
 
 from __future__ import annotations
 
-import math
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -71,11 +71,12 @@ def extract_butterfly_factors(
     if cell._hidden_dense:
         raise ValueError("cell hidden side is dense; nothing to extract")
     # struct_Wh_* are _ButterflyLinear wrappers; .b is the underlying
-    # torch_structured.Butterfly nn.Module.
+    # torch_structured.Butterfly nn.Module. nn.Module attribute access is
+    # typed Tensor | Module by the torch stubs — cast to nn.Module.
     modules = [
-        cell.struct_Wh_r.b,
-        cell.struct_Wh_z.b,
-        cell.struct_Wh_n.b,
+        cast(nn.Module, cast(nn.Module, cell.struct_Wh_r).b),
+        cast(nn.Module, cast(nn.Module, cell.struct_Wh_z).b),
+        cast(nn.Module, cast(nn.Module, cell.struct_Wh_n).b),
     ]
     sample = next(modules[0].parameters())
     if cell.b_hr is None:
@@ -83,7 +84,13 @@ def extract_butterfly_factors(
             3 * cell.hidden_size, device=sample.device, dtype=sample.dtype,
         )
     else:
-        bh_cat = torch.cat([cell.b_hr, cell.b_hz, cell.b_hn])
+        bh_cat = torch.cat(
+            [
+                cast(torch.Tensor, cell.b_hr),
+                cast(torch.Tensor, cell.b_hz),
+                cast(torch.Tensor, cell.b_hn),
+            ]
+        )
     return modules, bh_cat
 
 
@@ -158,8 +165,8 @@ def gru_scan_butterfly(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
-def gru_scan_butterfly_fwd_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_butterfly_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,             # [T, B, 3H], fp32
     h0_ptr,             # [B, H], fp32
     twiddle_ptr,        # [3, NBLOCKS, log_n, n//2, 2, 2], fp32 — one per gate
@@ -383,20 +390,34 @@ def gru_scan_butterfly_forward_triton(
     Returns:
         out: [T, B, H]
     """
-    assert gi.is_cuda
+    if not gi.is_cuda:
+        raise ValueError(f"gi must be a CUDA tensor; got device={gi.device}")
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
     # H itself may be non-pow2; the butterfly multiply runs on H_PAD =
     # next_pow_2(H). torch_structured.Butterfly already sizes its
     # twiddles at the padded shape internally. NBLOCKS is the number of
     # stacked butterfly chains (torch_structured's `nblocks` argument).
     n_gates, nblocks, log_n_t, n_div_2_t, two1, two2 = twiddles.shape
-    assert n_gates == 3 and two1 == 2 and two2 == 2
+    if not (n_gates == 3 and two1 == 2 and two2 == 2):
+        raise ValueError(
+            f"twiddles shape must be (3, nblocks, log_H, H//2, 2, 2); got "
+            f"{tuple(twiddles.shape)}"
+        )
     H_PAD = n_div_2_t * 2
     log_H_pad = log_n_t
-    assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
-    assert 1 << log_H_pad == H_PAD
+    if not (H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0):
+        raise ValueError(
+            f"twiddles imply H_PAD={H_PAD}, which must be >= H={H} and a power "
+            f"of two (shape {tuple(twiddles.shape)})"
+        )
+    if 1 << log_H_pad != H_PAD:
+        raise ValueError(
+            f"twiddles log_H={log_H_pad} inconsistent with H_PAD={H_PAD}: "
+            f"expected 1 << log_H == H_PAD (shape {tuple(twiddles.shape)})"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -438,8 +459,8 @@ def gru_scan_butterfly_forward_triton(
     return out
 
 
-@triton.jit
-def gru_scan_butterfly_bwd_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_butterfly_bwd_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (read-only)
     gi_ptr,
     h0_ptr,
@@ -971,10 +992,22 @@ def gru_scan_butterfly_backward_triton(
     # internally. Twiddle is already at H_PAD via torch_structured.
     # NBLOCKS is the stacked-butterfly count from torch_structured.
     n_gates, nblocks, log_H_pad, n_div_2_t, two1, two2 = twiddles.shape
-    assert n_gates == 3 and two1 == 2 and two2 == 2
+    if not (n_gates == 3 and two1 == 2 and two2 == 2):
+        raise ValueError(
+            f"twiddles shape must be (3, nblocks, log_H, H//2, 2, 2); got "
+            f"{tuple(twiddles.shape)}"
+        )
     H_PAD = n_div_2_t * 2
-    assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
-    assert 1 << log_H_pad == H_PAD
+    if not (H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0):
+        raise ValueError(
+            f"twiddles imply H_PAD={H_PAD}, which must be >= H={H} and a power "
+            f"of two (shape {tuple(twiddles.shape)})"
+        )
+    if 1 << log_H_pad != H_PAD:
+        raise ValueError(
+            f"twiddles log_H={log_H_pad} inconsistent with H_PAD={H_PAD}: "
+            f"expected 1 << log_H == H_PAD (shape {tuple(twiddles.shape)})"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -1049,8 +1082,8 @@ class GRUScanButterflyTritonFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         twiddles: torch.Tensor,
@@ -1068,7 +1101,9 @@ class GRUScanButterflyTritonFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, dout):  # type: ignore[override]
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, twiddles, bh_cat, out = ctx.saved_tensors
         grads = gru_scan_butterfly_backward_triton(
             gi, h0, twiddles, bh_cat, out, dout,
@@ -1096,8 +1131,11 @@ def gru_scan_butterfly_triton(
         h_in_quant / h_out_quant: optional ``(scale, qmin, qmax)`` —
             same semantics as ``gru_scan_monarch``.
     """
-    return GRUScanButterflyTritonFunction.apply(
-        gi, h0, twiddles, bh_cat, h_in_quant, h_out_quant,
+    return cast(
+        torch.Tensor,
+        GRUScanButterflyTritonFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, twiddles, bh_cat, h_in_quant, h_out_quant,
+        ),
     )
 
 
@@ -1119,14 +1157,26 @@ def extract_butterfly_twiddles(
     if cell._hidden_dense:
         raise ValueError("cell hidden side is dense; nothing to extract")
     # cell.struct_Wh_*.b.twiddle: [nstacks=1, butterfly_nblocks, log_n, n//2, 2, 2]
-    Wr = cell.struct_Wh_r.b.twiddle.squeeze(0)
-    Wz = cell.struct_Wh_z.b.twiddle.squeeze(0)
-    Wn = cell.struct_Wh_n.b.twiddle.squeeze(0)
+    # nn.Module attribute access is typed Tensor | Module by the torch
+    # stubs — cast each hop to the concrete submodule / tensor.
+    def _twiddle(layer: object) -> torch.Tensor:
+        butterfly = cast(nn.Module, cast(nn.Module, layer).b)
+        return cast(torch.Tensor, butterfly.twiddle).squeeze(0)
+
+    Wr = _twiddle(cell.struct_Wh_r)
+    Wz = _twiddle(cell.struct_Wh_z)
+    Wn = _twiddle(cell.struct_Wh_n)
     twiddles = torch.stack([Wr, Wz, Wn], dim=0)  # [3, nblocks, log_n, n//2, 2, 2]
     if cell.b_hr is None:
         bh_cat = torch.zeros(
             3 * cell.hidden_size, device=twiddles.device, dtype=twiddles.dtype,
         )
     else:
-        bh_cat = torch.cat([cell.b_hr, cell.b_hz, cell.b_hn])
+        bh_cat = torch.cat(
+            [
+                cast(torch.Tensor, cell.b_hr),
+                cast(torch.Tensor, cell.b_hz),
+                cast(torch.Tensor, cell.b_hn),
+            ]
+        )
     return twiddles, bh_cat
