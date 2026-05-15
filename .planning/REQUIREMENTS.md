@@ -70,6 +70,24 @@ Acknowledged but deferred beyond this audit milestone.
 - **PERF-01**: Re-validate cuDNN comparison table in `DEVELOPMENT.md` on current hardware.
 - **PERF-02**: Bench QAT-on overhead vs the +10–30% claim in `DEVELOPMENT.md`.
 
+### Kernel hardening (deferred from Phase 7 audit closure)
+
+- **KRN-01** (`bd:gru-triton-e0l`): Monarch backward kernel-tiling redesign for
+  consumer-GPU SMEM limits. The Phase 7 audit closed `gru-triton-e0l` as a
+  documented hardware limit (RTX 2000 Ada: SMEM OOM for `blksz_pad >= 128`,
+  `tl.dot` K<16 constraint for `blksz_pad < 16`), covered in-tree by the
+  `_skip_if_monarch_bwd_hw_limit` skip. A real fix needs a separate small-tile
+  autotune config tier or a re-tiled bwd kernel — a kernel redesign, not a
+  bugfix — and is deferred to v2. bd ref: `gru-triton-e0l` (CLOSED in Phase 7
+  with this v2 pointer).
+- **KRN-02** (`bd:gru-triton-e7t`, `gru-triton-rwm` family): `input_precision="ieee"`
+  TF32-elimination rewrite of the `tl.dot` / `tl.sum` kernel reduction paths
+  to remove the ACCEPTED-DIVERGENCE family at its root. Explicitly out of
+  Phase 7 scope per PROJECT.md's locked "Option C / tiered tolerance" Key
+  Decision. bd refs: the 9 ACCEPTED-DIVERGENCE issues (`in0`, `q3k`, `lqk`,
+  `5rk`, `mjy`, `lht`, `e7t`, `fpl`, `6dz` — all CLOSED in Phase 7 with a
+  resolution note pointing at this v2 record and AUDIT-REPORT.md).
+
 ## Out of Scope
 
 Explicitly excluded. Documented to prevent scope creep.
