@@ -97,6 +97,19 @@ def _validate_shapes(kind: StructuredKind, in_features: int, out_features: int, 
                 f"circulant requires power-of-2 size; got {in_features}"
             )
     elif kind == "butterfly":
+        # A size-1 butterfly factorization has log2(1) == 0 stages and is
+        # mathematically undefined. torch_structured's butterfly_multiply
+        # CUDA op divides by n // 2 == 0 for n=1 and raises a fatal
+        # Floating-point exception that aborts the whole Python process
+        # (not a catchable error). Reject in/out < 2 here so the failure
+        # surfaces as a clean ValueError at construction. Analogous to the
+        # circulant power-of-2 guard above. (bd gru-triton-ehf, Phase 6.)
+        if in_features < 2 or out_features < 2:
+            raise ValueError(
+                f"butterfly requires in/out >= 2 (a size-1 butterfly "
+                f"factorization has 0 stages and is undefined); "
+                f"got in={in_features}, out={out_features}"
+            )
         # The Butterfly module zero-pads internally to the next pow-of-2,
         # so we don't strictly need pow-of-2 here, but warn-by-error if
         # the padding would more than double the effective size — that's
