@@ -54,9 +54,6 @@ class StructureConfig:
     init: str = "randn"
 
 
-_NEEDS_TORCH_STRUCTURED = {"monarch", "circulant", "butterfly", "ldr"}
-
-
 def _import_torch_structured() -> Any:
     """Soft-import torch_structured. Raises a clear error on missing dep."""
     try:
