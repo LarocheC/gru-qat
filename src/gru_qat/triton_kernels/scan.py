@@ -227,12 +227,20 @@ def gru_scan_forward_persistent(
     Constraint: ``cdiv(B, block_b) * cdiv(H, block_oh) <= num_SMs`` —
     otherwise the spin-wait barrier deadlocks. Wrapper raises if exceeded.
     """
-    assert gi.is_cuda
+    if not gi.is_cuda:
+        raise ValueError(f"gi must be a CUDA tensor; got device={gi.device}")
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -657,11 +665,24 @@ def gru_scan_backward_persistent(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
-    assert out.shape == (T, B, H)
-    assert dout.shape == (T, B, H)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
+    if out.shape != (T, B, H):
+        raise ValueError(
+            f"out shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(out.shape)}"
+        )
+    if dout.shape != (T, B, H):
+        raise ValueError(
+            f"dout shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(dout.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -1346,11 +1367,24 @@ def gru_scan_backward_triton(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
-    assert out.shape == (T, B, H)
-    assert dout.shape == (T, B, H)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
+    if out.shape != (T, B, H):
+        raise ValueError(
+            f"out shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(out.shape)}"
+        )
+    if dout.shape != (T, B, H):
+        raise ValueError(
+            f"dout shape must be (T, B, H)=({T}, {B}, {H}); got {tuple(dout.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -1658,13 +1692,26 @@ def gru_scan_forward(
     Returns:
         out:    [T, B, H]   hidden state at each timestep
     """
-    assert gi.is_cuda and h0.is_cuda and Wh_cat.is_cuda and bh_cat.is_cuda
-    assert gi.dtype == torch.float32, "Phase 1 fp32 only"
+    if not (gi.is_cuda and h0.is_cuda and Wh_cat.is_cuda and bh_cat.is_cuda):
+        raise ValueError(
+            "gi, h0, Wh_cat, bh_cat must all be CUDA tensors; got devices "
+            f"gi={gi.device}, h0={h0.device}, Wh_cat={Wh_cat.device}, "
+            f"bh_cat={bh_cat.device}"
+        )
+    if gi.dtype != torch.float32:
+        raise ValueError(f"gi dtype must be float32 (Phase 1 fp32 only); got {gi.dtype}")
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
-    assert Wh_cat.shape == (3 * H, H)
-    assert bh_cat.shape == (3 * H,)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
+    if Wh_cat.shape != (3 * H, H):
+        raise ValueError(
+            f"Wh_cat shape must be (3H, H)=({3 * H}, {H}); got {tuple(Wh_cat.shape)}"
+        )
+    if bh_cat.shape != (3 * H,):
+        raise ValueError(
+            f"bh_cat shape must be (3H,)=({3 * H},); got {tuple(bh_cat.shape)}"
+        )
 
     # Make sure inputs are contiguous in their last dim — strides below assume
     # last-dim stride = 1.

@@ -227,10 +227,17 @@ def gru_scan_diagonal_forward_triton(
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Triton forward for the diagonal hidden-side scan."""
-    assert gi.is_cuda and Wh_diag.is_cuda
+    if not (gi.is_cuda and Wh_diag.is_cuda):
+        raise ValueError(
+            "gi and Wh_diag must be CUDA tensors; got devices "
+            f"gi={gi.device}, Wh_diag={Wh_diag.device}"
+        )
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert Wh_diag.shape == (3, H)
+    if Wh_diag.shape != (3, H):
+        raise ValueError(
+            f"Wh_diag shape must be (3, H)=(3, {H}); got {tuple(Wh_diag.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -488,7 +495,10 @@ def gru_scan_diagonal_backward_triton(
     """Triton backward for the diagonal hidden-side scan."""
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert Wh_diag.shape == (3, H)
+    if Wh_diag.shape != (3, H):
+        raise ValueError(
+            f"Wh_diag shape must be (3, H)=(3, {H}); got {tuple(Wh_diag.shape)}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()

@@ -383,20 +383,34 @@ def gru_scan_butterfly_forward_triton(
     Returns:
         out: [T, B, H]
     """
-    assert gi.is_cuda
+    if not gi.is_cuda:
+        raise ValueError(f"gi must be a CUDA tensor; got device={gi.device}")
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert h0.shape == (B, H)
+    if h0.shape != (B, H):
+        raise ValueError(f"h0 shape must be (B, H)=({B}, {H}); got {tuple(h0.shape)}")
     # H itself may be non-pow2; the butterfly multiply runs on H_PAD =
     # next_pow_2(H). torch_structured.Butterfly already sizes its
     # twiddles at the padded shape internally. NBLOCKS is the number of
     # stacked butterfly chains (torch_structured's `nblocks` argument).
     n_gates, nblocks, log_n_t, n_div_2_t, two1, two2 = twiddles.shape
-    assert n_gates == 3 and two1 == 2 and two2 == 2
+    if not (n_gates == 3 and two1 == 2 and two2 == 2):
+        raise ValueError(
+            f"twiddles shape must be (3, nblocks, log_H, H//2, 2, 2); got "
+            f"{tuple(twiddles.shape)}"
+        )
     H_PAD = n_div_2_t * 2
     log_H_pad = log_n_t
-    assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
-    assert 1 << log_H_pad == H_PAD
+    if not (H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0):
+        raise ValueError(
+            f"twiddles imply H_PAD={H_PAD}, which must be >= H={H} and a power "
+            f"of two (shape {tuple(twiddles.shape)})"
+        )
+    if 1 << log_H_pad != H_PAD:
+        raise ValueError(
+            f"twiddles log_H={log_H_pad} inconsistent with H_PAD={H_PAD}: "
+            f"expected 1 << log_H == H_PAD (shape {tuple(twiddles.shape)})"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -971,10 +985,22 @@ def gru_scan_butterfly_backward_triton(
     # internally. Twiddle is already at H_PAD via torch_structured.
     # NBLOCKS is the stacked-butterfly count from torch_structured.
     n_gates, nblocks, log_H_pad, n_div_2_t, two1, two2 = twiddles.shape
-    assert n_gates == 3 and two1 == 2 and two2 == 2
+    if not (n_gates == 3 and two1 == 2 and two2 == 2):
+        raise ValueError(
+            f"twiddles shape must be (3, nblocks, log_H, H//2, 2, 2); got "
+            f"{tuple(twiddles.shape)}"
+        )
     H_PAD = n_div_2_t * 2
-    assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
-    assert 1 << log_H_pad == H_PAD
+    if not (H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0):
+        raise ValueError(
+            f"twiddles imply H_PAD={H_PAD}, which must be >= H={H} and a power "
+            f"of two (shape {tuple(twiddles.shape)})"
+        )
+    if 1 << log_H_pad != H_PAD:
+        raise ValueError(
+            f"twiddles log_H={log_H_pad} inconsistent with H_PAD={H_PAD}: "
+            f"expected 1 << log_H == H_PAD (shape {tuple(twiddles.shape)})"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()

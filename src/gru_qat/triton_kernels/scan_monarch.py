@@ -321,12 +321,25 @@ def gru_scan_monarch_forward_triton(
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Triton forward for the Monarch hidden-side scan."""
-    assert gi.is_cuda and Wh_struct.is_cuda
+    if not (gi.is_cuda and Wh_struct.is_cuda):
+        raise ValueError(
+            "gi and Wh_struct must be CUDA tensors; got devices "
+            f"gi={gi.device}, Wh_struct={Wh_struct.device}"
+        )
     T, B, three_H = gi.shape
     H = three_H // 3
     n_gates, nblocks, out_blksz, in_blksz = Wh_struct.shape
-    assert n_gates == 3
-    assert out_blksz == in_blksz == H // nblocks
+    if n_gates != 3:
+        raise ValueError(
+            f"Wh_struct dim 0 (n_gates) must be 3; got {n_gates} "
+            f"(shape {tuple(Wh_struct.shape)})"
+        )
+    if not (out_blksz == in_blksz == H // nblocks):
+        raise ValueError(
+            f"Wh_struct block dims must be square and tile H: expected "
+            f"out_blksz == in_blksz == H // nblocks == {H // nblocks}; got "
+            f"out_blksz={out_blksz}, in_blksz={in_blksz}, H={H}, nblocks={nblocks}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -769,7 +782,17 @@ def gru_scan_monarch_backward_triton(
     T, B, three_H = gi.shape
     H = three_H // 3
     n_gates, nblocks, out_blksz, in_blksz = Wh_struct.shape
-    assert n_gates == 3 and out_blksz == in_blksz == H // nblocks
+    if n_gates != 3:
+        raise ValueError(
+            f"Wh_struct dim 0 (n_gates) must be 3; got {n_gates} "
+            f"(shape {tuple(Wh_struct.shape)})"
+        )
+    if not (out_blksz == in_blksz == H // nblocks):
+        raise ValueError(
+            f"Wh_struct block dims must be square and tile H: expected "
+            f"out_blksz == in_blksz == H // nblocks == {H // nblocks}; got "
+            f"out_blksz={out_blksz}, in_blksz={in_blksz}, H={H}, nblocks={nblocks}"
+        )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
