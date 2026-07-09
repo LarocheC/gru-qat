@@ -11,10 +11,11 @@ hidden weights and a multi-step persistent Triton kernel.
   touching the cell code. Reference path is pure PyTorch; accelerated
   path is Triton.
 - **Plus**: hidden weights can be parameterized as Diagonal (one
-  vector per gate), Monarch (block-diagonal), Butterfly (`O(H log H)`
-  twiddle), Circulant, or LDR (low-displacement rank) structured
-  matrices, with matching Triton kernels for Diagonal, Monarch and
-  Butterfly.
+  vector per gate), Blockdiag (single block-diagonal factor), Monarch
+  (genuine two-factor: block-diagonal × permutation × block-diagonal),
+  Butterfly (`O(H log H)` twiddle), Circulant, or LDR (low-displacement
+  rank) structured matrices, with matching Triton kernels for Diagonal,
+  Blockdiag, Monarch and Butterfly.
 
 ## Read first
 
@@ -73,7 +74,7 @@ gi = layer.cell.input_projection(x, w)
 out = gru_scan_persistent(gi, h0, w.Wh_cat, w.bh_cat)
 ```
 
-### Structured hidden weights with Triton (Monarch — fastest)
+### Structured hidden weights with Triton (Blockdiag — fastest)
 
 ```python
 from gru_qat import GRULayer, QuantRecipe, QuantizerConfig, StructureConfig
@@ -86,9 +87,14 @@ layer = GRULayer(
         hidden=QuantizerConfig(bits=8, name="h_q"),       # int8 hidden quant
     ),
     gate_layout="fused",
-    structure_hidden=StructureConfig(kind="monarch", nblocks=8),
-    use_triton="auto",   # routes through the persistent monarch kernel
+    structure_hidden=StructureConfig(kind="blockdiag", nblocks=8),
+    use_triton="auto",   # routes through the persistent blockdiag kernel
 ).cuda()
+
+# kind="monarch" is the genuine two-factor Monarch (full cross-channel
+# mixing); it has its own fused Triton kernel and is fast-dispatch-eligible
+# when blksz = H/nblocks is a power of two >= 16 (else it falls back to the
+# per-step reference path).
 
 # QAT flow:
 for x in train_loader:
@@ -150,9 +156,10 @@ paths are feature-complete:
 | Fake-quant insertion in cell (all 6 weight + 3 activation points) | ✓ |
 | `GRULayer` with calibration → freeze flow | ✓ |
 | Triton multi-step persistent kernel (dense, fp32, fp32 + frozen int8 QAT) | ✓ |
-| Structured hidden weights (Diagonal / Monarch / Butterfly / Circulant / LDR) | ✓ |
+| Structured hidden weights (Diagonal / Blockdiag / Monarch / Butterfly / Circulant / LDR) | ✓ |
 | Triton persistent kernel for Diagonal (fp32 + QAT) | ✓ |
-| Triton persistent kernel for Monarch (fp32 + QAT) | ✓ |
+| Triton persistent kernel for Blockdiag (fp32 + QAT) | ✓ |
+| Triton fused fwd+bwd kernels for two-factor Monarch (fp32 + QAT) | ✓ |
 | Triton persistent kernel for Butterfly (fp32 + QAT) | ✓ |
 
 The suite spans parity, QAT, calibration, structured-matrix, and
@@ -167,8 +174,8 @@ or `pytest -m "not slow"` to skip the long-T parity sweeps.
 | cuDNN `nn.GRU` (dense, no quant) | 4.4 | 1.0× |
 | `GRULayer` dense + `torch.compile` | 38.7 | 8.8× |
 | dense Triton persistent | 8.8 | 1.9× |
-| **Monarch persistent (nblocks=4)** | **5.8** | **1.3×** |
-| **Monarch persistent (nblocks=8)** | **2.0** | **0.45× (2.2× faster)** |
+| **Blockdiag persistent (nblocks=4)** | **5.8** | **1.3×** |
+| **Blockdiag persistent (nblocks=8)** | **2.0** | **0.45× (2.2× faster)** |
 | Butterfly persistent | 20.3 | 4.6× |
 | **Diagonal persistent** | **~1.1** | **~0.25× (4× faster)** |
 
@@ -188,10 +195,10 @@ per-parameter `dWh` / twiddle / `b_h*` rel diff.
 |---|---|---|---|---|---|
 | Dense Triton persistent | fp32 | 4e-4 | 4e-4 | 8e-4 | 1e-3 |
 | Dense Triton persistent | int8 QAT (hidden) | 8% | 7% | 9% | — |
-| Monarch persistent, nb=4 | fp32 | 3e-4 | 5e-4 | 7e-4 | 2e-3 |
-| Monarch persistent, nb=4 | int8 QAT (hidden) | 8% | 7% | 6% | 3% |
-| Monarch persistent, nb=8 | fp32 | 2e-4 | 4e-4 | 6e-4 | 2e-3 |
-| Monarch persistent, nb=8 | int8 QAT (hidden) | 8% | 5% | 8% | 3% |
+| Blockdiag persistent, nb=4 | fp32 | 3e-4 | 5e-4 | 7e-4 | 2e-3 |
+| Blockdiag persistent, nb=4 | int8 QAT (hidden) | 8% | 7% | 6% | 3% |
+| Blockdiag persistent, nb=8 | fp32 | 2e-4 | 4e-4 | 6e-4 | 2e-3 |
+| Blockdiag persistent, nb=8 | int8 QAT (hidden) | 8% | 5% | 8% | 3% |
 | Butterfly persistent | fp32 | 3e-2 | 3e-3 | 1e-3 | 2e-3 |
 | Butterfly persistent | int8 QAT (hidden) | 15% | 15% | 1% | 8% |
 | **Diagonal persistent** | **fp32** | **1e-6** | **4e-5** | **2e-7** | **2e-6** |
@@ -229,7 +236,8 @@ src/gru_qat/
   triton_kernels/
     scan.py               dense persistent fwd+bwd kernels
     scan_diagonal.py      Diagonal persistent fwd+bwd kernels
-    scan_monarch.py       Monarch persistent fwd+bwd kernels
+    scan_blockdiag.py     Blockdiag persistent fwd+bwd kernels
+    scan_monarch.py       Two-factor Monarch fused fwd+bwd kernels
     scan_butterfly.py     Butterfly persistent fwd+bwd kernels
 ```
 

@@ -54,15 +54,15 @@ def _load_strict_helpers() -> dict[str, object]:
     """
     scan = importlib.import_module("test_triton_scan_strict")
     diag = importlib.import_module("test_triton_diagonal_strict")
-    mono = importlib.import_module("test_triton_monarch_strict")
+    mono = importlib.import_module("test_triton_blockdiag_strict")
     butt = importlib.import_module("test_triton_butterfly_strict")
     return {
         "_assert_quant_parity": scan._assert_quant_parity,
         "_adversarial_inputs": scan._adversarial_inputs,
         "_make_dense_layer_quant_int8": scan._make_dense_layer_quant_int8,
         "_make_diagonal_layer_quant_int8": diag._make_diagonal_layer_quant_int8,
-        "_make_monarch_layer_quant_int8": mono._make_monarch_layer_quant_int8,
-        "_skip_if_monarch_bwd_hw_limit": mono._skip_if_monarch_bwd_hw_limit,
+        "_make_blockdiag_layer_quant_int8": mono._make_blockdiag_layer_quant_int8,
+        "_skip_if_blockdiag_bwd_hw_limit": mono._skip_if_blockdiag_bwd_hw_limit,
         "_make_butterfly_layer_quant_int8": butt._make_butterfly_layer_quant_int8,
     }
 
@@ -84,7 +84,7 @@ def _make_fastpath_qat_layer(
 
     The default ``_make_qat_layer`` returns a dense layer that is NOT in the
     fast-dispatch eligibility set (``src/gru_qat/gru_layer.py:100-104``
-    requires ``structure_hidden.kind ∈ {diagonal, monarch, butterfly}``).
+    requires ``structure_hidden.kind ∈ {diagonal, blockdiag, butterfly}``).
     CAL-01 and the bypass anti-pattern test need a layer where
     ``use_triton=True`` is meaningful, so they construct via this helper.
     Diagonal is the cheapest Triton-eligible kind (no ``torch-structured``
@@ -218,7 +218,7 @@ def test_calibrate_truncates_to_n_batches() -> None:
 # ===========================================================================
 #
 # Tests below verify the calibrate → freeze → deploy lifecycle on
-# Triton-eligible layers (diagonal / monarch / butterfly) and on the dense
+# Triton-eligible layers (diagonal / blockdiag / butterfly) and on the dense
 # pre_batch_input path. CAL-01 + CAL-03 + anti-pattern are CUDA-only because
 # the fast-dispatch wrapper that they audit (`GRULayer.calibrate`, lines
 # 268-302 of `src/gru_qat/gru_layer.py`) is only exercised when
@@ -251,7 +251,7 @@ def test_calibrate_uses_per_step_path() -> None:
 
     Built on a Triton-eligible (diagonal hidden) layer because dense
     layers are not in the fast-dispatch eligibility set
-    (``src/gru_qat/gru_layer.py:100-104``) — only diagonal, monarch and
+    (``src/gru_qat/gru_layer.py:100-104``) — only diagonal, blockdiag and
     butterfly satisfy ``self._fast_dispatch_eligible``. Diagonal is
     chosen because it has no ``torch-structured`` dependency.
     """
@@ -564,9 +564,9 @@ _CAL03_PARAMS = [
     # (kernel, T, B, H, nblocks_or_none)
     ("dense", 8, 4, 64, None),
     ("diagonal", 8, 4, 64, None),
-    # blksz = H // nblocks = 16 → outside _skip_if_monarch_bwd_hw_limit's
+    # blksz = H // nblocks = 16 → outside _skip_if_blockdiag_bwd_hw_limit's
     # skip range (CAL-03 is fwd-only, but the shape is sound for parity).
-    ("monarch", 8, 4, 64, 4),
+    ("blockdiag", 8, 4, 64, 4),
     # H=32 because butterfly requires power-of-2 hidden dim; tests/test_
     # triton_butterfly_strict.py uses the same H values (32/128/512).
     ("butterfly", 8, 4, 32, None),
@@ -578,7 +578,7 @@ _CAL03_CLASSES = ["realistic", "near-saturation", "large-magnitude"]
 # `torch.equal` bit-identity contract — reference and Triton TF32-tiled tl.dot
 # land on different INT8 rounding boundaries (residual = exactly 1×h_scale).
 # This is the same accepted TF32 divergence the strict-file dense quant cases
-# carry; mark the 3 dense cases per-parametrize-case so the diagonal / monarch
+# carry; mark the 3 dense cases per-parametrize-case so the diagonal / blockdiag
 # / butterfly CAL-03 cases stay in the `pytest -q -m "not divergence"` gate.
 _CAL03_DIVERGENCE_KERNELS = {"dense"}  # gru-triton-n20 re-baseline (D-07)
 
@@ -606,7 +606,7 @@ def test_triton_matches_reference_after_freeze(
     kernels and all 3 D-46 adversarial classes.
 
     Builds a frozen-INT8 layer per kernel using the Phase 4 strict-file
-    factories (``_make_{dense,diagonal,monarch,butterfly}_layer_quant_int8``)
+    factories (``_make_{dense,diagonal,blockdiag,butterfly}_layer_quant_int8``)
     which already perform the inline ``calibrate → freeze_quantizers``
     pattern Phase 5 audits. Then on a held-out batch from each D-46
     adversarial class, asserts the Triton (fast dispatch) output matches
@@ -622,7 +622,7 @@ def test_triton_matches_reference_after_freeze(
     | dense     | all                            | torch.equal      |
     | diagonal  | realistic / near-saturation    | torch.equal      |
     | diagonal  | large-magnitude                | h_scale_mult=2.0 |
-    | monarch   | all                            | h_scale_mult=4.0 |
+    | blockdiag   | all                            | h_scale_mult=4.0 |
     | butterfly | realistic                      | h_scale_mult=50  |
     | butterfly | near-saturation / large-magn.  | h_scale_mult=100 |
     +-----------+--------------------------------+------------------+
@@ -634,7 +634,7 @@ def test_triton_matches_reference_after_freeze(
     bd issue references on the loosened-bound call sites (per CONTEXT
     Decision B's "Every call site that overrides h_scale_mult must
     reference the bd issue"): see inline comments — gru-triton-fpl
-    (diagonal large-mag), gru-triton-in0 (monarch all), gru-triton-lqk
+    (diagonal large-mag), gru-triton-in0 (blockdiag all), gru-triton-lqk
     (butterfly all).
     """
     pytest.importorskip("triton")
@@ -736,51 +736,51 @@ def test_triton_matches_reference_after_freeze(
                 f"diag h_T[cls={cls}]", ref_hT, tri_hT, h_scale, strict=True
             )
 
-    elif kernel == "monarch":
-        # Monarch: low-level kernel-pair round-trip (mirrors strict-file
-        # test_monarch_quant_fwd at lines 554-612). Same rationale as
+    elif kernel == "blockdiag":
+        # Blockdiag: low-level kernel-pair round-trip (mirrors strict-file
+        # test_blockdiag_quant_fwd at lines 554-612). Same rationale as
         # diagonal — the per-step structured path goes through
         # quant_struct_Wh_* which has the known-broken per-channel
         # min_max observer; the kernel-pair pattern isolates the Triton
         # kernel from that wiring.
         import torch.nn.functional as F
-        from gru_qat.triton_kernels.scan_monarch import (
-            extract_monarch_factors,
-            gru_scan_monarch_forward_pytorch,
-            gru_scan_monarch_forward_triton,
+        from gru_qat.triton_kernels.scan_blockdiag import (
+            extract_blockdiag_factors,
+            gru_scan_blockdiag_forward_pytorch,
+            gru_scan_blockdiag_forward_triton,
         )
         assert nblocks is not None
-        layer = helpers["_make_monarch_layer_quant_int8"](
+        layer = helpers["_make_blockdiag_layer_quant_int8"](
             IN, H, nblocks=nblocks
         ).to(device).eval()
         x, h0 = _adversarial_inputs(cls, T, B, IN, device)
         with torch.no_grad():
-            Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+            Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
             Wi_cat, bi_cat = layer.cell.quantize_input_weights()
             xq = layer.cell.quant_x(x)
             gi = F.linear(xq, Wi_cat, bi_cat)
             h_scale = float(layer.cell.quant_h_in.scale.item())
             h_in_q = (h_scale, -127, 127)
             h_out_q = (h_scale, -127, 127)
-            ref_out = gru_scan_monarch_forward_pytorch(
+            ref_out = gru_scan_blockdiag_forward_pytorch(
                 gi, h0, Wh_struct, bh_cat,
                 h_in_quant=h_in_q, h_out_quant=h_out_q,
             )
-            tri_out = gru_scan_monarch_forward_triton(
+            tri_out = gru_scan_blockdiag_forward_triton(
                 gi, h0, Wh_struct, bh_cat,
                 h_in_quant=h_in_q, h_out_quant=h_out_q,
             )
             ref_hT = ref_out[-1]
             tri_hT = tri_out[-1]
-        # F-04-VERIFIER-A (bd gru-triton-in0): monarch fwd all classes require
+        # F-04-VERIFIER-A (bd gru-triton-in0): blockdiag fwd all classes require
         # h_scale_mult=4.0 (04-DISPOSITION line 41). TF32 reduction-order
         # non-associativity in tile-by-tile tl.dot vs reference einsum.
         _assert_quant_parity(
-            f"monarch out[cls={cls}]", ref_out, tri_out, h_scale,
+            f"blockdiag out[cls={cls}]", ref_out, tri_out, h_scale,
             strict=False, h_scale_mult=4.0,
         )
         _assert_quant_parity(
-            f"monarch h_T[cls={cls}]", ref_hT, tri_hT, h_scale,
+            f"blockdiag h_T[cls={cls}]", ref_hT, tri_hT, h_scale,
             strict=False, h_scale_mult=4.0,
         )
 

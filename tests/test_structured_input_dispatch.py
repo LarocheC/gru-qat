@@ -5,7 +5,7 @@ hoisted out of the recurrence regardless of how the input weight is
 parameterized. This file verifies that a *structured* input weight no longer
 disables the Triton hidden kernel: the layer hoists the structured input
 projection to a batched GEMM (``cell.structured_input_projection``), feeds the
-resulting dense ``gi: [T, B, 3H]`` into the existing monarch/diagonal kernel,
+resulting dense ``gi: [T, B, 3H]`` into the existing blockdiag/diagonal kernel,
 and matches the per-step ``step_structured`` reference.
 
 Gates the feature added in bd gru-triton (structured-input/Triton-hidden fusion).
@@ -45,8 +45,8 @@ def test_structured_input_is_fast_dispatch_eligible() -> None:
     gate layout is fused. (Construction-only — runs without CUDA.)"""
     layer = GRULayer(
         32, 32, recipe=_fp32_recipe(), gate_layout="fused",
-        structure_input=StructureConfig(kind="monarch", nblocks=4),
-        structure_hidden=StructureConfig(kind="monarch", nblocks=4),
+        structure_input=StructureConfig(kind="blockdiag", nblocks=4),
+        structure_hidden=StructureConfig(kind="blockdiag", nblocks=4),
         use_triton="auto",
     )
     assert layer._fast_dispatch_eligible is True
@@ -61,8 +61,8 @@ def test_structured_input_is_fast_dispatch_eligible() -> None:
 
 
 @cuda_only
-@pytest.mark.parametrize("input_kind", ["monarch", "butterfly", "diagonal"])
-@pytest.mark.parametrize("hidden_kind", ["diagonal", "monarch"])
+@pytest.mark.parametrize("input_kind", ["blockdiag", "butterfly", "diagonal"])
+@pytest.mark.parametrize("hidden_kind", ["diagonal", "blockdiag"])
 @pytest.mark.parametrize("T,B,H", [(8, 4, 32), (16, 8, 64)])
 def test_structured_input_triton_matches_per_step_reference(
     input_kind: str, hidden_kind: str, T: int, B: int, H: int
@@ -74,25 +74,25 @@ def test_structured_input_triton_matches_per_step_reference(
     The input projection is identical fp32 in both paths (batched vs
     per-step row-wise matmul), so the only difference is the hidden
     recurrence: kernel vs PyTorch. Tolerances follow the documented
-    per-kernel parity (diagonal ~machine eps, monarch ~TF32 tl.dot)."""
+    per-kernel parity (diagonal ~machine eps, blockdiag ~TF32 tl.dot)."""
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
 
-    # The monarch backward kernel needs blksz = H/nblocks >= 16 (tl.dot's
+    # The blockdiag backward kernel needs blksz = H/nblocks >= 16 (tl.dot's
     # K >= 16 constraint) — on RTX 2000 Ada blksz=8 (H=32, nb=4) OOMs / fails
-    # to compile. The strict monarch suite skips the same configs (gru-triton-e0l).
-    if hidden_kind == "monarch" and (H // 4) < 16:
-        pytest.skip("monarch bwd kernel requires blksz>=16 on this GPU (gru-triton-e0l)")
+    # to compile. The strict blockdiag suite skips the same configs (gru-triton-e0l).
+    if hidden_kind == "blockdiag" and (H // 4) < 16:
+        pytest.skip("blockdiag bwd kernel requires blksz>=16 on this GPU (gru-triton-e0l)")
 
     in_cfg = (
-        StructureConfig(kind="monarch", nblocks=4)
-        if input_kind == "monarch"
+        StructureConfig(kind="blockdiag", nblocks=4)
+        if input_kind == "blockdiag"
         else StructureConfig(kind=input_kind)
     )
     hid_cfg = (
-        StructureConfig(kind="monarch", nblocks=4)
-        if hidden_kind == "monarch"
+        StructureConfig(kind="blockdiag", nblocks=4)
+        if hidden_kind == "blockdiag"
         else StructureConfig(kind="diagonal")
     )
 
@@ -132,7 +132,7 @@ def test_structured_input_triton_matches_per_step_reference(
 
 @cuda_only
 def test_structured_input_qat_after_calibration_runs() -> None:
-    """End-to-end QAT smoke: structured input + monarch hidden, int8 hidden
+    """End-to-end QAT smoke: structured input + blockdiag hidden, int8 hidden
     quant, calibrate -> freeze -> forward through the Triton path."""
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("high")
@@ -146,8 +146,8 @@ def test_structured_input_qat_after_calibration_runs() -> None:
     )
     layer = GRULayer(
         H, H, recipe=rec, gate_layout="fused",
-        structure_input=StructureConfig(kind="monarch", nblocks=4),
-        structure_hidden=StructureConfig(kind="monarch", nblocks=4),
+        structure_input=StructureConfig(kind="blockdiag", nblocks=4),
+        structure_hidden=StructureConfig(kind="blockdiag", nblocks=4),
         use_triton=True,
     ).to(device)
 

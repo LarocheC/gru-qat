@@ -6,7 +6,7 @@ the smallest possible structured parameterization: ``3H`` weight scalars
 on the hidden side total, ``O(H)`` FLOPs per timestep per gate.
 
 Two consequences of the diagonal shape simplify the kernel vs.
-``scan_monarch``:
+``scan_blockdiag``:
 
 1. No matmul on the hidden side → no K-reduction → no cross-program
    reduction within a timestep. Each ``(pid_b, pid_h)`` program owns its
@@ -692,7 +692,7 @@ def gru_scan_diagonal(
 ) -> torch.Tensor:
     """Public API: differentiable diagonal-hidden-side GRU scan.
 
-    Mirror of ``gru_scan_persistent`` and ``gru_scan_monarch`` with a
+    Mirror of ``gru_scan_persistent`` and ``gru_scan_blockdiag`` with a
     diagonal hidden-side weight (one vector per gate).
 
     Args:

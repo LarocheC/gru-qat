@@ -1,6 +1,6 @@
 [project]
 name = "gru-qat"
-version = "0.2.0"
+version = "0.4.0"
 description = "Pluggable QAT and quantized inference for GRU, with structured-matrix hidden weights and persistent Triton kernels"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,10 +44,13 @@ Issues = "https://github.com/LarocheC/gru-qat/issues"
 
 [project.optional-dependencies]
 triton = ["triton>=2.2"]
-# Structured-matrix support (Monarch / Butterfly / LDR). torch-structured is
-# on PyPI as of 1.2.1; structure.py imports it lazily, so dense-only usage
-# (kind="dense") and the diagonal/circulant kinds work without this extra.
-structured = ["torch-structured>=1.2.1"]
+# Structured-matrix support (Blockdiag / Monarch / Butterfly / LDR).
+# structure.py imports it lazily, so dense-only usage (kind="dense") and the
+# diagonal/circulant kinds work without this extra. Pinned >=1.3.0 because
+# kind="monarch" now maps to the genuine two-factor MonarchLinear, first
+# exposed in torch-structured 1.3.0 (the naming inversion where the single
+# block-diagonal factor moved to kind="blockdiag").
+structured = ["torch-structured>=1.3.0"]
 dev = [
     "pytest>=7",
     "pytest-xdist>=3",

@@ -27,18 +27,24 @@ src/gru_qat/
   quantizers.py           FakeQuantize base + per-tensor / per-channel / per-group
   calibration.py          calibrate(module, loader, n_batches), freeze_all
   structure.py            StructureConfig + make_structured_linear
-                          (Diagonal, Monarch, Circulant, Butterfly, LDR)
+                          (Diagonal, Blockdiag, Monarch, Circulant, Butterfly, LDR)
   gru_cell.py             GRUCellQuant — single step. Optionally structured
                           (structure_input / structure_hidden).
   gru_layer.py            GRULayer — multi-step. Triton dispatch via use_triton.
   triton_kernels/
     __init__.py           Phase 5 design notes
-    scan.py               Dense persistent fwd+bwd kernels (Monarch tier 2 sibling).
+    scan.py               Dense persistent fwd+bwd kernels (Blockdiag tier 2 sibling).
                           Autotune over BLOCK_B/OH/K. In-kernel fake-quant for QAT.
     scan_diagonal.py      Diagonal persistent fwd+bwd. Elementwise w_h*h per gate;
                           no matmul, no cross-CTA barrier. In-kernel fake-quant.
-    scan_monarch.py       Monarch persistent fwd+bwd. nblocks block-diagonal matmuls
-                          per timestep. In-kernel fake-quant for QAT.
+    scan_blockdiag.py     Blockdiag persistent fwd+bwd. nblocks block-diagonal matmuls
+                          per timestep. In-kernel fake-quant for QAT. Backs
+                          kind="blockdiag".
+    scan_monarch.py       Two-factor Monarch fused fwd+bwd (two block-diagonal
+                          matmuls + transpose-permute per gate/step via a scratch
+                          round-trip; hand-derived reverse-time backward with
+                          atomic weight-grad accumulation). In-kernel fake-quant.
+                          Backs kind="monarch".
     scan_butterfly.py     Butterfly persistent fwd+bwd. log_H stages of strided
                           2x2 mixing. In-kernel fake-quant for QAT.
 
@@ -52,7 +58,7 @@ tests/
                                  gradient flow, training, int8 QAT
   test_triton_scan.py            Dense Triton fwd+bwd + persistent + QAT
   test_triton_diagonal.py        Diagonal Triton fwd+bwd + QAT + GRULayer dispatch
-  test_triton_monarch.py         Monarch Triton fwd+bwd + QAT + GRULayer dispatch
+  test_triton_blockdiag.py       Blockdiag Triton fwd+bwd + QAT + GRULayer dispatch
   test_butterfly_dispatch.py     Butterfly Triton fwd+bwd + QAT + GRULayer dispatch
 
 bench/
@@ -110,7 +116,10 @@ needed.
   - Structured: `cell.step_structured(x_t, h)`.
   - Triton fast path: `_forward_fast_dispatch` when `use_triton=True`.
     Eligible when `gate_layout="fused"` and the hidden kind is
-    `diagonal`/`monarch`/`butterfly`. The input side may be **dense or
+    `diagonal`/`blockdiag`/`butterfly`/`monarch`. (Two-factor `monarch` is
+    eligible only when `blksz = H/nblocks` is a power of two >= 16 — the
+    fused kernel's `tl.dot` constraint — else it runs the reference path.)
+    The input side may be **dense or
     structured**: the input projection `W_i·x` is invariant across
     timesteps, so it's hoisted to a single batched GEMM (dense via
     `quantize_input_weights`, structured via
@@ -134,7 +143,8 @@ half across all T timesteps):
 |---|---|---|---|
 | `scan.py` (dense) | autotune + persistent | grid `(B_tile, OH_tile)` with spin-wait barrier | Both autotune (1D grid, no inter-CTA) and persistent (2D grid + barrier) variants. QAT support. |
 | `scan_diagonal.py` | persistent, no barrier | grid `(B_tile, H_tile)`, no cross-CTA sync | Elementwise hidden recurrence (no matmul) so each program owns its slab; `h` carries in registers. Smallest params, fastest variant. QAT support. |
-| `scan_monarch.py` | persistent | grid `(B_tile, block)` | One small `[blksz, blksz]` matmul per (block, gate). Best speed at typical training shapes. QAT support. |
+| `scan_blockdiag.py` | persistent | grid `(B_tile, block)` | One small `[blksz, blksz]` matmul per (block, gate). Best speed at typical training shapes. QAT support. Backs `kind="blockdiag"`. |
+| `scan_monarch.py` | non-persistent | grid `(B_tile,)`, intra-CTA barrier only | Two `[blksz, blksz]` matmuls per (block, gate) + a transpose-permute via a scratch round-trip → full cross-channel mixing. Program owns all H for its rows so the recurrence needs no cross-CTA barrier. QAT support. Hand-derived reverse-time backward (recompute + atomic weight-grad accumulation). Backs `kind="monarch"`. Parallelism = `ceil(B/BLOCK_B)`, so occupancy-bound at small B. |
 | `scan_butterfly.py` | persistent | grid `(B_tile,)` | log_H stages of strided 2×2 mixing per gate. No tensor-core utilization. QAT support. |
 
 **Cross-CTA barriers** use the release/acquire atomic_add pattern:
@@ -151,7 +161,7 @@ drift on `gru_scan_persistent` outputs. Fixed in the most recent
 commits.
 
 - Tests: `test_triton_scan.py`, `test_triton_diagonal.py`,
-  `test_triton_monarch.py`, `test_butterfly_dispatch.py`.
+  `test_triton_blockdiag.py`, `test_butterfly_dispatch.py`.
 
 ### Phase 5+ — structured-matrix hidden weights ✓
 
@@ -165,12 +175,13 @@ Extension to the phase-5 work, not part of the original plan:
   modules in place of dense weights. Per-gate output-side fake-quant
   replaces per-row weight quant. A structured *input* no longer disables
   the Triton path — its projection is hoisted batched (see Phase 4 fast
-  path) so a structured-input + monarch/diagonal-hidden layer still runs
+  path) so a structured-input + blockdiag/diagonal-hidden layer still runs
   through the kernel.
-- Triton kernels for Diagonal, Monarch and Butterfly (Circulant / LDR
-  fall back to the per-step PyTorch path).
+- Triton kernels for Diagonal, Blockdiag, Butterfly, and two-factor
+  Monarch (Circulant / LDR fall back to the per-step PyTorch path).
 - Tests: `test_structure.py`, `test_triton_diagonal.py`,
-  `test_triton_monarch.py`, `test_butterfly_dispatch.py`.
+  `test_triton_blockdiag.py`, `test_triton_monarch.py`,
+  `test_butterfly_dispatch.py`.
 
 ### Phase 6 — int activations and LUT nonlinearities
 
@@ -183,8 +194,8 @@ Not started. Out of scope for QAT; needed for embedded deployment.
 | cuDNN `nn.GRU` | 4.4 | 1.0× |
 | `GRULayer` dense + compile_step | 38.7 | 8.8× |
 | dense Triton persistent | 8.8 | 1.9× |
-| Monarch persistent, nblocks=4 | 5.8 | 1.3× |
-| Monarch persistent, nblocks=8 | 2.0 | **0.45× (2.2× faster than cuDNN)** |
+| Blockdiag persistent, nblocks=4 | 5.8 | 1.3× |
+| Blockdiag persistent, nblocks=8 | 2.0 | **0.45× (2.2× faster than cuDNN)** |
 | Butterfly persistent | 20.3 | 4.6× |
 | Butterfly per-step CUDA op (pre-Triton) | 107 | 24× |
 | Diagonal persistent | ~1.1 | **~0.25× (~4× faster than cuDNN)** |
@@ -196,8 +207,8 @@ Per-gate hidden parameter counts:
 | kind | params per gate at H=512 |
 |---|---|
 | dense | 262K |
-| Monarch nblocks=4 | 65K |
-| Monarch nblocks=8 | 32K |
+| Blockdiag nblocks=4 | 65K |
+| Blockdiag nblocks=8 | 32K |
 | Butterfly | 4.6K |
 | Diagonal | 512 |
 
@@ -219,7 +230,7 @@ No changes to `gru_cell.py` or `gru_layer.py`.
    `nn.Module`. Validate shape constraints in `_validate_shapes`.
 3. The PyTorch cell path picks it up automatically. For Triton speed,
    either write a new persistent kernel (`scan_<kind>.py`) following
-   the Monarch / Butterfly templates, or leave it as PyTorch-only.
+   the Blockdiag / Butterfly templates, or leave it as PyTorch-only.
 
 ### Switching from STE-round to a different gradient estimator
 

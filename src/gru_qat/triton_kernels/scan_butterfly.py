@@ -117,7 +117,7 @@ def gru_scan_butterfly(
 ) -> torch.Tensor:
     """Differentiable Butterfly-hidden-side GRU scan.
 
-    Mirror of ``gru_scan_monarch`` but the matmul per step goes through
+    Mirror of ``gru_scan_blockdiag`` but the matmul per step goes through
     ``torch_structured.Butterfly``'s CUDA op. No multi-step Triton fusion.
 
     Args:
@@ -127,7 +127,7 @@ def gru_scan_butterfly(
             modules, one per gate. Get from ``extract_butterfly_factors``.
         bh_cat:   [3*H]
         h_in_quant / h_out_quant: optional ``(scale, qmin, qmax)`` —
-            same semantics as ``gru_scan_monarch``.
+            same semantics as ``gru_scan_blockdiag``.
 
     Returns:
         out: [T, B, H]
@@ -1078,7 +1078,7 @@ def gru_scan_butterfly_backward_triton(
 class GRUScanButterflyTritonFunction(torch.autograd.Function):
     """autograd wrapper around the multi-step persistent Triton butterfly
     kernels. Optional in-kernel fake-quant on hidden state via the same
-    ``(scale, qmin, qmax)`` per-tensor symmetric scheme as Monarch.
+    ``(scale, qmin, qmax)`` per-tensor symmetric scheme as Blockdiag.
     """
 
     @staticmethod
@@ -1129,7 +1129,7 @@ def gru_scan_butterfly_triton(
         twiddles: [3, log_H, H/2, 2, 2]
         bh_cat:   [3*H]
         h_in_quant / h_out_quant: optional ``(scale, qmin, qmax)`` —
-            same semantics as ``gru_scan_monarch``.
+            same semantics as ``gru_scan_blockdiag``.
     """
     return cast(
         torch.Tensor,

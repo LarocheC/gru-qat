@@ -18,8 +18,8 @@ uv pip install -e ".[dev]"             # add pytest, mypy, ruff
 uv pip install git+https://github.com/LarocheC/torch-structured  # structured-matrix paths
 
 pytest -q                              # full suite (~100 tests)
-pytest tests/test_triton_monarch.py -q # one file
-pytest -k "monarch and qat" -q         # one test by name
+pytest tests/test_triton_blockdiag.py -q # one file
+pytest -k "blockdiag and qat" -q       # one test by name
 pytest -m "not slow" -q                # skip slow tests
 mypy                                   # strict, src/gru_qat only (see pyproject.toml)
 ruff check src tests
@@ -38,10 +38,10 @@ Single-direction, single-layer GRU written for QAT. cuDNN's GRU is a closed fuse
 `GRUCellQuant` (single step) → `GRULayer` (Python time loop) → `calibrate()` collects activation min/max → `freeze_all()` locks scales for inference. The reference path's job is to be slow, obvious, and correct — speed lives in Triton.
 
 **Fast path (Triton persistent kernels):**
-One kernel launch covers all T timesteps for fwd or bwd. `GRULayer._forward_fast_dispatch` picks dense / Monarch / Butterfly based on `structure_hidden`. Cross-CTA visibility uses the release/acquire `atomic_add(sem=...)` pattern — see the explicit warning in `DEVELOPMENT.md` about `cache_modifier=".cv"` not being a fence substitute.
+One kernel launch covers all T timesteps for fwd or bwd. `GRULayer._forward_fast_dispatch` picks dense / Blockdiag / Monarch / Butterfly based on `structure_hidden`. Cross-CTA visibility uses the release/acquire `atomic_add(sem=...)` pattern — see the explicit warning in `DEVELOPMENT.md` about `cache_modifier=".cv"` not being a fence substitute.
 
 **Structured hidden weights (Phase 5+):**
-`StructureConfig(kind=...)` swaps the H×H hidden GEMM for Monarch (block-diagonal), Butterfly (`O(H log H)`), Circulant, or LDR. Monarch and Butterfly have matching Triton kernels; Circulant/LDR fall back to the per-step PyTorch path. Depends on the external `torch-structured` library (lazy-imported in `structure.py`).
+`StructureConfig(kind=...)` swaps the H×H hidden GEMM for Blockdiag (single block-diagonal factor), Monarch (genuine two-factor: block-diagonal × permutation × block-diagonal), Butterfly (`O(H log H)`), Circulant, or LDR. Blockdiag, Butterfly, and Monarch have matching Triton kernels (Monarch: fused fwd + hand-derived reverse-time bwd, eligible when `H/nblocks` is a power of two ≥ 16); Circulant and LDR fall back to the per-step PyTorch path. Naming follows torch-structured ≥ 1.3.0 — the single block-diagonal factor this library historically called "monarch" is now `kind="blockdiag"`; `kind="monarch"` is the genuine two-factor construction. Depends on the external `torch-structured` library (lazy-imported in `structure.py`).
 
 **Quantizer design:**
 `FakeQuantize` is an `nn.Module` (holds observer / frozen-scale state). Granularity is parameterized by `(axis, group_size, symmetric, bits)`, not class hierarchy. Subclasses differ only in `_compute_scale_zp`. Gates default to `split` so each gate carries its own activation scale; `fused` layout is required for `pre_batch_input=True` and for several Triton paths.
@@ -190,8 +190,8 @@ bd close <id>         # Complete work
 
 ## Naming Patterns
 - `snake_case.py` throughout: `gru_cell.py`, `gru_layer.py`, `quantizers.py`, `ste.py`, `structure.py`, `calibration.py`.
-- Triton kernel modules live under `src/gru_qat/triton_kernels/` and use the prefix `scan` for the dense variant, then `scan_<kind>.py` for structured variants: `scan.py`, `scan_diagonal.py`, `scan_monarch.py`, `scan_butterfly.py`.
-- Tests mirror source modules one-to-one with the prefix `test_`: `test_ste.py`, `test_quantizers.py`, `test_parity.py`, `test_qat_smoke.py`, `test_calibration.py`, `test_structure.py`, `test_triton_scan.py`, `test_triton_diagonal.py`, `test_triton_monarch.py`, `test_butterfly_dispatch.py`.
+- Triton kernel modules live under `src/gru_qat/triton_kernels/` and use the prefix `scan` for the dense variant, then `scan_<kind>.py` for structured variants: `scan.py`, `scan_diagonal.py`, `scan_blockdiag.py`, `scan_monarch.py`, `scan_butterfly.py`.
+- Tests mirror source modules one-to-one with the prefix `test_`: `test_ste.py`, `test_quantizers.py`, `test_parity.py`, `test_qat_smoke.py`, `test_calibration.py`, `test_structure.py`, `test_triton_scan.py`, `test_triton_diagonal.py`, `test_triton_blockdiag.py`, `test_triton_monarch.py`, `test_butterfly_dispatch.py`.
 - Benches live in `bench/` and use the `bench_` prefix: `bench_layer.py`, `bench_triton_fwd.py`, `bench_triton_train.py`.
 - `snake_case` for top-level and methods: `make_quantizer`, `make_structured_linear`, `fake_quant_ste`, `extract_diagonal_factors`, `gru_scan_diagonal_forward_pytorch`.
 - Private/internal helpers prefixed with a single underscore: `_compute_scale_zp`, `_qrange`, `_scale_zp_from_min_max`, `_update_observer`, `_import_torch_structured`, `_validate_shapes`, `_forward_fast_dispatch`, `_extract_h_quant_params`.
@@ -202,13 +202,13 @@ bd close <id>         # Complete work
 - Weight tensor names follow PyTorch's `W_ir`, `W_iz`, `W_in`, `W_hr`, `W_hz`, `W_hn`; bias names follow `b_ir`, ..., `b_hn`.
 - Concatenated "fused" versions: `Wi_cat`, `Wh_cat`, `bi_cat`, `bh_cat` (`src/gru_qat/gru_cell.py:53`).
 - `PascalCase` for classes and dataclasses: `GRUCellQuant`, `GRULayer`, `FakeQuantize`, `FakeQuantizePerTensor`, `FakeQuantizePerChannel`, `FakeQuantizePerGroup`, `QuantizerConfig`, `QuantRecipe`, `StructureConfig`, `CellWeights`, `STERound`, `STEClamp`, `Identity`.
-- `typing.Literal` is used for closed string unions instead of `Enum`: `GateLayout = Literal["split", "fused"]` (`src/gru_qat/gru_cell.py:35`), `ObserverMode = Literal["dynamic", "min_max", "frozen"]` (`src/gru_qat/quantizers.py:37`), `StructuredKind = Literal["dense", "diagonal", "monarch", "circulant", "butterfly", "ldr"]` (`src/gru_qat/structure.py:31`).
+- `typing.Literal` is used for closed string unions instead of `Enum`: `GateLayout = Literal["split", "fused"]` (`src/gru_qat/gru_cell.py:35`), `ObserverMode = Literal["dynamic", "min_max", "frozen"]` (`src/gru_qat/quantizers.py:37`), `StructuredKind = Literal["dense", "diagonal", "blockdiag", "monarch", "circulant", "butterfly", "ldr"]` (`src/gru_qat/structure.py:31`).
 - `QuantizerFactory = Callable[[], FakeQuantize]` — type aliases use `PascalCase` and live next to the function that consumes them (`src/gru_qat/quantizers.py:233`).
 ## Code Style
 - `ruff` configured in `pyproject.toml`:
 - No explicit formatter (Black/isort) — ruff covers both. Run `ruff check src tests`.
 - `ruff` rules use defaults (no rule-set extension declared in `pyproject.toml`).
-- Test files that need module imports after a `pytest.importorskip` use `# noqa: E402` to silence "module level import not at top of file" — see `tests/test_structure.py:27`, `tests/test_triton_diagonal.py:17`, `tests/test_triton_monarch.py:19`.
+- Test files that need module imports after a `pytest.importorskip` use `# noqa: E402` to silence "module level import not at top of file" — see `tests/test_structure.py:27`, `tests/test_triton_diagonal.py:17`, `tests/test_triton_blockdiag.py:19`.
 - Triton kernels with intentionally-unused bias loads use `# noqa: F841` (`src/gru_qat/triton_kernels/scan_butterfly.py:495`).
 - `mypy` is configured with `strict = true` and scoped to `files = ["src/gru_qat"]` (`pyproject.toml:32-35`). Tests and benches are **not** type-checked.
 - `python_version = "3.10"`.
@@ -221,7 +221,7 @@ bd close <id>         # Complete work
 - `import triton` and `import triton.language as tl` are kept side-by-side in kernel files (`src/gru_qat/triton_kernels/scan_diagonal.py:27`).
 - Internal cross-package imports always use the full path `from gru_qat.<module>` — never relative imports. Example: `from gru_qat.quantizers import (...)` in `src/gru_qat/gru_cell.py:26`.
 - Optional / soft dependencies (`torch_structured`) are imported **lazily inside the function that needs them** via `_import_torch_structured()` (`src/gru_qat/structure.py:60`) — never at module top. This keeps dense-only usage from requiring the optional dep.
-- Tests defer `gru_qat` imports until **after** `pytest.importorskip("torch_structured")` or `pytest.importorskip("triton")` — see `tests/test_structure.py:25`, `tests/test_triton_monarch.py:17`. The `# noqa: E402` is paired with this pattern.
+- Tests defer `gru_qat` imports until **after** `pytest.importorskip("torch_structured")` or `pytest.importorskip("triton")` — see `tests/test_structure.py:25`, `tests/test_triton_blockdiag.py:17`. The `# noqa: E402` is paired with this pattern.
 - None. Imports are flat under the `gru_qat` package root.
 ## Type Annotations
 - Every public function and method has full type annotations on parameters and return type, including `-> None`.
@@ -293,7 +293,8 @@ bd close <id>         # Complete work
 | `calibrate` / `freeze_all` | Switch activation quantizers to `min_max`, run forwards, then lock scales | `src/gru_qat/calibration.py` |
 | Dense Triton scan | Persistent + autotune fwd/bwd kernels; `gru_scan_persistent`, `gru_scan` | `src/gru_qat/triton_kernels/scan.py` |
 | Diagonal Triton scan | Elementwise-recurrence persistent kernel (no cross-CTA barrier, `h` in registers) | `src/gru_qat/triton_kernels/scan_diagonal.py` |
-| Monarch Triton scan | Block-diagonal matmul per gate per timestep; persistent | `src/gru_qat/triton_kernels/scan_monarch.py` |
+| Blockdiag Triton scan | Block-diagonal matmul per gate per timestep; persistent. Backs `kind="blockdiag"` | `src/gru_qat/triton_kernels/scan_blockdiag.py` |
+| Monarch Triton scan | Two block-diagonal matmuls + transpose-permute per gate per timestep (full mixing); fused fwd + hand-derived reverse-time bwd. Backs `kind="monarch"` | `src/gru_qat/triton_kernels/scan_monarch.py` |
 | Butterfly Triton scan | log_H stages of strided 2×2 mixing per gate; persistent | `src/gru_qat/triton_kernels/scan_butterfly.py` |
 | Triton kernels `__init__` | Phase-5 design notes; `is_available()` helper; placeholders | `src/gru_qat/triton_kernels/__init__.py` |
 ## Pattern Overview
@@ -337,7 +338,7 @@ bd close <id>         # Complete work
 - Depends on: `quantizers.FakeQuantize`
 - Used by: `GRULayer.calibrate`, user code post-training
 - Purpose: Persistent multi-step fwd/bwd kernels for each structured kind that has Triton support
-- Location: `src/gru_qat/triton_kernels/scan.py` (dense), `scan_diagonal.py`, `scan_monarch.py`, `scan_butterfly.py`
+- Location: `src/gru_qat/triton_kernels/scan.py` (dense), `scan_diagonal.py`, `scan_blockdiag.py`, `scan_monarch.py`, `scan_butterfly.py`
 - Contains: `@triton.jit` fwd/bwd kernels, `torch.autograd.Function` wrappers, `gru_scan*`, `extract_*_factors` helpers
 - Depends on: `triton`, CUDA, frozen-scale buffers on the cell
 - Used by: `GRULayer._forward_fast_dispatch`, dedicated Triton tests
@@ -362,7 +363,7 @@ bd close <id>         # Complete work
 - Pattern: Dataclass holding the six fake-quantized weight tensors plus optional `Wi_cat`/`Wh_cat`/`bi_cat`/`bh_cat` for fused-gate layout.
 - Purpose: Swap the H×H hidden (or input) GEMM for an `O(n log n)` or `O(n)` parameterization
 - Examples: `src/gru_qat/structure.py:34` (`StructureConfig`), `:118` (`make_structured_linear`), `:177` (`_DiagonalLinear`)
-- Pattern: Dataclass-driven factory. Kinds: `dense`, `diagonal`, `monarch`, `circulant`, `butterfly`, `ldr`. `torch_structured` is lazy-imported only when a non-local kind is requested.
+- Pattern: Dataclass-driven factory. Kinds: `dense`, `diagonal`, `blockdiag`, `monarch`, `circulant`, `butterfly`, `ldr`. `torch_structured` is lazy-imported only when a non-local kind is requested.
 - Purpose: Sole location where the QAT gradient story is faked
 - Examples: `src/gru_qat/ste.py:15` (`STERound`), `:32` (`STEClamp`), `:59` (`fake_quant_ste`)
 - Pattern: `torch.autograd.Function` subclasses with identity / clipped-identity backward. `fake_quant_ste(x, scale, zp, qmin, qmax)` is the canonical building block.
@@ -372,7 +373,7 @@ bd close <id>         # Complete work
 ## Entry Points
 - Location: `src/gru_qat/gru_layer.py:49`
 - Triggers: User construction in training / inference code
-- Responsibilities: Build the cell, decide fast-path eligibility (`structure_input is None and kind in {diagonal, monarch, butterfly} and gate_layout == 'fused'`), optionally wrap per-step body in `torch.compile(mode="default")`.
+- Responsibilities: Build the cell, decide fast-path eligibility (`structure_input is None and kind in {diagonal, blockdiag, monarch, butterfly} and gate_layout == 'fused'`), optionally wrap per-step body in `torch.compile(mode="default")`.
 - Location: `src/gru_qat/gru_layer.py:139`
 - Triggers: Standard PyTorch forward
 - Responsibilities: Time-loop or Triton dispatch; returns `(out, h_T)`.
@@ -382,7 +383,7 @@ bd close <id>         # Complete work
 - Location: `src/gru_qat/gru_cell.py:351`, `:436`, `:302`
 - Triggers: Per-step body inside the layer's time loop
 - Responsibilities: One GRU step with all fake-quant insertion points wired.
-- Location: `src/gru_qat/triton_kernels/scan.py:1624`, `scan_diagonal.py:661`, `scan_monarch.py` (`gru_scan_monarch`), `scan_butterfly.py` (`gru_scan_butterfly_triton`)
+- Location: `src/gru_qat/triton_kernels/scan.py:1624`, `scan_diagonal.py:661`, `scan_blockdiag.py` (`gru_scan_blockdiag`), `scan_monarch.py` (`gru_scan_monarch`), `scan_butterfly.py` (`gru_scan_butterfly_triton`)
 - Triggers: Called from `_forward_fast_dispatch`
 - Responsibilities: Wrap `torch.autograd.Function` calls that launch the persistent fwd/bwd Triton kernels.
 - Location: `src/gru_qat/calibration.py:31`, `:129`
@@ -391,7 +392,7 @@ bd close <id>         # Complete work
 ## Architectural Constraints
 - **Single-layer, single-direction, GRU only.** Stacking, bidirectionality, and LSTM are out of scope (`SCOPE.md` non-goals).
 - **Streaming inference bypasses Triton.** Triton kernels require T at launch time; `cell.step(x_t, h)` works for streaming but loses the fast path.
-- **Fast-path eligibility is strict:** input side must be dense, gate layout must be `"fused"`, hidden structure must be one of `{diagonal, monarch, butterfly}`. Any other configuration falls back to the per-step PyTorch path (`gru_layer.py:100`).
+- **Fast-path eligibility is strict:** input side must be dense, gate layout must be `"fused"`, hidden structure must be one of `{diagonal, blockdiag, monarch, butterfly}`. Any other configuration falls back to the per-step PyTorch path (`gru_layer.py:100`).
 - **`pre_batch_input=True` requires `gate_layout="fused"`** and dense input side (`gru_layer.py:65`, `:80`).
 - **Fused gate layout requires `recipe.weight.axis=0`** — per-tensor weight quant under fused gates would silently share one scale across all three gate matrices (`gru_cell.py:106`).
 - **In-kernel fake-quant requires frozen + per-tensor + symmetric** hidden quantizers (`gru_layer.py:28`). Any other state disables it without error.

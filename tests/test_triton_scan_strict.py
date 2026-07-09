@@ -551,7 +551,7 @@ def test_no_cv_cache_modifier_live_uses_in_scan_source() -> None:
     of ``cache_modifier=".cv"`` in ``scan.py`` (lines 192, 431, 625) are
     ALL inside ``#``-comment lines that *document* why the pattern is
     forbidden; the live-code baseline is 0. The other ``scan*.py`` files
-    (scan_diagonal.py, scan_monarch.py, scan_butterfly.py) have zero matches
+    (scan_diagonal.py, scan_blockdiag.py, scan_butterfly.py) have zero matches
     of any kind. If a future commit reintroduces ``cache_modifier=".cv"``
     outside a comment in any of those files, this canary fails with the
     offending file path + line number.

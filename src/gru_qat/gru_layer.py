@@ -27,12 +27,28 @@ from gru_qat.quantizers import FakeQuantize, FakeQuantizePerTensor, QuantRecipe
 from gru_qat.structure import StructureConfig
 
 
+def _monarch_triton_ok(hidden_size: int, cfg: StructureConfig | None) -> bool:
+    """Whether the two-factor Monarch Triton kernel supports this config.
+
+    The kernel does a per-block ``tl.dot`` of size ``blksz = H/nblocks`` and
+    uses ``tl.arange(0, blksz)`` for the transpose-permute, so ``blksz`` must
+    be a power of two and >= 16. Configs that fail this run the reference
+    per-step path instead (so ``use_triton='auto'`` never crashes).
+    """
+    if cfg is None or cfg.kind != "monarch":
+        return False
+    if hidden_size % cfg.nblocks != 0:
+        return False
+    blksz = hidden_size // cfg.nblocks
+    return blksz >= 16 and (blksz & (blksz - 1)) == 0
+
+
 def _extract_h_quant_params(
     quantizer: FakeQuantize,
 ) -> tuple[float, int, int] | None:
     """Pull (scale, qmin, qmax) from a frozen per-tensor symmetric quantizer.
 
-    Returns None if the quantizer isn't in a state the Triton-Monarch
+    Returns None if the quantizer isn't in a state the Triton-Blockdiag
     path can consume:
     - mode != "frozen" (scales aren't stable)
     - per-channel/per-group (kernel is per-tensor only)
@@ -92,11 +108,16 @@ class GRULayer(nn.Module):
         # - "diagonal": uses a persistent Triton kernel; the recurrence
         #   is fully pointwise across H so each program owns a slab and
         #   needs no cross-CTA barrier.
-        # - "monarch": uses the persistent Triton kernel (real speedup).
+        # - "blockdiag": uses the persistent Triton kernel (real speedup).
+        # - "monarch": genuine two-factor Monarch. Uses its own fused Triton
+        #   kernel (two block-diagonal matmuls + a transpose-permute per gate
+        #   per step). Only eligible when blksz = H/nblocks is a power of two
+        #   >= 16 (the kernel's tl.dot constraint); otherwise it falls back to
+        #   the per-step reference path.
         # - "butterfly": uses a Python time loop calling
         #   torch_structured.butterfly_multiply per step (API parity,
         #   no multi-step Triton fusion). The flag is named ``use_triton``
-        #   for symmetry with the monarch path even though butterfly
+        #   for symmetry with the blockdiag path even though butterfly
         #   doesn't actually use a Triton kernel.
         #
         # The input side may be dense OR structured: the input projection
@@ -108,7 +129,10 @@ class GRULayer(nn.Module):
         # kernel never sees the input parameterization.
         kind = structure_hidden.kind if structure_hidden is not None else None
         self._fast_dispatch_eligible = (
-            kind in ("diagonal", "monarch", "butterfly")
+            (
+                kind in ("diagonal", "blockdiag", "butterfly")
+                or (kind == "monarch" and _monarch_triton_ok(hidden_size, structure_hidden))
+            )
             and gate_layout == "fused"
         )
         self._dispatch_kind: str | None = kind if self._fast_dispatch_eligible else None
@@ -118,9 +142,10 @@ class GRULayer(nn.Module):
             self.use_triton = bool(use_triton)
             if self.use_triton and not self._fast_dispatch_eligible:
                 raise ValueError(
-                    "use_triton=True requires "
-                    "structure_hidden.kind in {'diagonal', 'monarch', 'butterfly'} "
-                    "and gate_layout='fused'."
+                    "use_triton=True requires structure_hidden.kind in "
+                    "{'diagonal', 'blockdiag', 'butterfly', 'monarch'} and "
+                    "gate_layout='fused' (monarch additionally needs "
+                    "H/nblocks a power of two >= 16 for the Triton kernel)."
                 )
         # When compile_step is True, wrap the per-step body in torch.compile
         # so Inductor fuses the elementwise ops (sigmoid/tanh/mul/add) with
@@ -191,8 +216,8 @@ class GRULayer(nn.Module):
         if h0 is None:
             h0 = x.new_zeros(batch_size, self.hidden_size)
 
-        # Fast path: structured hidden (monarch or butterfly) + dense
-        # input + dispatch enabled. Monarch goes through the persistent
+        # Fast path: structured hidden (blockdiag or butterfly) + dense
+        # input + dispatch enabled. Blockdiag goes through the persistent
         # Triton kernel; butterfly goes through a Python time loop with
         # torch_structured's butterfly_multiply CUDA op (API parity, not
         # a Triton kernel).
@@ -237,7 +262,7 @@ class GRULayer(nn.Module):
         """Dispatch for structured-hidden fast paths (dense or structured
         input).
 
-        All of monarch / butterfly / diagonal share the input projection
+        All of blockdiag / butterfly / diagonal share the input projection
         setup and the QAT param extraction, differing only in the scan
         backend used for the hidden recurrence. The input projection is
         hoisted to a single batched GEMM — identical across timesteps — and
@@ -267,14 +292,27 @@ class GRULayer(nn.Module):
                 gi, h0, Wh_diag, bh_cat,
                 h_in_quant=h_in_q, h_out_quant=h_out_q,
             )
+        elif self._dispatch_kind == "blockdiag":
+            from gru_qat.triton_kernels.scan_blockdiag import (
+                extract_blockdiag_factors,
+                gru_scan_blockdiag,
+            )
+            Wh_struct, bh_cat = extract_blockdiag_factors(self.cell)
+            out = gru_scan_blockdiag(
+                gi, h0, Wh_struct, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
         elif self._dispatch_kind == "monarch":
+            # Genuine two-factor Monarch: fused Triton forward (two
+            # block-diagonal matmuls + transpose-permute per gate per step),
+            # PyTorch-reference backward. Two weight factors (W1, W2).
             from gru_qat.triton_kernels.scan_monarch import (
                 extract_monarch_factors,
                 gru_scan_monarch,
             )
-            Wh_struct, bh_cat = extract_monarch_factors(self.cell)
+            W1, W2, bh_cat = extract_monarch_factors(self.cell)
             out = gru_scan_monarch(
-                gi, h0, Wh_struct, bh_cat,
+                gi, h0, W1, W2, bh_cat,
                 h_in_quant=h_in_q, h_out_quant=h_out_q,
             )
         elif self._dispatch_kind == "butterfly":

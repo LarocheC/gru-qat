@@ -1,7 +1,10 @@
 """Tier-1 structured-mode tests.
 
-Each test parameterizes over the four supported kinds (monarch, circulant,
-butterfly, ldr). They check three things per kind:
+Each test parameterizes over the supported kinds (blockdiag, monarch,
+circulant, butterfly, ldr). ``blockdiag`` is the single block-diagonal
+factor (Triton-backed fast path); ``monarch`` is the genuine two-factor
+Monarch (reference path only) — both must satisfy the generic structured
+contracts below. They check three things per kind:
 - forward output is finite and the right shape;
 - gradients populate every parameter on backward;
 - a short training loop reduces loss vs. a fresh-init baseline (sanity);
@@ -37,7 +40,7 @@ from gru_qat.quantizers import FakeQuantizePerTensor  # noqa: E402
 def _shapes_for_kind(kind: str) -> tuple[int, int]:
     """(input_size, hidden_size) tuned to each kind's constraints.
 
-    - monarch: in/out divisible by nblocks=4.
+    - blockdiag / monarch: in/out divisible by nblocks=4.
     - circulant: square, power-of-2.
     - butterfly: power-of-2 makes the zero-pad a no-op.
     - ldr: square.
@@ -48,7 +51,7 @@ def _shapes_for_kind(kind: str) -> tuple[int, int]:
         return (32, 32)  # square
     if kind == "butterfly":
         return (32, 32)  # pow2 both sides
-    if kind == "monarch":
+    if kind in ("blockdiag", "monarch"):
         return (32, 32)  # divisible by nblocks=4
     raise ValueError(kind)
 
@@ -70,7 +73,7 @@ def _make_cell(kind: str, recipe: QuantRecipe | None = None) -> GRUCellQuant:
     )
 
 
-KINDS = ["monarch", "circulant", "butterfly", "ldr"]
+KINDS = ["blockdiag", "monarch", "circulant", "butterfly", "ldr"]
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -230,6 +233,82 @@ def test_mixed_dense_input_structured_hidden() -> None:
     h_new = cell(x, h)
     assert h_new.shape == (4, hid)
     assert torch.isfinite(h_new).all()
+
+
+def test_blockdiag_is_single_factor_monarch_is_two_factor() -> None:
+    """torch-structured 1.3.0 naming: ``blockdiag`` builds a single
+    block-diagonal factor (one ``weight`` tensor, zero cross-block mixing);
+    ``monarch`` builds the genuine two-factor Monarch (``w1``/``w2``, full
+    cross-channel mixing). Guards against silently swapping one for the
+    other."""
+    from gru_qat.structure import make_structured_linear
+
+    bd = make_structured_linear(StructureConfig(kind="blockdiag", nblocks=4), 64, 64)
+    # Single block-diagonal factor: [nblocks, out_blksz, in_blksz].
+    assert hasattr(bd, "weight")
+    assert bd.weight.shape == (4, 16, 16)
+
+    mon = make_structured_linear(StructureConfig(kind="monarch", nblocks=4), 64, 64)
+    # Two block-diagonal factors + implicit permutation.
+    assert hasattr(mon, "w1") and hasattr(mon, "w2")
+    assert not hasattr(mon, "weight")
+
+    # Cross-block mixing: a single block-diagonal factor cannot move
+    # information between blocks, the two-factor Monarch can. Perturb one
+    # input coordinate and check whether outputs outside its block move.
+    x0 = torch.zeros(1, 64)
+    x1 = x0.clone()
+    x1[0, 0] = 1.0
+    with torch.no_grad():
+        bd_delta = (bd(x1) - bd(x0)).abs()
+        mon_delta = (mon(x1) - mon(x0)).abs()
+    # blockdiag: only the first block (coords 0..15) can respond.
+    assert bd_delta[0, 16:].max().item() == 0.0
+    # monarch: coordinates outside the first block respond (cross-mixing).
+    assert mon_delta[0, 16:].max().item() > 0.0
+
+
+def test_monarch_two_factor_triton_eligibility() -> None:
+    """The two-factor ``monarch`` has its own fused Triton kernel, eligible
+    when blksz = H/nblocks is a power of two >= 16. Configs that fail that
+    constraint fall back to the per-step reference path (``use_triton='auto'``
+    -> False) and reject an explicit ``use_triton=True``. ``blockdiag`` is
+    always eligible."""
+    rec = QuantRecipe(
+        weight=QuantizerConfig(bits=32, axis=0, name="W_id"),
+        input_act=QuantizerConfig(bits=32, name="x_id"),
+        hidden=QuantizerConfig(bits=32, name="h_id"),
+    )
+    # H=64, nblocks=4 -> blksz=16 (pow2, >=16): Triton-eligible.
+    mon_ok = GRULayer(
+        64, 64, recipe=rec, gate_layout="fused",
+        structure_hidden=StructureConfig(kind="monarch", nblocks=4),
+        use_triton="auto",
+    )
+    assert mon_ok._fast_dispatch_eligible is True
+    assert mon_ok.use_triton is True
+
+    # H=32, nblocks=4 -> blksz=8 (< 16): not eligible, falls back.
+    mon_small = GRULayer(
+        32, 32, recipe=rec, gate_layout="fused",
+        structure_hidden=StructureConfig(kind="monarch", nblocks=4),
+        use_triton="auto",
+    )
+    assert mon_small._fast_dispatch_eligible is False
+    assert mon_small.use_triton is False
+    with pytest.raises(ValueError, match="monarch"):
+        GRULayer(
+            32, 32, recipe=rec, gate_layout="fused",
+            structure_hidden=StructureConfig(kind="monarch", nblocks=4),
+            use_triton=True,
+        )
+
+    bd = GRULayer(
+        64, 64, recipe=rec, gate_layout="fused",
+        structure_hidden=StructureConfig(kind="blockdiag", nblocks=4),
+        use_triton="auto",
+    )
+    assert bd._fast_dispatch_eligible is True
 
 
 def test_structure_validation_errors() -> None:

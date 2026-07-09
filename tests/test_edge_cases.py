@@ -8,7 +8,7 @@ with a clear, tested ``ValueError``.
 This is the edge-shape ring of the native-PyTorch parity audit. Phase 4
 already swept adversarial numerics; Phase 6 owns *shape* robustness.
 CONCERNS.md predicts BLOCK-size-assumption failures at tiny shapes
-(butterfly ``B % BLOCK_B``, monarch non-pow2 ``BLKSZ``, persistent-grid
+(butterfly ``B % BLOCK_B``, blockdiag non-pow2 ``BLKSZ``, persistent-grid
 deadlock) — the B=1/small-H sweep targets exactly those failure modes.
 
 Design decisions honored (06-CONTEXT.md):
@@ -19,7 +19,7 @@ Design decisions honored (06-CONTEXT.md):
   entries), not a reduced subset.
 - D-09: tolerances reused verbatim from PROJECT.md — reference vs
   ``nn.GRU`` < 1e-4; diagonal Triton (non-``tl.dot``) < 1e-5;
-  dense/monarch/butterfly Triton (``tl.dot``) < 5e-4. No new bounds.
+  dense/blockdiag/butterfly Triton (``tl.dot``) < 5e-4. No new bounds.
 - D-10/D-11: all edge sweeps in this single new file; the
   ``_translate_nn_gru_to_cell`` helper is imported from the D-51-locked
   ``test_layer_parity.py`` (import-only, never edited).
@@ -65,16 +65,16 @@ ALL_PATHS: list[str] = [
     "reference",
     "dense_triton",
     "diagonal_triton",
-    "monarch_triton",
+    "blockdiag_triton",
     "butterfly_triton",
     "circulant",
     "ldr",
 ]
 
 # Paths that route through a Triton kernel — need CUDA + triton.
-_TRITON_PATHS = {"dense_triton", "diagonal_triton", "monarch_triton", "butterfly_triton"}
+_TRITON_PATHS = {"dense_triton", "diagonal_triton", "blockdiag_triton", "butterfly_triton"}
 # Paths that need the optional torch_structured dependency.
-_STRUCTURED_DEP_PATHS = {"monarch_triton", "butterfly_triton", "ldr"}
+_STRUCTURED_DEP_PATHS = {"blockdiag_triton", "butterfly_triton", "ldr"}
 
 
 def _fp32_recipe() -> QuantRecipe:
@@ -94,7 +94,7 @@ def _fp32_recipe() -> QuantRecipe:
 def _gate_off(path: str) -> None:
     """Skip the test cleanly when the path's dependencies are unavailable.
 
-    Triton paths need CUDA + triton; monarch/butterfly/ldr also need
+    Triton paths need CUDA + triton; blockdiag/butterfly/ldr also need
     torch_structured. The reference + circulant paths run CPU-side and
     are never skipped here.
     """
@@ -113,7 +113,7 @@ def _make_layer(path: str, in_size: int, hid: int) -> GRULayer:
       reference        — dense hidden, use_triton=False, gate_layout split
       dense_triton     — dense hidden, use_triton=True, fused gates
       diagonal_triton  — StructureConfig(kind="diagonal"), use_triton=True
-      monarch_triton   — StructureConfig(kind="monarch"),  use_triton=True
+      blockdiag_triton   — StructureConfig(kind="blockdiag"),  use_triton=True
       butterfly_triton — StructureConfig(kind="butterfly"),use_triton=True
       circulant        — StructureConfig(kind="circulant"), per-step path
       ldr              — StructureConfig(kind="ldr"),        per-step path
@@ -138,13 +138,13 @@ def _make_layer(path: str, in_size: int, hid: int) -> GRULayer:
             structure_hidden=StructureConfig(kind="diagonal"),
             use_triton=True,
         )
-    if path == "monarch_triton":
+    if path == "blockdiag_triton":
         # nblocks must divide H; pick a divisor that works for the small
         # hidden sizes used here. H is always a multiple of 2 in the
         # edge grid except H in {1}; clamp nblocks so it divides H.
         return GRULayer(
             in_size, hid, recipe=rec, gate_layout="fused",
-            structure_hidden=StructureConfig(kind="monarch", nblocks=_monarch_nblocks(hid)),
+            structure_hidden=StructureConfig(kind="blockdiag", nblocks=_blockdiag_nblocks(hid)),
             use_triton=True,
         )
     if path == "butterfly_triton":
@@ -166,10 +166,10 @@ def _make_layer(path: str, in_size: int, hid: int) -> GRULayer:
     raise AssertionError(f"unknown path: {path}")
 
 
-def _monarch_nblocks(hid: int) -> int:
-    """Pick a monarch nblocks that divides ``hid`` (in == out == hid).
+def _blockdiag_nblocks(hid: int) -> int:
+    """Pick a blockdiag nblocks that divides ``hid`` (in == out == hid).
 
-    monarch requires in/out divisible by nblocks (structure.py:84). The
+    blockdiag requires in/out divisible by nblocks (structure.py:84). The
     edge grid uses H in {1, 2, 8}; nblocks must divide H. Default 4 only
     works for H>=4 and 4|H, so clamp to a working divisor.
     """
@@ -185,7 +185,7 @@ def _path_tol(path: str) -> float:
     Tolerances reused verbatim from PROJECT.md Constraints + the existing
     committed kernel-test contracts (D-09 — no NEW bounds invented):
 
-      - dense / monarch / diagonal full-layer forward: < 5e-4 (the
+      - dense / blockdiag / diagonal full-layer forward: < 5e-4 (the
         PROJECT.md ``tl.dot`` tight-TF32 tier). NOTE: although the
         diagonal *recurrence* has no ``tl.dot`` and pins at < 1e-5 in
         tests/test_triton_diagonal.py, the full-GRULayer forward compared
@@ -208,7 +208,7 @@ def _path_tol(path: str) -> float:
     """
     if path == "butterfly_triton":
         return 5e-2
-    if path in ("dense_triton", "monarch_triton", "diagonal_triton"):
+    if path in ("dense_triton", "blockdiag_triton", "diagonal_triton"):
         return 5e-4
     # circulant, ldr — deterministic per-step PyTorch replay.
     return 1e-5
@@ -236,7 +236,7 @@ def _run_path_vs_reference(
       - dense_triton: per-step dense layer vs the explicit dense
         ``gru_scan`` Triton kernel at < 5e-4 (mirrors the strict-file
         pre_batch_input round-trip pattern).
-      - diagonal/monarch/butterfly_triton: a ``use_triton=True`` layer vs
+      - diagonal/blockdiag/butterfly_triton: a ``use_triton=True`` layer vs
         a same-weights ``use_triton=False`` layer at the path tier.
       - circulant/ldr: per-step PyTorch — a deterministic same-recipe
         re-run; assert finite + correct shape and < 1e-5 replay equality.
@@ -377,19 +377,19 @@ def test_t0_b0_raises_valueerror(
         layer(x)
 
 
-def _maybe_skip_monarch_bwd(path: str, T: int, B: int, H: int) -> None:
-    """Apply the legitimate monarch-bwd HW-limit skip from the D-51 LOCKED
-    test_triton_monarch_strict.py.
+def _maybe_skip_blockdiag_bwd(path: str, T: int, B: int, H: int) -> None:
+    """Apply the legitimate blockdiag-bwd HW-limit skip from the D-51 LOCKED
+    test_triton_blockdiag_strict.py.
 
-    ``_skip_if_monarch_bwd_hw_limit`` skips shapes the RTX 2000 Ada
-    monarch bwd kernel genuinely cannot launch (SMEM OOM, tl.dot K<16).
+    ``_skip_if_blockdiag_bwd_hw_limit`` skips shapes the RTX 2000 Ada
+    blockdiag bwd kernel genuinely cannot launch (SMEM OOM, tl.dot K<16).
     A HW-limit skip is DISTINCT from a BLOCK-assumption bug — a real bug
     must be FIXED in-phase (D-04), not hidden behind a skip.
     """
-    if path != "monarch_triton":
+    if path != "blockdiag_triton":
         return
-    mono = importlib.import_module("test_triton_monarch_strict")
-    mono._skip_if_monarch_bwd_hw_limit(T, B, H, _monarch_nblocks(H))
+    mono = importlib.import_module("test_triton_blockdiag_strict")
+    mono._skip_if_blockdiag_bwd_hw_limit(T, B, H, _blockdiag_nblocks(H))
 
 
 # ===========================================================================
@@ -409,7 +409,7 @@ def test_t1_forward_parity(path: str, T: int, B: int, H: int) -> None:
 
     Tolerances reused verbatim from PROJECT.md tiers + the committed
     kernel-test contracts (D-09 — no new bounds; see ``_path_tol``):
-    reference vs ``nn.GRU`` < 1e-4; dense / monarch / diagonal full-layer
+    reference vs ``nn.GRU`` < 1e-4; dense / blockdiag / diagonal full-layer
     < 5e-4 (the tl.dot tier — the full-layer path always routes through
     the TF32 input-projection GEMM); butterfly < 5e-2 (the established
     test_butterfly_dispatch.py contract); circulant / ldr deterministic
@@ -426,12 +426,12 @@ def test_t1_backward_parity(path: str, T: int, B: int, H: int) -> None:
     and match the reference path within the per-path tolerance tier
     (EDG-01, ROADMAP SC#1).
 
-    The monarch backward case applies the legitimate
-    ``_skip_if_monarch_bwd_hw_limit`` HW-limit skip — a BLOCK-assumption
+    The blockdiag backward case applies the legitimate
+    ``_skip_if_blockdiag_bwd_hw_limit`` HW-limit skip — a BLOCK-assumption
     bug at T=1 (non-HW reason) would instead be fixed in-phase (D-04).
     """
     _gate_off(path)
-    _maybe_skip_monarch_bwd(path, T, B, H)
+    _maybe_skip_blockdiag_bwd(path, T, B, H)
     _run_path_vs_reference(path, T, B, H, backward=True)
 
 
@@ -441,10 +441,10 @@ def test_t1_backward_parity(path: str, T: int, B: int, H: int) -> None:
 #
 # The most bug-likely task per CONCERNS.md — the B=1 / small-H corner is
 # exactly where Triton BLOCK assumptions break (butterfly B%BLOCK_B partial
-# tile, monarch non-pow2 BLKSZ pad-to-pow2). Any BLOCK-assumption failure
+# tile, blockdiag non-pow2 BLKSZ pad-to-pow2). Any BLOCK-assumption failure
 # surfaced here is a REAL BUG, fixed in-phase (D-04): Commit A failing test
 # -> bd issue -> Commit B fix. NO @pytest.mark.xfail. A HW-limit skip
-# (_skip_if_monarch_bwd_hw_limit) is distinct from a BLOCK-assumption bug.
+# (_skip_if_blockdiag_bwd_hw_limit) is distinct from a BLOCK-assumption bug.
 #
 # Every Task-3 shape is small (H<=8, B<=33); with default block_b=8 /
 # block_oh=128 the persistent-grid product cdiv(B,8)*cdiv(H,128) is 1, far
@@ -469,7 +469,7 @@ def test_b1_small_h_parity(path: str, T: int, B: int, H: int) -> None:
     (EDG-02, ROADMAP SC#2).
 
     Explicitly targets the CONCERNS.md BLOCK-size failure modes: butterfly
-    ``B % BLOCK_B`` partial-tile OOB, monarch non-pow2 ``BLKSZ`` pad-to-pow2
+    ``B % BLOCK_B`` partial-tile OOB, blockdiag non-pow2 ``BLKSZ`` pad-to-pow2
     mask fragility at small H. Any BLOCK-assumption failure surfaced is a
     real bug — fixed in-phase per D-04, never silenced with xfail.
 
@@ -607,7 +607,7 @@ def test_long_t_drift(path: str, T: int) -> None:
     per-step asymmetry between a path and its reference would compound
     into a visible drift. Tolerances are the same per-path tiers as the
     shorter sweeps (D-09 — no new long-T bounds): reference vs ``nn.GRU``
-    < 1e-4; dense/monarch/diagonal full-layer < 5e-4; butterfly < 5e-2;
+    < 1e-4; dense/blockdiag/diagonal full-layer < 5e-4; butterfly < 5e-2;
     circulant/ldr deterministic replay < 1e-5.
     """
     _gate_off(path)

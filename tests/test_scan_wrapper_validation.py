@@ -3,7 +3,7 @@
 Phase 7, plan 07-01, task 1 — closes ``gru-triton-7rj``.
 
 The four public ``gru_scan*`` wrappers (``gru_scan``, ``gru_scan_persistent``,
-``gru_scan_diagonal``, ``gru_scan_monarch``, ``gru_scan_butterfly_triton``)
+``gru_scan_diagonal``, ``gru_scan_blockdiag``, ``gru_scan_butterfly_triton``)
 dispatch into callee functions that historically validated input shape /
 dtype / ``is_cuda`` with bare ``assert`` statements. Under ``python -O`` an
 ``assert`` is stripped, so a malformed shape would reach the kernel and cause
@@ -35,7 +35,7 @@ from gru_qat.triton_kernels.scan import (  # noqa: E402
     gru_scan_persistent,
 )
 from gru_qat.triton_kernels.scan_diagonal import gru_scan_diagonal  # noqa: E402
-from gru_qat.triton_kernels.scan_monarch import gru_scan_monarch  # noqa: E402
+from gru_qat.triton_kernels.scan_blockdiag import gru_scan_blockdiag  # noqa: E402
 from gru_qat.triton_kernels.scan_butterfly import (  # noqa: E402
     gru_scan_butterfly_triton,
 )
@@ -103,8 +103,8 @@ def test_gru_scan_diagonal_rejects_non_cuda_tensor() -> None:
     assert not isinstance(excinfo.value, AssertionError)
 
 
-def test_gru_scan_monarch_rejects_non_cuda_tensor() -> None:
-    """gru_scan_monarch with a CPU tensor raises a clear error."""
+def test_gru_scan_blockdiag_rejects_non_cuda_tensor() -> None:
+    """gru_scan_blockdiag with a CPU tensor raises a clear error."""
     T, B, H, nblocks = 4, 2, 8, 2
     blksz = H // nblocks
     gi = torch.randn(T, B, 3 * H)  # CPU
@@ -112,7 +112,7 @@ def test_gru_scan_monarch_rejects_non_cuda_tensor() -> None:
     Wh_struct = torch.randn(3, nblocks, blksz, blksz)
     bh_cat = torch.zeros(3 * H)
     with pytest.raises(_EXPECTED) as excinfo:
-        gru_scan_monarch(gi, h0, Wh_struct, bh_cat)
+        gru_scan_blockdiag(gi, h0, Wh_struct, bh_cat)
     assert not isinstance(excinfo.value, AssertionError)
 
 
@@ -213,8 +213,8 @@ def test_gru_scan_diagonal_rejects_malformed_shape() -> None:
 
 
 @cuda_only
-def test_gru_scan_monarch_rejects_malformed_shape() -> None:
-    """gru_scan_monarch with a non-square Monarch block raises a clear error."""
+def test_gru_scan_blockdiag_rejects_malformed_shape() -> None:
+    """gru_scan_blockdiag with a non-square Blockdiag block raises a clear error."""
     T, B, H, nblocks = 4, 2, 8, 2
     blksz = H // nblocks
     dev = "cuda"
@@ -224,7 +224,7 @@ def test_gru_scan_monarch_rejects_malformed_shape() -> None:
     Wh_struct = torch.randn(3, nblocks, blksz + 1, blksz + 1, device=dev)
     bh_cat = torch.zeros(3 * H, device=dev)
     with pytest.raises(_EXPECTED) as excinfo:
-        gru_scan_monarch(gi, h0, Wh_struct, bh_cat)
+        gru_scan_blockdiag(gi, h0, Wh_struct, bh_cat)
     assert not isinstance(excinfo.value, AssertionError)
 
 

@@ -1,24 +1,24 @@
-"""Strict-tier parity tests for the Monarch (block-diagonal) Triton scan kernel — Phase 2 audit.
+"""Strict-tier parity tests for the Blockdiag (block-diagonal) Triton scan kernel — Phase 2 audit.
 
-Validates ``gru_scan_monarch_forward_triton`` / ``gru_scan_monarch_backward_triton``
-against the PyTorch monarch reference (``gru_scan_monarch_forward_pytorch`` /
-``gru_scan_monarch_backward_pytorch``) at the strict tier:
+Validates ``gru_scan_blockdiag_forward_triton`` / ``gru_scan_blockdiag_backward_triton``
+against the PyTorch blockdiag reference (``gru_scan_blockdiag_forward_pytorch`` /
+``gru_scan_blockdiag_backward_pytorch``) at the strict tier:
 
     torch.set_float32_matmul_precision('highest')      # IEEE fp32 matmul
     assert (triton - reference).abs().max() < 5e-4     # absolute, not relative
 
-Diverges from ``tests/test_triton_monarch.py`` (the realistic-deployment
+Diverges from ``tests/test_triton_blockdiag.py`` (the realistic-deployment
 sibling) — that file runs under ``'high'`` / TF32 with looser bounds
 (rel < 5e-3 fwd at line 127, rel < 5e-2 bwd at line 248). Both files
 coexist; this file does NOT loosen the existing one.
 
 Tight-TF32 strict-tier bound rationale (Phase 2 Plan 02-06 / Option C):
-Monarch's hidden-side block matmul (3 gates x ``tl.dot`` per timestep) is
+Blockdiag's hidden-side block matmul (3 gates x ``tl.dot`` per timestep) is
 the primary stressor of ``tl.dot`` reduction order. Triton's ``tl.dot``
 uses TF32 on Ampere+ regardless of
 ``torch.set_float32_matmul_precision('highest')`` — the global precision
 knob does not propagate into in-kernel ``tl.dot``. The realistic-tier
-sibling at ``tests/test_triton_monarch.py:127`` tolerates the full TF32
+sibling at ``tests/test_triton_blockdiag.py:127`` tolerates the full TF32
 noise floor at rel < 5e-3; this strict-tier file holds the bound at
 ``< 5e-4 abs`` — well above the TF32 noise floor (~1e-4) but tight enough
 to surface kernel bugs at the ~5e-4 level. The accepted TF32 divergence
@@ -29,7 +29,7 @@ finding per D-14 of ``02-CONTEXT.md`` — Commit A failing test -> bd issue
 D-27).
 
 Grid: parametrized over ``nblocks in {2, 4, 8}`` per D-16 with the
-divisibility filter ``H % nblocks == 0`` (Monarch requires H divisible by
+divisibility filter ``H % nblocks == 0`` (Blockdiag requires H divisible by
 nblocks per ``src/gru_qat/structure.py``).
 """
 
@@ -46,16 +46,16 @@ triton = pytest.importorskip("triton")
 torch_structured = pytest.importorskip("torch_structured")
 
 from gru_qat import GRULayer, QuantRecipe, QuantizerConfig, StructureConfig  # noqa: E402
-from gru_qat.triton_kernels.scan_monarch import (  # noqa: E402
-    extract_monarch_factors,
-    gru_scan_monarch_backward_pytorch,
-    gru_scan_monarch_backward_triton,
-    gru_scan_monarch_forward_pytorch,
-    gru_scan_monarch_forward_triton,
+from gru_qat.triton_kernels.scan_blockdiag import (  # noqa: E402
+    extract_blockdiag_factors,
+    gru_scan_blockdiag_backward_pytorch,
+    gru_scan_blockdiag_backward_triton,
+    gru_scan_blockdiag_forward_pytorch,
+    gru_scan_blockdiag_forward_triton,
 )
 
 # Strict tier: IEEE-754 fp32 matmul, not TF32. The realistic-tier sibling
-# file (tests/test_triton_monarch.py) uses 'high' to exercise the kernel
+# file (tests/test_triton_blockdiag.py) uses 'high' to exercise the kernel
 # under deployment conditions; this file audits the math.
 torch.set_float32_matmul_precision("highest")
 
@@ -68,7 +68,7 @@ cuda_only = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # `divergence` marker (Phase 7 D-05) — per-parametrize-case marking.
 #
-# Monarch has 3 `tl.dot` calls per timestep per gate, so it is the heaviest
+# Blockdiag has 3 `tl.dot` calls per timestep per gate, so it is the heaviest
 # TF32-reduction-order surface. The fp32 strict `< 5e-4` fwd/bwd cases that
 # exceed the bound are the Phase 2 Option C accepted divergence (`gru-triton-
 # rwm` / `gru-triton-6dz`); the quant-bwd large-magnitude T=512 cases are the
@@ -77,46 +77,46 @@ cuda_only = pytest.mark.skipif(
 # pass stay in the green gate). The id sets are the empirical post-n20-fix
 # strict-suite failure list captured on RTX 2000 Ada. See AUDIT-REPORT.md.
 # ---------------------------------------------------------------------------
-# monarch fwd/bwd fp32 strict: monarch has 3 tl.dot calls per timestep per
+# blockdiag fwd/bwd fp32 strict: blockdiag has 3 tl.dot calls per timestep per
 # gate — the heaviest TF32-reduction surface. Which exact shapes exceed the
 # `< 5e-4` bound is autotune-config dependent, so the WHOLE fast grid is
 # marked for both directions (`gru-triton-rwm` / `gru-triton-q3k` family).
-_DIV_MONARCH_FWD = {
+_DIV_BLOCKDIAG_FWD = {
     f"{T}-{B}-{H}-{nb}"
     for T in (1, 8, 64) for B in (1, 4, 32)
     for H in (32, 128, 512) for nb in (2, 4, 8)
 }
-_DIV_MONARCH_BWD = {
+_DIV_BLOCKDIAG_BWD = {
     f"{T}-{B}-{H}-{nb}"
     for T in (1, 8, 64) for B in (1, 4, 32)
     for H in (32, 128, 512) for nb in (2, 4, 8)
 }
-# n20-rebaselined monarch quant bwd: the `large-magnitude` H=512 nb=8 cases
+# n20-rebaselined blockdiag quant bwd: the `large-magnitude` H=512 nb=8 cases
 # exceed even the loose 100x bound (gru-triton-q3k). Mark the whole
 # `large-magnitude` H=512 cluster — which (T, B) tuples tip over is
 # autotune-config dependent. realistic / near-saturation stay clean.
-_DIV_MONARCH_QUANT_BWD = {
+_DIV_BLOCKDIAG_QUANT_BWD = {
     f"large-magnitude-{T}-{B}-512-{nb}"
     for T in (8, 64) for B in (1, 4, 32) for nb in (2, 4, 8)
 }
 # slow-tier (T in {512, 1024}) — observed failure ids from the slow strict run.
-# monarch fwd/bwd fp32 slow strict (T in {512, 1024}) — same whole-grid TF32
+# blockdiag fwd/bwd fp32 slow strict (T in {512, 1024}) — same whole-grid TF32
 # divergence as the fast tier (`gru-triton-rwm` / `gru-triton-q3k`).
-_DIV_MONARCH_FWD_SLOW = {
+_DIV_BLOCKDIAG_FWD_SLOW = {
     f"{T}-{B}-{H}-{nb}"
     for T in (512, 1024) for B in (1, 4, 32)
     for H in (32, 128, 512) for nb in (2, 4, 8)
 }
-_DIV_MONARCH_BWD_SLOW = {
+_DIV_BLOCKDIAG_BWD_SLOW = {
     f"{T}-{B}-{H}-{nb}"
     for T in (512, 1024) for B in (1, 4, 32)
     for H in (32, 128, 512) for nb in (2, 4, 8)
 }
-# n20-rebaselined monarch quant bwd slow (gru-triton-q3k). The
+# n20-rebaselined blockdiag quant bwd slow (gru-triton-q3k). The
 # `near-saturation` / `large-magnitude` slow clusters tip over the per-class
 # bound and which exact (B, nblocks) tuples fail is autotune-config
 # dependent, so both clusters are marked whole. `realistic` stays clean.
-_DIV_MONARCH_QUANT_BWD_SLOW = {
+_DIV_BLOCKDIAG_QUANT_BWD_SLOW = {
     f"{cls}-512-{B}-{H}-{nb}"
     for cls in ("near-saturation", "large-magnitude")
     for B in (1, 4, 32) for H in (32, 128, 512) for nb in (2, 4, 8)
@@ -132,23 +132,23 @@ def _div_param(values: tuple, ident: str, div_set: set[str]):
     return pytest.param(*values)
 
 
-# Helpers below are duplicated verbatim from tests/test_triton_monarch.py per
+# Helpers below are duplicated verbatim from tests/test_triton_blockdiag.py per
 # D-18 (CONTEXT). Phase 2's LOCKED-files contract (D-28) plus the
 # planner's "small (<30 LOC) helper, prefer duplicate over import" rule
 # motivate the copy.
 
 
-def _make_monarch_layer(
+def _make_blockdiag_layer(
     in_size: int, hid: int, nblocks: int = 4
 ) -> GRULayer:
-    """Build a structured-Monarch layer with no quant on weights or
+    """Build a structured-Blockdiag layer with no quant on weights or
     activations (fp32 path) — keeps reference math clean."""
     rec = QuantRecipe(
         weight=QuantizerConfig(bits=32, axis=0, name="W_id"),
         input_act=QuantizerConfig(bits=32, name="x_id"),
         hidden=QuantizerConfig(bits=32, name="h_id"),
     )
-    cfg = StructureConfig(kind="monarch", nblocks=nblocks)
+    cfg = StructureConfig(kind="blockdiag", nblocks=nblocks)
     return GRULayer(
         in_size, hid, recipe=rec,
         gate_layout="fused",
@@ -163,9 +163,9 @@ def _build_gi_from_cell(layer: GRULayer, x: torch.Tensor) -> torch.Tensor:
     the last dim, then sliced by time. The dense input side already
     matches what the persistent kernel expects.
 
-    For the structured-monarch test we want to feed the SAME ``gi`` to
+    For the structured-blockdiag test we want to feed the SAME ``gi`` to
     both the cell-based reference (which goes through quant_h_in / etc.)
-    and our PyTorch monarch reference. Constructing it explicitly here
+    and our PyTorch blockdiag reference. Constructing it explicitly here
     keeps both paths in sync.
     """
     cell = layer.cell
@@ -184,20 +184,20 @@ def _build_gi_from_cell(layer: GRULayer, x: torch.Tensor) -> torch.Tensor:
 
 
 # T x B x H x nblocks grid. Fast set runs on every `pytest -q`; slow set
-# under `-m slow`. The `H % nblocks == 0` filter enforces Monarch's
+# under `-m slow`. The `H % nblocks == 0` filter enforces Blockdiag's
 # divisibility invariant (StructureConfig requires H divisible by
 # nblocks). All H in {32, 128, 512} are divisible by all nblocks in
 # {2, 4, 8}, so the filter is a safety check that documents the invariant
 # and protects future grid extensions from non-divisible combos.
-FAST_MONARCH_GRID = [
+FAST_BLOCKDIAG_GRID = [
     (T, B, H, nblocks)
     for T in (1, 8, 64)
     for B in (1, 4, 32)
     for H in (32, 128, 512)
     for nblocks in (2, 4, 8)
-    if H % nblocks == 0  # Monarch requires H divisible by nblocks
+    if H % nblocks == 0  # Blockdiag requires H divisible by nblocks
 ]  # 81 cases
-SLOW_MONARCH_GRID = [
+SLOW_BLOCKDIAG_GRID = [
     (T, B, H, nblocks)
     for T in (512, 1024)
     for B in (1, 4, 32)
@@ -211,41 +211,41 @@ SLOW_MONARCH_GRID = [
 @pytest.mark.parametrize(
     "T,B,H,nblocks",
     [
-        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_FWD)
-        for (T, B, H, nb) in FAST_MONARCH_GRID
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_BLOCKDIAG_FWD)
+        for (T, B, H, nb) in FAST_BLOCKDIAG_GRID
     ],
 )
-def test_monarch_fwd_strict_matches_reference(
+def test_blockdiag_fwd_strict_matches_reference(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
-    """``gru_scan_monarch_forward_triton`` must match the PyTorch monarch
+    """``gru_scan_blockdiag_forward_triton`` must match the PyTorch blockdiag
     reference to < 5e-4 absolute under ``'highest'`` precision.
 
     Tight-TF32 strict-tier bound (Phase 2 Plan 02-06 / Option C): Triton's
     ``tl.dot`` defaults to TF32 on Ampere+ regardless of the global
-    ``torch.set_float32_matmul_precision('highest')`` setting. Monarch
+    ``torch.set_float32_matmul_precision('highest')`` setting. Blockdiag
     has 3 ``tl.dot`` calls per timestep per gate, so TF32 noise is the
     dominant divergence source vs the PyTorch IEEE-fp32 reference. Bound
     is 5e-4 abs — well above the ~1e-4 TF32 floor, well below the kind of
     divergence a kernel bug would produce. See module docstring for the
     accepted-divergence bd issue reference.
 
-    The realistic-tier sibling at ``tests/test_triton_monarch.py:127``
+    The realistic-tier sibling at ``tests/test_triton_blockdiag.py:127``
     uses ``< 5e-3`` rel under TF32 — that's correct for its regime; not
     loosened by us.
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
-    layer = _make_monarch_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
+    layer = _make_blockdiag_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
 
     x = torch.randn(T, B, H, device=device)
     h0 = torch.randn(B, H, device=device)
 
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_gi_from_cell(layer, x)
-        ref = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
-        tri = gru_scan_monarch_forward_triton(gi, h0, Wh_struct, bh_cat)
+        ref = gru_scan_blockdiag_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+        tri = gru_scan_blockdiag_forward_triton(gi, h0, Wh_struct, bh_cat)
 
     max_diff = (ref - tri).abs().max().item()
     assert max_diff < 5e-4, (
@@ -258,11 +258,11 @@ def test_monarch_fwd_strict_matches_reference(
 @pytest.mark.parametrize(
     "T,B,H,nblocks",
     [
-        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_FWD_SLOW)
-        for (T, B, H, nb) in SLOW_MONARCH_GRID
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_BLOCKDIAG_FWD_SLOW)
+        for (T, B, H, nb) in SLOW_BLOCKDIAG_GRID
     ],
 )
-def test_monarch_fwd_strict_matches_reference_slow(
+def test_blockdiag_fwd_strict_matches_reference_slow(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
     """Identical body to the fast variant; gated behind ``@pytest.mark.slow``
@@ -272,16 +272,16 @@ def test_monarch_fwd_strict_matches_reference_slow(
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
-    layer = _make_monarch_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
+    layer = _make_blockdiag_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
 
     x = torch.randn(T, B, H, device=device)
     h0 = torch.randn(B, H, device=device)
 
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_gi_from_cell(layer, x)
-        ref = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
-        tri = gru_scan_monarch_forward_triton(gi, h0, Wh_struct, bh_cat)
+        ref = gru_scan_blockdiag_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+        tri = gru_scan_blockdiag_forward_triton(gi, h0, Wh_struct, bh_cat)
 
     max_diff = (ref - tri).abs().max().item()
     assert max_diff < 5e-4, (
@@ -293,14 +293,14 @@ def test_monarch_fwd_strict_matches_reference_slow(
 @pytest.mark.parametrize(
     "T,B,H,nblocks",
     [
-        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_BWD)
-        for (T, B, H, nb) in FAST_MONARCH_GRID
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_BLOCKDIAG_BWD)
+        for (T, B, H, nb) in FAST_BLOCKDIAG_GRID
     ],
 )
-def test_monarch_bwd_strict_matches_reference(
+def test_blockdiag_bwd_strict_matches_reference(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
-    """Triton monarch backward gradients must match the PyTorch monarch
+    """Triton blockdiag backward gradients must match the PyTorch blockdiag
     reference on ``(dgi, dh0, dWh_struct, dbh)`` to < 5e-4 absolute under
     ``'highest'`` precision.
 
@@ -311,7 +311,7 @@ def test_monarch_bwd_strict_matches_reference(
     docstring for the full rationale and the bd issue documenting the
     accepted TF32 divergence.
 
-    The realistic-tier sibling at ``tests/test_triton_monarch.py:248``
+    The realistic-tier sibling at ``tests/test_triton_blockdiag.py:248``
     uses ``< 5e-2`` rel under TF32 — that's correct for its regime; not
     loosened by us. Per D-14: any failure here (at < 5e-4 abs) is a
     finding for Plan 02-06 GPU triage (Commit A failing test -> bd issue
@@ -320,29 +320,29 @@ def test_monarch_bwd_strict_matches_reference(
 
     Compares directly via the kernel-pair signatures (not autograd) —
     matches the analog file's pattern at
-    ``tests/test_triton_monarch.py:233-248``: both backward functions
+    ``tests/test_triton_blockdiag.py:233-248``: both backward functions
     return ``(dgi, dh0, dWh_struct, dbh)`` with shapes
     ``([T, B, 3H], [B, H], [3, nblocks, blksz, blksz], [3H])`` per the
     docstring at
-    ``src/gru_qat/triton_kernels/scan_monarch.py:928-934``.
+    ``src/gru_qat/triton_kernels/scan_blockdiag.py:928-934``.
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
-    layer = _make_monarch_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
+    layer = _make_blockdiag_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
 
     x = torch.randn(T, B, H, device=device)
     h0 = torch.randn(B, H, device=device)
 
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_gi_from_cell(layer, x)
-        out_fwd = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+        out_fwd = gru_scan_blockdiag_forward_pytorch(gi, h0, Wh_struct, bh_cat)
         dout = torch.randn(T, B, H, device=device)
 
-        dgi_ref, dh0_ref, dWh_struct_ref, dbh_ref = gru_scan_monarch_backward_pytorch(
+        dgi_ref, dh0_ref, dWh_struct_ref, dbh_ref = gru_scan_blockdiag_backward_pytorch(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout
         )
-        dgi_tri, dh0_tri, dWh_struct_tri, dbh_tri = gru_scan_monarch_backward_triton(
+        dgi_tri, dh0_tri, dWh_struct_tri, dbh_tri = gru_scan_blockdiag_backward_triton(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout
         )
 
@@ -364,11 +364,11 @@ def test_monarch_bwd_strict_matches_reference(
 @pytest.mark.parametrize(
     "T,B,H,nblocks",
     [
-        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_BWD_SLOW)
-        for (T, B, H, nb) in SLOW_MONARCH_GRID
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_BLOCKDIAG_BWD_SLOW)
+        for (T, B, H, nb) in SLOW_BLOCKDIAG_GRID
     ],
 )
-def test_monarch_bwd_strict_matches_reference_slow(
+def test_blockdiag_bwd_strict_matches_reference_slow(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
     """Identical body to the fast variant; gated behind ``@pytest.mark.slow``
@@ -378,21 +378,21 @@ def test_monarch_bwd_strict_matches_reference_slow(
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
-    layer = _make_monarch_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
+    layer = _make_blockdiag_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
 
     x = torch.randn(T, B, H, device=device)
     h0 = torch.randn(B, H, device=device)
 
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_gi_from_cell(layer, x)
-        out_fwd = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+        out_fwd = gru_scan_blockdiag_forward_pytorch(gi, h0, Wh_struct, bh_cat)
         dout = torch.randn(T, B, H, device=device)
 
-        dgi_ref, dh0_ref, dWh_struct_ref, dbh_ref = gru_scan_monarch_backward_pytorch(
+        dgi_ref, dh0_ref, dWh_struct_ref, dbh_ref = gru_scan_blockdiag_backward_pytorch(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout
         )
-        dgi_tri, dh0_tri, dWh_struct_tri, dbh_tri = gru_scan_monarch_backward_triton(
+        dgi_tri, dh0_tri, dWh_struct_tri, dbh_tri = gru_scan_blockdiag_backward_triton(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout
         )
 
@@ -477,15 +477,15 @@ def _assert_quant_parity(
         )
 
 
-def _make_monarch_layer_quant_int8(
+def _make_blockdiag_layer_quant_int8(
     in_size: int, hid: int, nblocks: int = 4, h_scale: float = 0.02
 ) -> GRULayer:
     """Frozen INT8 per-channel weight + per-tensor activation + per-tensor
-    hidden, monarch (block-diagonal) hidden structure.
+    hidden, blockdiag (block-diagonal) hidden structure.
 
     Recipe per CONTEXT D-41 (full INT8 audit recipe — NOT the looser
     fp32-weight + frozen-INT8-hidden shortcut from
-    ``tests/test_triton_monarch.py:130-210``):
+    ``tests/test_triton_blockdiag.py:130-210``):
 
     - weight:    ``bits=8, axis=0, mode='min_max', symmetric=True`` —
       per-channel scale per row of W; ``axis=0`` is the ``hidden_size`` axis.
@@ -493,7 +493,7 @@ def _make_monarch_layer_quant_int8(
     - hidden:    ``bits=8, axis=None, mode='frozen', symmetric=True`` — per-tensor;
       scale is set manually to ``h_scale``.
 
-    Hidden side uses ``StructureConfig(kind='monarch', nblocks=nblocks)``
+    Hidden side uses ``StructureConfig(kind='blockdiag', nblocks=nblocks)``
     — the H×H hidden GEMM becomes a block-diagonal multiply with
     ``[nblocks, blksz, blksz]`` factors per gate (``blksz = H // nblocks``).
     Requires ``H % nblocks == 0`` per ``src/gru_qat/structure.py``.
@@ -526,7 +526,7 @@ def _make_monarch_layer_quant_int8(
             bits=bits, axis=None, mode="frozen", symmetric=True, name="h_int8_pt"
         ),
     )
-    cfg = StructureConfig(kind="monarch", nblocks=nblocks)
+    cfg = StructureConfig(kind="blockdiag", nblocks=nblocks)
     layer = GRULayer(
         in_size, hid, recipe=rec, gate_layout="fused",
         structure_input=None, structure_hidden=cfg,
@@ -591,11 +591,11 @@ def _adversarial_inputs(
 
 # Phase 4 D-49: smaller grid than Phase 2 (bit-identity is binary, not a
 # distribution sweep). T x B x H x nblocks grid; T in {8, 64} (fast),
-# T in {512} slow. H % nblocks == 0 filter enforces monarch's
+# T in {512} slow. H % nblocks == 0 filter enforces blockdiag's
 # divisibility invariant; H ∈ {32, 128, 512} all divisible by nblocks ∈
 # {2, 4, 8} so every combo lands but the filter documents the invariant
 # and protects future grid extensions from non-divisible combos.
-QUANT_MONARCH_FAST_GRID = [
+QUANT_BLOCKDIAG_FAST_GRID = [
     (T, B, H, nblocks)
     for T in (8, 64)
     for B in (1, 4, 32)
@@ -604,7 +604,7 @@ QUANT_MONARCH_FAST_GRID = [
     if H % nblocks == 0
 ]  # 54 cases per D-49
 
-QUANT_MONARCH_SLOW_GRID = [
+QUANT_BLOCKDIAG_SLOW_GRID = [
     (T, B, H, nblocks)
     for T in (512,)
     for B in (1, 4, 32)
@@ -640,17 +640,17 @@ def _build_qgi_from_layer(
 
 
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nblocks", QUANT_MONARCH_FAST_GRID)
+@pytest.mark.parametrize("T,B,H,nblocks", QUANT_BLOCKDIAG_FAST_GRID)
 @pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
-def test_monarch_quant_fwd(
+def test_blockdiag_quant_fwd(
     cls: str, T: int, B: int, H: int, nblocks: int
 ) -> None:
-    """Frozen-INT8 monarch forward must match the PyTorch reference per
+    """Frozen-INT8 blockdiag forward must match the PyTorch reference per
     D-42 + F-04-VERIFIER-A disposition: ``abs_diff < 4 * h_scale``.
 
     F-04-VERIFIER-A (bd ``gru-triton-in0``) — Phase 4 verifier surfaced
     142/162 fast cases failing ``torch.equal`` by exactly one INT8 step.
-    Root cause confirmed by ``.planning/debug/repro_monarch_rounding.py``:
+    Root cause confirmed by ``.planning/debug/repro_blockdiag_rounding.py``:
     PyTorch reference uses ``torch.einsum('bni,gnoi->bgno', ...)`` at full
     fp32 reduction order while Triton uses tiled ``tl.dot`` with
     ``input_precision="tf32"``. The reduction-order non-associativity
@@ -665,22 +665,22 @@ def test_monarch_quant_fwd(
     torch.manual_seed(0)
     device = torch.device("cuda")
     IN = H
-    layer = _make_monarch_layer_quant_int8(
+    layer = _make_blockdiag_layer_quant_int8(
         IN, H, nblocks=nblocks
     ).to(device).eval()
 
     x, h0 = _adversarial_inputs(cls, T, B, IN, device)
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_qgi_from_layer(layer, x)
         h_scale = float(layer.cell.quant_h_in.scale.item())
         h_in_q = (h_scale, -127, 127)
         h_out_q = (h_scale, -127, 127)
-        ref = gru_scan_monarch_forward_pytorch(
+        ref = gru_scan_blockdiag_forward_pytorch(
             gi, h0, Wh_struct, bh_cat,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
-        tri = gru_scan_monarch_forward_triton(
+        tri = gru_scan_blockdiag_forward_triton(
             gi, h0, Wh_struct, bh_cat,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
@@ -699,32 +699,32 @@ def test_monarch_quant_fwd(
 
 @pytest.mark.slow
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nblocks", QUANT_MONARCH_SLOW_GRID)
+@pytest.mark.parametrize("T,B,H,nblocks", QUANT_BLOCKDIAG_SLOW_GRID)
 @pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
-def test_monarch_quant_fwd_slow(
+def test_blockdiag_quant_fwd_slow(
     cls: str, T: int, B: int, H: int, nblocks: int
 ) -> None:
-    """Slow sibling of ``test_monarch_quant_fwd``; gated behind
+    """Slow sibling of ``test_blockdiag_quant_fwd``; gated behind
     ``@pytest.mark.slow`` per D-49 (T=512)."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     IN = H
-    layer = _make_monarch_layer_quant_int8(
+    layer = _make_blockdiag_layer_quant_int8(
         IN, H, nblocks=nblocks
     ).to(device).eval()
 
     x, h0 = _adversarial_inputs(cls, T, B, IN, device)
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_qgi_from_layer(layer, x)
         h_scale = float(layer.cell.quant_h_in.scale.item())
         h_in_q = (h_scale, -127, 127)
         h_out_q = (h_scale, -127, 127)
-        ref = gru_scan_monarch_forward_pytorch(
+        ref = gru_scan_blockdiag_forward_pytorch(
             gi, h0, Wh_struct, bh_cat,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
-        tri = gru_scan_monarch_forward_triton(
+        tri = gru_scan_blockdiag_forward_triton(
             gi, h0, Wh_struct, bh_cat,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
@@ -747,7 +747,7 @@ def test_monarch_quant_fwd_slow(
 # --------------------------------------------------------------------------- #
 
 
-def _skip_if_monarch_bwd_hw_limit(T: int, B: int, H: int, nblocks: int) -> None:
+def _skip_if_blockdiag_bwd_hw_limit(T: int, B: int, H: int, nblocks: int) -> None:
     """F-04-VERIFIER-F (bd gru-triton-e0l): skip shapes that fail kernel
     compile/launch due to RTX 2000 Ada (sm_89) hardware limits, not
     numerical mismatch.
@@ -767,14 +767,14 @@ def _skip_if_monarch_bwd_hw_limit(T: int, B: int, H: int, nblocks: int) -> None:
     blksz = H // nblocks
     if blksz < 16 or blksz >= 128:
         pytest.skip(
-            f"F-04-VERIFIER-F (gru-triton-e0l): monarch bwd kernel cannot "
+            f"F-04-VERIFIER-F (gru-triton-e0l): blockdiag bwd kernel cannot "
             f"run on RTX 2000 Ada at blksz={blksz} (H={H}, nb={nblocks}); "
             f"SMEM OOM or tl.dot K<16 constraint"
         )
 
 
-def _monarch_bwd_mult(cls: str, B: int) -> float:
-    """F-04-VERIFIER-B (bd gru-triton-q3k): per-(cls, B) mult for monarch bwd.
+def _blockdiag_bwd_mult(cls: str, B: int) -> float:
+    """F-04-VERIFIER-B (bd gru-triton-q3k): per-(cls, B) mult for blockdiag bwd.
 
     Verifier surfaced ~61 bwd failures including ``large-magnitude``
     cases where the default < h_scale bound is exceeded by 10-30×.
@@ -807,56 +807,56 @@ def _monarch_bwd_mult(cls: str, B: int) -> float:
     "cls,T,B,H,nblocks",
     [
         _div_param(
-            (cls, T, B, H, nb), f"{cls}-{T}-{B}-{H}-{nb}", _DIV_MONARCH_QUANT_BWD
+            (cls, T, B, H, nb), f"{cls}-{T}-{B}-{H}-{nb}", _DIV_BLOCKDIAG_QUANT_BWD
         )
         for cls in ("realistic", "near-saturation", "large-magnitude")
-        for (T, B, H, nb) in QUANT_MONARCH_FAST_GRID
+        for (T, B, H, nb) in QUANT_BLOCKDIAG_FAST_GRID
     ],
 )
-def test_monarch_quant_bwd(
+def test_blockdiag_quant_bwd(
     cls: str, T: int, B: int, H: int, nblocks: int
 ) -> None:
-    """Frozen-INT8 monarch backward must match the PyTorch reference per
+    """Frozen-INT8 blockdiag backward must match the PyTorch reference per
     D-42 disposition: ``abs_diff < h_scale`` (one INT8 step) on each of
     ``(dgi, dh0, dWh_struct, dbh)`` independently.
 
     Direct kernel call (NOT autograd) — same pattern as Phase 2 strict-tier
-    monarch bwd at lines 213-274, plus D-41 input-quant before ``F.linear``.
+    blockdiag bwd at lines 213-274, plus D-41 input-quant before ``F.linear``.
     """
-    _skip_if_monarch_bwd_hw_limit(T, B, H, nblocks)
+    _skip_if_blockdiag_bwd_hw_limit(T, B, H, nblocks)
     torch.manual_seed(0)
     device = torch.device("cuda")
     IN = H
-    layer = _make_monarch_layer_quant_int8(
+    layer = _make_blockdiag_layer_quant_int8(
         IN, H, nblocks=nblocks
     ).to(device).eval()
 
     x, h0 = _adversarial_inputs(cls, T, B, IN, device)
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_qgi_from_layer(layer, x)
         h_scale = float(layer.cell.quant_h_in.scale.item())
         h_in_q = (h_scale, -127, 127)
         h_out_q = (h_scale, -127, 127)
-        out_fwd = gru_scan_monarch_forward_triton(
+        out_fwd = gru_scan_blockdiag_forward_triton(
             gi, h0, Wh_struct, bh_cat,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
         dout = torch.randn(T, B, H, device=device) * 0.5
 
-        dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_monarch_backward_triton(
+        dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_blockdiag_backward_triton(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
-        dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_monarch_backward_pytorch(
+        dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_blockdiag_backward_pytorch(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
 
     # F-04-VERIFIER-B (bd gru-triton-q3k): per-class h_scale_mult via
-    # ``_monarch_bwd_mult``. Per-grad explicit calls so a single-grad
+    # ``_blockdiag_bwd_mult``. Per-grad explicit calls so a single-grad
     # failure surfaces with its tensor name + cls + shape + nblocks.
-    mult = _monarch_bwd_mult(cls, B)
+    mult = _blockdiag_bwd_mult(cls, B)
     name_suffix = f"[{cls}-T={T}-B={B}-H={H}-nb={nblocks}]"
     _assert_quant_parity(
         f"dgi{name_suffix}", dgi_p, dgi_t, h_scale,
@@ -882,50 +882,50 @@ def test_monarch_quant_bwd(
     "cls,T,B,H,nblocks",
     [
         _div_param(
-            (cls, T, B, H, nb), f"{cls}-{T}-{B}-{H}-{nb}", _DIV_MONARCH_QUANT_BWD_SLOW
+            (cls, T, B, H, nb), f"{cls}-{T}-{B}-{H}-{nb}", _DIV_BLOCKDIAG_QUANT_BWD_SLOW
         )
         for cls in ("realistic", "near-saturation", "large-magnitude")
-        for (T, B, H, nb) in QUANT_MONARCH_SLOW_GRID
+        for (T, B, H, nb) in QUANT_BLOCKDIAG_SLOW_GRID
     ],
 )
-def test_monarch_quant_bwd_slow(
+def test_blockdiag_quant_bwd_slow(
     cls: str, T: int, B: int, H: int, nblocks: int
 ) -> None:
-    """Slow sibling of ``test_monarch_quant_bwd``; gated behind
+    """Slow sibling of ``test_blockdiag_quant_bwd``; gated behind
     ``@pytest.mark.slow`` per D-49 (T=512)."""
-    _skip_if_monarch_bwd_hw_limit(T, B, H, nblocks)
+    _skip_if_blockdiag_bwd_hw_limit(T, B, H, nblocks)
     torch.manual_seed(0)
     device = torch.device("cuda")
     IN = H
-    layer = _make_monarch_layer_quant_int8(
+    layer = _make_blockdiag_layer_quant_int8(
         IN, H, nblocks=nblocks
     ).to(device).eval()
 
     x, h0 = _adversarial_inputs(cls, T, B, IN, device)
     with torch.no_grad():
-        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        Wh_struct, bh_cat = extract_blockdiag_factors(layer.cell)
         gi = _build_qgi_from_layer(layer, x)
         h_scale = float(layer.cell.quant_h_in.scale.item())
         h_in_q = (h_scale, -127, 127)
         h_out_q = (h_scale, -127, 127)
-        out_fwd = gru_scan_monarch_forward_triton(
+        out_fwd = gru_scan_blockdiag_forward_triton(
             gi, h0, Wh_struct, bh_cat,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
         dout = torch.randn(T, B, H, device=device) * 0.5
 
-        dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_monarch_backward_triton(
+        dgi_t, dh0_t, dWh_t, dbh_t = gru_scan_blockdiag_backward_triton(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
-        dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_monarch_backward_pytorch(
+        dgi_p, dh0_p, dWh_p, dbh_p = gru_scan_blockdiag_backward_pytorch(
             gi, h0, Wh_struct, bh_cat, out_fwd, dout,
             h_in_quant=h_in_q, h_out_quant=h_out_q,
         )
 
     # F-04-VERIFIER-B (bd gru-triton-q3k): slow grid uses the same per-cls
-    # mult as the fast grid via ``_monarch_bwd_mult``.
-    mult = _monarch_bwd_mult(cls, B)
+    # mult as the fast grid via ``_blockdiag_bwd_mult``.
+    mult = _blockdiag_bwd_mult(cls, B)
     name_suffix = f"[{cls}-T={T}-B={B}-H={H}-nb={nblocks}]"
     _assert_quant_parity(
         f"dgi{name_suffix}", dgi_p, dgi_t, h_scale,

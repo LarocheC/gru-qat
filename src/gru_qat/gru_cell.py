@@ -273,7 +273,7 @@ class GRUCellQuant(nn.Module):
     def quantize_input_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Quantize the dense input-side weights and return concat'd
         ``(Wi_cat, bi_cat)`` ready for a single F.linear over the whole
-        sequence. Used by the GRULayer Triton-Monarch dispatch path —
+        sequence. Used by the GRULayer Triton fast-dispatch path —
         input side is dense, hidden side is structured.
 
         Raises if the input side is structured (no single dense weight to

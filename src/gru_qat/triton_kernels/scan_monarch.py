@@ -1,12 +1,40 @@
-"""Monarch (block-diagonal) hidden weights for the multi-step GRU scan.
+"""Genuine two-factor Monarch hidden weights for the multi-step GRU scan.
 
-Tier-2 work: structured-hidden-side variant of ``gru_scan_persistent``.
-The hidden weight ``Wh`` is parameterized as three Monarch factors (one
-per gate), each ``[nblocks, blksz, blksz]`` with ``blksz = H/nblocks``.
-The per-step matmul becomes ``nblocks`` independent ``[B, blksz] x
-[blksz, blksz]`` block matmuls — same total FLOPs in the input-bound
-regime, but ``nblocks``× smaller K-reduction per output block, ``nblocks``×
-smaller per-block working set.
+Distinct from ``scan_blockdiag`` (a single block-diagonal factor). Here each
+gate's hidden weight is the two-factor Monarch construction
+(``torch_structured.monarch.MonarchLinear``): a block-diagonal factor ``w1``,
+a transpose-permutation, then a second block-diagonal factor ``w2``. Unlike
+the single block-diagonal factor, this mixes information across all blocks by
+construction (full dense-equivalent rank), which is why it needs both a
+first-factor and a second-factor matmul with a reshuffle between them.
+
+Math (square hidden, ``H`` channels, ``nblocks`` blocks, ``blksz = H/nblocks``):
+
+    X[k, p]      = h[k * blksz + p]                       # reshape to blocks
+    out1[k, q]   = sum_p w1[k, q, p] * X[k, p]            # factor 1 (block-diag)
+    mid[l, r]    = out1_flat[r * nblocks + l]             # transpose-permute
+    gh[s, l]     = sum_r w2[l, s, r] * mid[l, r]          # factor 2 (block-diag)
+    y[s * nblocks + l] = gh[s, l]                         # natural H layout
+
+The permutation ``mid[l, r] = out1_flat[r*nblocks + l]`` is the crux: block
+``l`` of the second factor reads one element from each first-factor block, so
+the two factors cannot both be block-local. The kernel handles it with a
+per-program scratch round-trip (mirrors ``scan_butterfly``'s inter-stage
+scratch): factor 1 writes ``out1`` contiguously, an intra-CTA barrier, then
+factor 2 loads its inputs with a strided (permuted) gather.
+
+Grid is ``(n_pid_b,)`` — one program per batch tile owns ALL H channels for
+its rows, so the recurrence needs no cross-CTA barrier (each program feeds its
+own ``h_t`` back into ``h_{t+1}``); only an intra-CTA ``tl.debug_barrier()``
+separates the two factors, whose scratch traffic crosses warp boundaries.
+
+Backward is a hand-derived reverse-time Triton kernel (same grid /
+scratch-round-trip structure as the forward): per step it recomputes the
+forward, runs the gate backward, factor-2 backward (``dmid`` / ``dW2``, with
+the inverse-permute), then factor-1 backward (``dX`` / ``dW1``), folding the
+matmul term into the carry. Weight gradients accumulate via ``atomic_add``
+(uncontended when ``B <= BLOCK_B``). ``gru_scan_monarch_backward_pytorch``
+(autograd through the forward reference) is the parity ground truth.
 """
 
 from __future__ import annotations
@@ -18,35 +46,41 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from gru_qat.ste import fake_quant_ste
 
-def extract_monarch_factors(cell: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pull the three hidden-side Monarch weights out of a tier-1 cell.
+
+def extract_monarch_factors(
+    cell: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pull the three hidden-side two-factor Monarch weights out of a cell.
 
     Args:
         cell: a ``GRUCellQuant`` whose ``structure_hidden`` was a Monarch
-              ``StructureConfig``. Must have ``struct_Wh_r``, ``struct_Wh_z``,
-              and ``struct_Wh_n`` BlockdiagLinear modules.
+              ``StructureConfig``. Must have ``struct_Wh_r/z/n`` MonarchLinear
+              modules, each exposing ``w1``/``w2`` factor tensors.
 
     Returns:
-        Wh_struct: [3, nblocks, blksz, blksz] — gates stacked in (r, z, n)
-            order, each layer's underlying ``[nblocks, out_blksz, in_blksz]``
-            weight tensor.
+        W1: [3, nblocks, blksz, blksz] — first factors, gates in (r, z, n).
+        W2: [3, nblocks, blksz, blksz] — second factors, gates in (r, z, n).
         bh_cat: [3*H] — concat of (b_hr, b_hz, b_hn).
     """
     if cell._hidden_dense:
         raise ValueError("cell hidden side is dense; nothing to extract")
-    # All three layers share the same shape (square BlockdiagLinear with
-    # in_features == out_features == H).
-    # struct_Wh_* are BlockdiagLinear instances; their `.weight` is the
-    # [nblocks, out_blksz, in_blksz] factor tensor. nn.Module attribute
-    # access is typed Tensor | Module by the torch stubs — cast to the
-    # concrete submodule, then read the Tensor weight.
-    Wr = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_r).weight)
-    Wz = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_z).weight)
-    Wn = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_n).weight)
-    Wh_struct = torch.stack([Wr, Wz, Wn], dim=0)  # [3, nblocks, blksz, blksz]
+
+    def _w(name: str, attr: str) -> torch.Tensor:
+        mod = cast(nn.Module, getattr(cell, name))
+        return cast(torch.Tensor, getattr(mod, attr))
+
+    W1 = torch.stack(
+        [_w("struct_Wh_r", "w1"), _w("struct_Wh_z", "w1"), _w("struct_Wh_n", "w1")],
+        dim=0,
+    )
+    W2 = torch.stack(
+        [_w("struct_Wh_r", "w2"), _w("struct_Wh_z", "w2"), _w("struct_Wh_n", "w2")],
+        dim=0,
+    )
     if cell.b_hr is None:
-        bh_cat = torch.zeros(3 * cell.hidden_size, device=Wh_struct.device, dtype=Wh_struct.dtype)
+        bh_cat = torch.zeros(3 * cell.hidden_size, device=W1.device, dtype=W1.dtype)
     else:
         bh_cat = torch.cat(
             [
@@ -55,349 +89,279 @@ def extract_monarch_factors(cell: nn.Module) -> tuple[torch.Tensor, torch.Tensor
                 cast(torch.Tensor, cell.b_hn),
             ]
         )
-    return Wh_struct, bh_cat
+    return W1, W2, bh_cat
 
 
-def _fake_quant(
-    x: torch.Tensor, params: tuple[float, int, int] | None
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Per-tensor symmetric fake-quant + STE clip mask. None passes through."""
+def _permute_index(nblocks: int, blksz: int, device: torch.device) -> torch.Tensor:
+    """Gather index realizing mid[l, r] = out1_flat[r*nblocks + l].
+
+    Returned as a flat [nblocks*blksz] index into out1_flat, laid out
+    row-major over (l, r) so ``out1_flat[idx].view(nblocks, blksz) == mid``.
+    """
+    lb = torch.arange(nblocks, device=device).view(nblocks, 1)
+    rb = torch.arange(blksz, device=device).view(1, blksz)
+    return (rb * nblocks + lb).reshape(-1)
+
+
+def _ste(x: torch.Tensor, params: tuple[float, int, int] | None) -> torch.Tensor:
+    """Differentiable per-tensor symmetric fake-quant (STE). None passes through."""
     if params is None:
-        return x, None
+        return x
     scale, qmin, qmax = params
-    q_unclamped = torch.round(x / scale)
-    mask = (q_unclamped >= qmin) & (q_unclamped <= qmax)
-    q_clamped = q_unclamped.clamp(qmin, qmax)
-    return q_clamped * scale, mask
+    return fake_quant_ste(
+        x,
+        torch.tensor(scale, device=x.device, dtype=x.dtype),
+        torch.zeros((), device=x.device, dtype=x.dtype),
+        float(qmin),
+        float(qmax),
+    )
 
 
 def gru_scan_monarch_forward_pytorch(
     gi: torch.Tensor,
     h0: torch.Tensor,
-    Wh_struct: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
     bh_cat: torch.Tensor,
     *,
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
-    """Reference forward for the block-diagonal scan, in PyTorch.
+    """Reference forward for the two-factor Monarch scan, in PyTorch.
+
+    Differentiable (STE fake-quant), so it doubles as the backward reference.
 
     Args:
         gi: [T, B, 3H] — pre-batched input projection (already with bi).
         h0: [B, H]
-        Wh_struct: [3, nblocks, blksz, blksz]
+        W1, W2: [3, nblocks, blksz, blksz] — per-gate Monarch factors.
         bh_cat: [3H]
-        h_in_quant: optional (scale, qmin, qmax) for matmul-side h.
+        h_in_quant: optional (scale, qmin, qmax) for the matmul-side h.
         h_out_quant: optional (scale, qmin, qmax) for h_new before store.
     Returns:
         out: [T, B, H] — hidden state at every timestep.
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    n_gates, nblocks, out_blksz, in_blksz = Wh_struct.shape
+    n_gates, nblocks, blksz, in_blksz = W1.shape
     assert n_gates == 3
-    assert out_blksz == in_blksz, "square Monarch only"
-    assert nblocks * out_blksz == H, f"nblocks*blksz={nblocks*out_blksz} != H={H}"
+    assert blksz == in_blksz, "square Monarch only"
+    assert nblocks * blksz == H, f"nblocks*blksz={nblocks * blksz} != H={H}"
 
-    blksz = out_blksz
-    out = torch.empty(T, B, H, device=gi.device, dtype=gi.dtype)
-    h = h0
+    perm = _permute_index(nblocks, blksz, gi.device)
     bh = bh_cat.view(3, H)
 
+    def monarch2(h_mm: torch.Tensor, g: int) -> torch.Tensor:
+        X = h_mm.view(B, nblocks, blksz)
+        out1 = torch.einsum("kqp,bkp->bkq", W1[g], X).reshape(B, nblocks * blksz)
+        mid = out1[:, perm].view(B, nblocks, blksz)
+        out2 = torch.einsum("lsr,blr->bsl", W2[g], mid)  # [B, s, l]
+        return out2.reshape(B, blksz * nblocks)  # flat s*nblocks + l
+
+    h = h0
+    outs: list[torch.Tensor] = []
     for t in range(T):
-        # quant_h_in only on the matmul-side (direct contribution uses raw h).
-        h_for_matmul, _ = _fake_quant(h, h_in_quant)
-        h_chunks = h_for_matmul.view(B, nblocks, blksz)
-        gh = torch.einsum("bni,gnoi->bgno", h_chunks, Wh_struct)
-        gh = gh.reshape(B, 3, H) + bh
-        gh_r, gh_z, gh_n = gh[:, 0, :], gh[:, 1, :], gh[:, 2, :]
+        h_mm = _ste(h, h_in_quant)
+        gh_r = monarch2(h_mm, 0) + bh[0]
+        gh_z = monarch2(h_mm, 1) + bh[1]
+        gh_n = monarch2(h_mm, 2) + bh[2]
 
         gi_r = gi[t, :, 0:H]
-        gi_z = gi[t, :, H:2 * H]
-        gi_n = gi[t, :, 2 * H:3 * H]
+        gi_z = gi[t, :, H : 2 * H]
+        gi_n = gi[t, :, 2 * H : 3 * H]
 
         r = torch.sigmoid(gi_r + gh_r)
         z = torch.sigmoid(gi_z + gh_z)
         n = torch.tanh(gi_n + r * gh_n)
         h_new = (1.0 - z) * n + z * h
-        h_new, _ = _fake_quant(h_new, h_out_quant)
-        out[t] = h_new
+        h_new = _ste(h_new, h_out_quant)
+        outs.append(h_new)
         h = h_new
 
-    return out
+    return torch.stack(outs, dim=0)
 
 
 @triton.jit  # type: ignore[untyped-decorator]
 def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
-    Wh_ptr,            # [3, nblocks, blksz, blksz], fp32
+    W1_ptr,            # [3, nblocks, blksz, blksz], fp32
+    W2_ptr,            # [3, nblocks, blksz, blksz], fp32
     bh_ptr,            # [3H], fp32
+    scratch_ptr,       # [3, B, H], fp32 (per-program rows; factor-1 output)
     out_ptr,           # [T, B, H], fp32
-    barrier_ptr,       # [T], int32
     T,
     B,
     sg_t, sg_b,
     sh0_b,
-    sW_g, sW_n, sW_o,
+    sW_g, sW_n, sW_o,   # W1/W2 strides (identical layout): gate, block, out-row
+    ss_g, ss_b,         # scratch strides: gate, batch
     so_t, so_b,
-    NUM_PROGRAMS,
-    h_in_scale,
-    h_in_qmin,
-    h_in_qmax,
-    h_out_scale,
-    h_out_qmin,
-    h_out_qmax,
+    h_in_scale, h_in_qmin, h_in_qmax,
+    h_out_scale, h_out_qmin, h_out_qmax,
     H: tl.constexpr,
-    BLKSZ: tl.constexpr,
-    BLKSZ_PAD: tl.constexpr,
+    BLKSZ: tl.constexpr,   # power of 2, >= 16
     NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
 ):
-    """Persistent forward over the block-diagonal recurrence.
+    """Forward over the two-factor Monarch recurrence.
 
-    Grid (pid_b, pid_block): each program handles ALL 3 gates for ONE
-    block, producing [BLOCK_B, blksz] of h_t for that block. Block
-    boundaries don't mix in the matmul (block-diagonal), so the K
-    reduction is only over blksz instead of full H — that's where the
-    win comes from.
-
-    BLKSZ may be any positive integer; BLKSZ_PAD is the next power of 2
-    (Triton requires pow-2 ``tl.arange`` lengths). mask_oh = offs_oh <
-    BLKSZ excludes the padded tail from every memory op so we don't
-    corrupt the adjacent block / gate slice in the dense H/3H tensors.
+    Grid ``(pid_b,)``: each program owns ``BLOCK_B`` batch rows across ALL H
+    channels. Per timestep it runs factor 1 for all three gates into a scratch
+    buffer, a CTA barrier, then factor 2 + the gate recurrence per output
+    block. No cross-CTA barrier is needed because a program's rows never touch
+    another program's rows.
     """
     pid_b = tl.program_id(0)
-    pid_block = tl.program_id(1)
-
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
-    offs_oh = tl.arange(0, BLKSZ_PAD)  # output rows within this block (padded)
-    mask_oh = offs_oh < BLKSZ
-
-    # Output position in flat 3H layout: gate * H + pid_block * BLKSZ + offs_oh.
-    # h-input range: pid_block * BLKSZ + offs_k.
-
-    # Pre-load the bias slice for this (gate, block) — 3 chunks of BLKSZ.
-    bh_offset = pid_block * BLKSZ
-    bhr_tile = tl.load(bh_ptr + 0 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
-    bhz_tile = tl.load(bh_ptr + 1 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
-    bhn_tile = tl.load(bh_ptr + 2 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
+    ar = tl.arange(0, BLKSZ)  # within-block index (p / q / r / s), BLKSZ is pow2
 
     h_in_ptr = h0_ptr
     sh_b = sh0_b
 
     for t in range(0, T):
-        ghr = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
-        ghz = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
-        ghn = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
-
-        for k in range(0, BLKSZ, BLOCK_K):
-            offs_k = k + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < BLKSZ
-
-            # h_block tile: [BLOCK_B, BLOCK_K] read from the current h_in
-            # at the input slice of pid_block.
-            h_ptrs = (
-                h_in_ptr
-                + offs_b[:, None] * sh_b
-                + (pid_block * BLKSZ + offs_k)[None, :]
-            )
-            h_tile = tl.load(
-                h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
-            )
-            # quant_h_in only on the matmul-side h. The direct contribution
-            # to h_new uses raw h_old below — matches gru_cell.step.
+        # ---- factor 1: out1[g, :, k, q] -> scratch[g] at flat k*BLKSZ + q ----
+        for k in range(0, NBLOCKS):
+            cols = k * BLKSZ + ar  # p positions in h (contiguous block k)
+            h_ptrs = h_in_ptr + offs_b[:, None] * sh_b + cols[None, :]
+            hk = tl.load(h_ptrs, mask=mask_b[:, None], other=0.0)
             if QUANT_H_IN:
-                q = tl.extra.cuda.libdevice.rint(h_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(hk / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
-                h_tile = q * h_in_scale
+                hk = q * h_in_scale
+            for g in range(0, 3):
+                w1 = tl.load(
+                    W1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :]
+                )  # [q, p]
+                o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")  # [BB, q]
+                s_ptrs = (
+                    scratch_ptr + g * ss_g + offs_b[:, None] * ss_b + cols[None, :]
+                )
+                tl.store(s_ptrs, o1, mask=mask_b[:, None])
 
-            # Three W tiles, one per gate. Each is [BLKSZ_PAD, BLOCK_K].
-            # mask_oh zeroes the padded oh rows so they contribute 0 to
-            # the dot product over the BLKSZ_PAD axis.
-            W_block_offset = pid_block * sW_n
-            W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
-            W_mask = mask_oh[:, None] & mask_k[None, :]
-            Wr_tile = tl.load(
-                Wh_ptr + 0 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+        tl.debug_barrier()
+
+        # ---- factor 2 + gate recurrence, per output block lb ----
+        for lb in range(0, NBLOCKS):
+            chan = lb + NBLOCKS * ar  # output channels o = s*NBLOCKS + lb; mid r positions
+
+            # gate r/z/n second factor: gh[:, s] = mid[:, r] @ w2[lb].T
+            mid_r = tl.load(
+                scratch_ptr + 0 * ss_g + offs_b[:, None] * ss_b + chan[None, :],
+                mask=mask_b[:, None], other=0.0,
             )
-            Wz_tile = tl.load(
-                Wh_ptr + 1 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+            mid_z = tl.load(
+                scratch_ptr + 1 * ss_g + offs_b[:, None] * ss_b + chan[None, :],
+                mask=mask_b[:, None], other=0.0,
             )
-            Wn_tile = tl.load(
-                Wh_ptr + 2 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+            mid_n = tl.load(
+                scratch_ptr + 2 * ss_g + offs_b[:, None] * ss_b + chan[None, :],
+                mask=mask_b[:, None], other=0.0,
             )
+            w2r = tl.load(W2_ptr + 0 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            w2z = tl.load(W2_ptr + 1 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            w2n = tl.load(W2_ptr + 2 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            ghr = tl.dot(mid_r, tl.trans(w2r), input_precision="tf32")
+            ghz = tl.dot(mid_z, tl.trans(w2z), input_precision="tf32")
+            ghn = tl.dot(mid_n, tl.trans(w2n), input_precision="tf32")
 
-            ghr += tl.dot(h_tile, tl.trans(Wr_tile), input_precision="tf32")
-            ghz += tl.dot(h_tile, tl.trans(Wz_tile), input_precision="tf32")
-            ghn += tl.dot(h_tile, tl.trans(Wn_tile), input_precision="tf32")
+            bhr = tl.load(bh_ptr + 0 * H + chan)
+            bhz = tl.load(bh_ptr + 1 * H + chan)
+            bhn = tl.load(bh_ptr + 2 * H + chan)
+            ghr += bhr[None, :]
+            ghz += bhz[None, :]
+            ghn += bhn[None, :]
 
-        ghr += bhr_tile[None, :]
-        ghz += bhz_tile[None, :]
-        ghn += bhn_tile[None, :]
+            gi_base = gi_ptr + t * sg_t + offs_b[:, None] * sg_b + chan[None, :]
+            gir = tl.load(gi_base + 0 * H, mask=mask_b[:, None], other=0.0)
+            giz = tl.load(gi_base + 1 * H, mask=mask_b[:, None], other=0.0)
+            gin = tl.load(gi_base + 2 * H, mask=mask_b[:, None], other=0.0)
 
-        # gi[t] tile for this block, three gate slices.
-        gi_base = (
-            gi_ptr
-            + t * sg_t
-            + offs_b[:, None] * sg_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        gi_mask = mask_b[:, None] & mask_oh[None, :]
-        gir = tl.load(gi_base + 0 * H, mask=gi_mask, other=0.0)
-        giz = tl.load(gi_base + 1 * H, mask=gi_mask, other=0.0)
-        gin = tl.load(gi_base + 2 * H, mask=gi_mask, other=0.0)
+            r = tl.sigmoid(gir + ghr)
+            z = tl.sigmoid(giz + ghz)
+            n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
 
-        r = tl.sigmoid(gir + ghr)
-        z = tl.sigmoid(giz + ghz)
-        n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
+            h_old = tl.load(
+                h_in_ptr + offs_b[:, None] * sh_b + chan[None, :],
+                mask=mask_b[:, None], other=0.0,
+            )
+            h_new = (1.0 - z) * n + z * h_old
+            if QUANT_H_OUT:
+                q = tl.extra.cuda.libdevice.rint(h_new / h_out_scale)
+                q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
+                h_new = q * h_out_scale
 
-        # h_t = (1-z)*n + z*h_prev at THIS block's output positions.
-        h_old_ptrs = (
-            h_in_ptr
-            + offs_b[:, None] * sh_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        h_old = tl.load(h_old_ptrs, mask=gi_mask, other=0.0)
-        h_new = (1.0 - z) * n + z * h_old
-
-        if QUANT_H_OUT:
-            q = tl.extra.cuda.libdevice.rint(h_new / h_out_scale)
-            q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
-            h_new = q * h_out_scale
-
-        out_ptrs = (
-            out_ptr
-            + t * so_t
-            + offs_b[:, None] * so_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        tl.store(out_ptrs, h_new, mask=gi_mask)
-
-        # Cross-CTA barrier: pair release/acquire same as dense persistent.
-        tl.atomic_add(barrier_ptr + t, 1, sem="release")
-        done = tl.atomic_add(barrier_ptr + t, 0, sem="acquire")
-        while done < NUM_PROGRAMS:
-            done = tl.atomic_add(barrier_ptr + t, 0, sem="acquire")
+            out_ptrs = out_ptr + t * so_t + offs_b[:, None] * so_b + chan[None, :]
+            tl.store(out_ptrs, h_new, mask=mask_b[:, None])
 
         h_in_ptr = out_ptr + t * so_t
         sh_b = so_b
 
 
-def _pick_tile(blksz_pad: int, *, fwd: bool) -> tuple[int, int, int]:
-    """Pick (BLOCK_B, BLOCK_K, num_stages) given the padded block size.
-
-    Triton's tl.dot needs all tile dims >= 16, so BLOCK_B and BLOCK_K
-    stay at 16 minimum. The dominant smem consumer is the three W
-    tiles (3 * BLKSZ_PAD * BLOCK_K * 4 bytes), double-buffered when
-    num_stages > 1. Below the threshold the default (32, num_stages=2
-    fwd / 1 bwd) keeps tensor cores fed; at large BLKSZ_PAD we drop to
-    BLOCK_K=16 + num_stages=1 to stay under the 4090's 100KB SMEM/SM.
-    """
-    block_b = 16
-    if blksz_pad <= 128:
-        # Default 4090-comfortable config: W tiles = 3 * 128 * 32 * 4 = 48KB
-        # plus accumulators 3 * 16 * 128 * 4 = 24KB. ~72KB total before
-        # double-buffer — fits at num_stages=2.
-        block_k = 32
-        num_stages = 2 if fwd else 1
-    else:
-        # BLKSZ_PAD=256: with BLOCK_K=16 num_stages=1 the W tiles are
-        # 3 * 256 * 16 * 4 = 48KB and accumulators 48KB = 96KB. Just under
-        # the 100KB limit on a 4090.
-        block_k = 16
-        num_stages = 1
-    return block_b, block_k, num_stages
-
-
 def gru_scan_monarch_forward_triton(
     gi: torch.Tensor,
     h0: torch.Tensor,
-    Wh_struct: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
     bh_cat: torch.Tensor,
     *,
-    block_b: int | None = None,
-    block_k: int | None = None,
+    block_b: int = 32,
     num_warps: int = 4,
-    num_stages: int | None = None,
+    num_stages: int = 2,
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
-    """Triton forward for the Monarch hidden-side scan."""
-    if not (gi.is_cuda and Wh_struct.is_cuda):
-        raise ValueError(
-            "gi and Wh_struct must be CUDA tensors; got devices "
-            f"gi={gi.device}, Wh_struct={Wh_struct.device}"
-        )
+    """Triton forward for the two-factor Monarch hidden-side scan."""
+    if not (gi.is_cuda and W1.is_cuda and W2.is_cuda):
+        raise ValueError("gi, W1, W2 must be CUDA tensors")
     T, B, three_H = gi.shape
     H = three_H // 3
-    n_gates, nblocks, out_blksz, in_blksz = Wh_struct.shape
-    if n_gates != 3:
+    n_gates, nblocks, blksz, in_blksz = W1.shape
+    if n_gates != 3 or W2.shape[0] != 3:
+        raise ValueError(f"W1/W2 dim 0 (n_gates) must be 3; got {n_gates}, {W2.shape[0]}")
+    if not (blksz == in_blksz and nblocks * blksz == H):
         raise ValueError(
-            f"Wh_struct dim 0 (n_gates) must be 3; got {n_gates} "
-            f"(shape {tuple(Wh_struct.shape)})"
+            f"Monarch factors must be square and tile H: got nblocks={nblocks}, "
+            f"blksz={blksz}x{in_blksz}, H={H}"
         )
-    if not (out_blksz == in_blksz == H // nblocks):
+    if tuple(W2.shape) != (3, nblocks, blksz, blksz):
+        raise ValueError(f"W2 shape {tuple(W2.shape)} != W1 shape {tuple(W1.shape)}")
+    if blksz < 16 or (blksz & (blksz - 1)) != 0:
         raise ValueError(
-            f"Wh_struct block dims must be square and tile H: expected "
-            f"out_blksz == in_blksz == H // nblocks == {H // nblocks}; got "
-            f"out_blksz={out_blksz}, in_blksz={in_blksz}, H={H}, nblocks={nblocks}"
+            f"Triton Monarch kernel requires blksz (=H/nblocks) a power of 2 >= 16; "
+            f"got blksz={blksz} (H={H}, nblocks={nblocks}). Use the reference path."
         )
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
-    Wh_struct = Wh_struct.contiguous()
+    W1 = W1.contiguous()
+    W2 = W2.contiguous()
     bh_cat = bh_cat.contiguous()
 
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
-    barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
+    scratch = torch.empty((3, B, H), device=gi.device, dtype=gi.dtype)
 
-    blksz_pad = triton.next_power_of_2(out_blksz)
-    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
-    auto_b, auto_k, auto_s = _pick_tile(blksz_pad, fwd=True)
-    if block_b is None:
-        block_b = auto_b
-    if block_k is None:
-        block_k = auto_k
-    if num_stages is None:
-        num_stages = auto_s
-    n_pid_b = triton.cdiv(B, block_b)
-    num_programs = n_pid_b * nblocks
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -(2**31), 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -(2**31), 2**31 - 1)
 
-    if num_programs > sm_count:
-        raise RuntimeError(
-            f"persistent grid {num_programs} > SM count {sm_count}; "
-            f"would deadlock on the spin-wait barrier."
-        )
-
-    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
-    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
-
-    grid = (n_pid_b, nblocks)
+    grid = (triton.cdiv(B, block_b),)
     gru_scan_monarch_fwd_kernel[grid](
-        gi, h0, Wh_struct, bh_cat, out,
-        barrier,
+        gi, h0, W1, W2, bh_cat, scratch, out,
         T, B,
         gi.stride(0), gi.stride(1),
         h0.stride(0),
-        Wh_struct.stride(0), Wh_struct.stride(1), Wh_struct.stride(2),
+        W1.stride(0), W1.stride(1), W1.stride(2),
+        scratch.stride(0), scratch.stride(1),
         out.stride(0), out.stride(1),
-        num_programs,
         in_s, in_qmin, in_qmax,
         out_s, out_qmin, out_qmax,
         H=H,
-        BLKSZ=out_blksz,
-        BLKSZ_PAD=blksz_pad,
+        BLKSZ=blksz,
         NBLOCKS=nblocks,
         BLOCK_B=block_b,
-        BLOCK_K=block_k,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps,
@@ -406,648 +370,337 @@ def gru_scan_monarch_forward_triton(
     return out
 
 
+def gru_scan_monarch_backward_pytorch(
+    gi: torch.Tensor,
+    h0: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
+    bh_cat: torch.Tensor,
+    dout: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference backward: autograd through the differentiable forward.
+
+    Returns ``(dgi, dh0, dW1, dW2, dbh)``. Ground truth for the Triton
+    backward kernel.
+    """
+    leaves = [t.detach().requires_grad_(True) for t in (gi, h0, W1, W2, bh_cat)]
+    out = gru_scan_monarch_forward_pytorch(
+        *leaves, h_in_quant=h_in_quant, h_out_quant=h_out_quant
+    )
+    grads = torch.autograd.grad(out, leaves, grad_outputs=dout, allow_unused=True)
+    return tuple(  # type: ignore[return-value]
+        g if g is not None else torch.zeros_like(t) for g, t in zip(grads, leaves)
+    )
+
+
 @triton.jit  # type: ignore[untyped-decorator]
 def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
-    # forward inputs (read-only)
-    gi_ptr,              # [T, B, 3H]
-    h0_ptr,              # [B, H]
-    Wh_ptr,              # [3, nblocks, blksz, blksz]
-    bh_ptr,              # [3H]
-    out_ptr,             # [T, B, H]
-    # upstream
-    dout_ptr,            # [T, B, H]
-    # outputs
-    dgi_ptr,             # [T, B, 3H]
-    dh0_ptr,             # [B, H]
-    # per-pid_b partial buffers (reduced across pid_b in Python)
-    dWh_partial_ptr,     # [num_pid_b, 3, nblocks, blksz, blksz]
-    dbh_partial_ptr,     # [num_pid_b, 3H]
-    # scratch dh_acc buffer (per-block disjoint, no ping-pong needed because
-    # block-diagonal structure means no cross-program writes to same cell)
-    dh_acc_ptr,          # [B, H]
-    barrier_ptr,         # [T] int32
-    T, B,
+    gi_ptr,            # [T, B, 3H]
+    hprev_ptr,         # [T, B, H]   h_prev[t] = h_{t-1}  (= cat([h0], out[:-1]))
+    W1_ptr,            # [3, nblocks, blksz, blksz]
+    W2_ptr,            # [3, nblocks, blksz, blksz]
+    bh_ptr,            # [3H]
+    dout_ptr,          # [T, B, H]   upstream grad
+    dgi_ptr,           # [T, B, 3H]  (out)
+    dh0_ptr,           # [B, H]      (out)
+    dW1_ptr,           # [3, nblocks, blksz, blksz]  (out, zero-init, atomic)
+    dW2_ptr,           # [3, nblocks, blksz, blksz]  (out, zero-init, atomic)
+    dbh_ptr,           # [3H]        (out, zero-init, atomic)
+    carry_ptr,         # [B, H]      scratch (zero-init)
+    out1_ptr,          # [3, B, H]   scratch (factor-1 recompute)
+    dout1_ptr,         # [3, B, H]   scratch (inverse-permuted dmid)
+    T,
+    B,
     sg_t, sg_b,
-    sh0_b,
+    shp_t, shp_b,
     sW_g, sW_n, sW_o,
-    so_t, so_b,
-    sdo_t, sdo_b,
+    sd_t, sd_b,          # dout strides
     sdgi_t, sdgi_b,
-    sdh0_b,
-    sdWp_pid, sdWp_g, sdWp_n, sdWp_o,
-    sdbp_pid,
-    sdh_b,
-    NUM_PROGRAMS,
-    h_in_scale,
-    h_in_qmin,
-    h_in_qmax,
-    h_out_scale,
-    h_out_qmin,
-    h_out_qmax,
+    ss_g, ss_b,
+    scarry_b,
+    h_in_scale, h_in_qmin, h_in_qmax,
+    h_out_scale, h_out_qmin, h_out_qmax,
     H: tl.constexpr,
     BLKSZ: tl.constexpr,
-    BLKSZ_PAD: tl.constexpr,
     NBLOCKS: tl.constexpr,
     BLOCK_B: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
 ):
-    """Persistent backward over block-diagonal recurrence.
+    """Reverse-time backward for the two-factor Monarch recurrence.
 
-    Each program owns one (batch_tile, output_block) and stays in that
-    slot for all T timesteps. dh_acc accumulation, dWh partial, and dbh
-    partial are all partition-disjoint across (pid_b, pid_block) pairs:
-    block i's dh_via_W only feeds block i's input slice. So no atomic
-    adds or ping-pong buffers — just a single dh_acc scratch with a
-    cross-CTA barrier between timesteps.
-
-    BLKSZ may be any positive integer; BLKSZ_PAD is the next power of 2.
-    mask_oh = offs_oh < BLKSZ excludes the padded tail from every memory
-    op so we don't corrupt adjacent block / gate slices.
+    Grid ``(pid_b,)``: each program owns ``BLOCK_B`` batch rows across all H
+    and walks t from T-1 down to 0, carrying ``dh`` (grad w.r.t. the current
+    hidden state) in the ``carry`` buffer. Per step it recomputes the forward
+    (factor 1 -> scratch, factor 2), runs the gate backward, factor-2 backward
+    (dmid + dW2) with the inverse-permute into ``dout1``, then factor-1
+    backward (dX + dW1) folding the matmul term into the carry. Weight grads
+    accumulate via ``atomic_add`` (uncontended when B <= BLOCK_B).
     """
     pid_b = tl.program_id(0)
-    pid_block = tl.program_id(1)
-
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
-    offs_oh = tl.arange(0, BLKSZ_PAD)
-    mask_oh = offs_oh < BLKSZ
-    mask_bo = mask_b[:, None] & mask_oh[None, :]
+    mb = mask_b[:, None]
+    ar = tl.arange(0, BLKSZ)
 
-    # Pre-load bias slice (constant across T).
-    bh_offset = pid_block * BLKSZ
-    bhr_tile = tl.load(bh_ptr + 0 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
-    bhz_tile = tl.load(bh_ptr + 1 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
-    bhn_tile = tl.load(bh_ptr + 2 * H + bh_offset + offs_oh, mask=mask_oh, other=0.0)
+    for t in range(T - 1, -1, -1):
+        hprev_row = hprev_ptr + t * shp_t + offs_b[:, None] * shp_b
 
-    # Initialize dh_acc[:, this block range] to zero.
-    dh_acc_init_ptrs = (
-        dh_acc_ptr
-        + offs_b[:, None] * sdh_b
-        + (pid_block * BLKSZ + offs_oh)[None, :]
-    )
-    tl.store(
-        dh_acc_init_ptrs,
-        tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32),
-        mask=mask_bo,
-    )
-
-    for t_rev in range(0, T):
-        t = T - 1 - t_rev
-
-        if t == 0:
-            h_prev_ptr = h0_ptr
-            sh_prev_b = sh0_b
-        else:
-            h_prev_ptr = out_ptr + (t - 1) * so_t
-            sh_prev_b = so_b
-
-        # ---- Recompute forward gh for this (block, all gates) ----
-        ghr = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
-        ghz = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
-        ghn = tl.zeros((BLOCK_B, BLKSZ_PAD), dtype=tl.float32)
-        for k in range(0, BLKSZ, BLOCK_K):
-            offs_k = k + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < BLKSZ
-            h_ptrs = (
-                h_prev_ptr
-                + offs_b[:, None] * sh_prev_b
-                + (pid_block * BLKSZ + offs_k)[None, :]
-            )
-            h_tile = tl.load(
-                h_ptrs, mask=mask_b[:, None] & mask_k[None, :], other=0.0,
-            )
+        # ---- recompute factor 1 -> out1 scratch (all 3 gates) ----
+        for k in range(0, NBLOCKS):
+            cols = k * BLKSZ + ar
+            hk = tl.load(hprev_row + cols[None, :], mask=mb, other=0.0)
             if QUANT_H_IN:
-                q = tl.extra.cuda.libdevice.rint(h_tile / h_in_scale)
+                q = tl.extra.cuda.libdevice.rint(hk / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
-                h_tile = q * h_in_scale
-            W_block_offset = pid_block * sW_n
-            W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
-            W_mask = mask_oh[:, None] & mask_k[None, :]
-            Wr_tile = tl.load(
-                Wh_ptr + 0 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+                hk = q * h_in_scale
+            for g in range(0, 3):
+                w1 = tl.load(W1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :])
+                o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")
+                tl.store(out1_ptr + g * ss_g + offs_b[:, None] * ss_b + cols[None, :], o1, mask=mb)
+        tl.debug_barrier()
+
+        # ---- factor 2 recompute + gate backward + factor 2 backward ----
+        for lb in range(0, NBLOCKS):
+            chan = lb + NBLOCKS * ar
+            cptr = offs_b[:, None] * ss_b + chan[None, :]
+            mid_r = tl.load(out1_ptr + 0 * ss_g + cptr, mask=mb, other=0.0)
+            mid_z = tl.load(out1_ptr + 1 * ss_g + cptr, mask=mb, other=0.0)
+            mid_n = tl.load(out1_ptr + 2 * ss_g + cptr, mask=mb, other=0.0)
+            w2r = tl.load(W2_ptr + 0 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            w2z = tl.load(W2_ptr + 1 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            w2n = tl.load(W2_ptr + 2 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            ghr = tl.dot(mid_r, tl.trans(w2r), input_precision="tf32") + tl.load(bh_ptr + 0 * H + chan)[None, :]
+            ghz = tl.dot(mid_z, tl.trans(w2z), input_precision="tf32") + tl.load(bh_ptr + 1 * H + chan)[None, :]
+            ghn = tl.dot(mid_n, tl.trans(w2n), input_precision="tf32") + tl.load(bh_ptr + 2 * H + chan)[None, :]
+
+            gi_base = gi_ptr + t * sg_t + offs_b[:, None] * sg_b + chan[None, :]
+            gir = tl.load(gi_base + 0 * H, mask=mb, other=0.0)
+            giz = tl.load(gi_base + 1 * H, mask=mb, other=0.0)
+            gin = tl.load(gi_base + 2 * H, mask=mb, other=0.0)
+            r = tl.sigmoid(gir + ghr)
+            z = tl.sigmoid(giz + ghz)
+            n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
+            h_old = tl.load(hprev_row + chan[None, :], mask=mb, other=0.0)
+            h_new_pre = (1.0 - z) * n + z * h_old
+
+            g_ht = (
+                tl.load(dout_ptr + t * sd_t + offs_b[:, None] * sd_b + chan[None, :], mask=mb, other=0.0)
+                + tl.load(carry_ptr + offs_b[:, None] * scarry_b + chan[None, :], mask=mb, other=0.0)
             )
-            Wz_tile = tl.load(
-                Wh_ptr + 1 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+            if QUANT_H_OUT:
+                qo = tl.extra.cuda.libdevice.rint(h_new_pre / h_out_scale)
+                mask_out = (qo >= h_out_qmin) & (qo <= h_out_qmax)
+                g_hp = g_ht * mask_out
+            else:
+                g_hp = g_ht
+
+            dz = g_hp * (h_old - n)
+            dn = g_hp * (1.0 - z)
+            dh_old_direct = g_hp * z
+            dan = dn * (1.0 - n * n)
+            dgh_n = dan * r
+            dr = dan * ghn
+            dgi_n = dan
+            dar = dr * r * (1.0 - r)
+            dgh_r = dar
+            dgi_r = dar
+            daz = dz * z * (1.0 - z)
+            dgh_z = daz
+            dgi_z = daz
+
+            dgi_base = dgi_ptr + t * sdgi_t + offs_b[:, None] * sdgi_b + chan[None, :]
+            tl.store(dgi_base + 0 * H, dgi_r, mask=mb)
+            tl.store(dgi_base + 1 * H, dgi_z, mask=mb)
+            tl.store(dgi_base + 2 * H, dgi_n, mask=mb)
+            # z-part of dh_{t-1} (overwrite carry at these output channels)
+            tl.store(carry_ptr + offs_b[:, None] * scarry_b + chan[None, :], dh_old_direct, mask=mb)
+
+            # dbh: sum over batch rows (invalid rows contribute 0 via g_ht=0)
+            tl.atomic_add(dbh_ptr + 0 * H + chan, tl.sum(dgh_r, axis=0))
+            tl.atomic_add(dbh_ptr + 1 * H + chan, tl.sum(dgh_z, axis=0))
+            tl.atomic_add(dbh_ptr + 2 * H + chan, tl.sum(dgh_n, axis=0))
+
+            # factor 2 backward per gate: dmid + dW2
+            dmid_r = tl.dot(dgh_r, w2r, input_precision="tf32")
+            dmid_z = tl.dot(dgh_z, w2z, input_precision="tf32")
+            dmid_n = tl.dot(dgh_n, w2n, input_precision="tf32")
+            tl.atomic_add(
+                dW2_ptr + 0 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :],
+                tl.dot(tl.trans(dgh_r), mid_r, input_precision="tf32"),
             )
-            Wn_tile = tl.load(
-                Wh_ptr + 2 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+            tl.atomic_add(
+                dW2_ptr + 1 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :],
+                tl.dot(tl.trans(dgh_z), mid_z, input_precision="tf32"),
             )
-            ghr += tl.dot(h_tile, tl.trans(Wr_tile), input_precision="tf32")
-            ghz += tl.dot(h_tile, tl.trans(Wz_tile), input_precision="tf32")
-            ghn += tl.dot(h_tile, tl.trans(Wn_tile), input_precision="tf32")
-        ghr += bhr_tile[None, :]
-        ghz += bhz_tile[None, :]
-        ghn += bhn_tile[None, :]
-
-        gi_base = (
-            gi_ptr
-            + t * sg_t
-            + offs_b[:, None] * sg_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        gir = tl.load(gi_base + 0 * H, mask=mask_bo, other=0.0)
-        giz = tl.load(gi_base + 1 * H, mask=mask_bo, other=0.0)
-        gin = tl.load(gi_base + 2 * H, mask=mask_bo, other=0.0)
-
-        r = tl.sigmoid(gir + ghr)
-        z = tl.sigmoid(giz + ghz)
-        n = tl.extra.cuda.libdevice.tanh(gin + r * ghn)
-
-        # h_prev at THIS block's positions (for dh_prev_direct and (1-z)*n + z*h_prev).
-        h_prev_oh_ptrs = (
-            h_prev_ptr
-            + offs_b[:, None] * sh_prev_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        h_prev_oh = tl.load(h_prev_oh_ptrs, mask=mask_bo, other=0.0)
-
-        # ---- Read incoming dh_acc[this block range].
-        dh_acc_ptrs = (
-            dh_acc_ptr
-            + offs_b[:, None] * sdh_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        dh_acc_oh = tl.load(
-            dh_acc_ptrs, mask=mask_bo, other=0.0,
-        )
-        dout_base = (
-            dout_ptr
-            + t * sdo_t
-            + offs_b[:, None] * sdo_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        dout_oh = tl.load(dout_base, mask=mask_bo, other=0.0)
-        dh_t = dout_oh + dh_acc_oh
-
-        # STE backward of quant_h_out: incoming dh_t is grad on quantized
-        # h_t. Recompute h_t_raw to derive the clip mask.
-        if QUANT_H_OUT:
-            h_t_raw = (1.0 - z) * n + z * h_prev_oh
-            q_unclamped = tl.extra.cuda.libdevice.rint(h_t_raw / h_out_scale)
-            mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
-            dh_t = tl.where(mask_out, dh_t, 0.0)
-
-        # h_t = (1 - z) * n + z * h_prev
-        dn = dh_t * (1.0 - z)
-        dz = dh_t * (h_prev_oh - n)
-        dh_prev_direct = dh_t * z
-
-        dgn_pre = dn * (1.0 - n * n)
-        dgi_n = dgn_pre
-        dr = dgn_pre * ghn
-        dgh_n = dgn_pre * r
-
-        dgz_pre = dz * z * (1.0 - z)
-        dgi_z = dgz_pre
-        dgh_z = dgz_pre
-
-        dgr_pre = dr * r * (1.0 - r)
-        dgi_r = dgr_pre
-        dgh_r = dgr_pre
-
-        # Store dgi[t] for this block range, all 3 gates.
-        dgi_base = (
-            dgi_ptr
-            + t * sdgi_t
-            + offs_b[:, None] * sdgi_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        tl.store(dgi_base + 0 * H, dgi_r, mask=mask_bo)
-        tl.store(dgi_base + 1 * H, dgi_z, mask=mask_bo)
-        tl.store(dgi_base + 2 * H, dgi_n, mask=mask_bo)
-
-        # dbh_partial: each (pid_b, pid_block) is the only writer to its
-        # bias slice rows. Padded oh lanes must be masked or they'd land
-        # in the next block / gate slot.
-        dbh_base = dbh_partial_ptr + pid_b * sdbp_pid + bh_offset + offs_oh
-        tl.store(
-            dbh_base + 0 * H,
-            tl.load(dbh_base + 0 * H, mask=mask_oh, other=0.0) + tl.sum(dgh_r, axis=0),
-            mask=mask_oh,
-        )
-        tl.store(
-            dbh_base + 1 * H,
-            tl.load(dbh_base + 1 * H, mask=mask_oh, other=0.0) + tl.sum(dgh_z, axis=0),
-            mask=mask_oh,
-        )
-        tl.store(
-            dbh_base + 2 * H,
-            tl.load(dbh_base + 2 * H, mask=mask_oh, other=0.0) + tl.sum(dgh_n, axis=0),
-            mask=mask_oh,
-        )
-
-        # ---- dh_prev_via_W and dWh_partial accumulation ----
-        # Both are per-block (no cross-block contributions). For each k-tile,
-        # compute the dh_via_W contribution to dh_acc[this block, k:k+BLOCK_K]
-        # and the dWh contribution dgh^T @ h_prev (per gate).
-        for k in range(0, BLKSZ, BLOCK_K):
-            offs_k = k + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < BLKSZ
-            W_block_offset = pid_block * sW_n
-            W_oh_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
-            W_mask = mask_oh[:, None] & mask_k[None, :]
-            Wr_t = tl.load(
-                Wh_ptr + 0 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
+            tl.atomic_add(
+                dW2_ptr + 2 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :],
+                tl.dot(tl.trans(dgh_n), mid_n, input_precision="tf32"),
             )
-            Wz_t = tl.load(
-                Wh_ptr + 1 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
-            )
-            Wn_t = tl.load(
-                Wh_ptr + 2 * sW_g + W_block_offset + W_oh_offset,
-                mask=W_mask, other=0.0,
-            )
+            # inverse-permute: dout1_flat[r*NBLOCKS + lb] = dmid[lb, r] -> chan positions
+            tl.store(dout1_ptr + 0 * ss_g + cptr, dmid_r, mask=mb)
+            tl.store(dout1_ptr + 1 * ss_g + cptr, dmid_z, mask=mb)
+            tl.store(dout1_ptr + 2 * ss_g + cptr, dmid_n, mask=mb)
+        tl.debug_barrier()
 
-            # dh_via_W tile: sum over gates of dgh[g] @ W[g, :, :]
-            # dgh_r: [BLOCK_B, BLKSZ_PAD], Wr_t: [BLKSZ_PAD, BLOCK_K]
-            # -> [BLOCK_B, BLOCK_K]. Padded oh rows of W are 0 (masked
-            # load), so padded-row garbage in dgh contributes nothing.
-            contrib = (
-                tl.dot(dgh_r, Wr_t, input_precision="tf32")
-                + tl.dot(dgh_z, Wz_t, input_precision="tf32")
-                + tl.dot(dgh_n, Wn_t, input_precision="tf32")
-            )
-            h_prev_k_ptrs = (
-                h_prev_ptr
-                + offs_b[:, None] * sh_prev_b
-                + (pid_block * BLKSZ + offs_k)[None, :]
-            )
-            h_prev_tile_raw = tl.load(
-                h_prev_k_ptrs,
-                mask=mask_b[:, None] & mask_k[None, :],
-                other=0.0,
-            )
+        # ---- factor 1 backward per input block: dX + dW1, fold into carry ----
+        for k in range(0, NBLOCKS):
+            cols = k * BLKSZ + ar
+            kptr = offs_b[:, None] * ss_b + cols[None, :]
+            hk = tl.load(hprev_row + cols[None, :], mask=mb, other=0.0)
             if QUANT_H_IN:
-                q_in_unclamped = tl.extra.cuda.libdevice.rint(
-                    h_prev_tile_raw / h_in_scale
+                q = tl.extra.cuda.libdevice.rint(hk / h_in_scale)
+                mask_in = (q >= h_in_qmin) & (q <= h_in_qmax)
+                xk = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax) * h_in_scale
+            else:
+                xk = hk
+            dhmm = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
+            for g in range(0, 3):
+                dout1_g = tl.load(dout1_ptr + g * ss_g + kptr, mask=mb, other=0.0)
+                w1 = tl.load(W1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :])
+                dhmm += tl.dot(dout1_g, w1, input_precision="tf32")
+                tl.atomic_add(
+                    dW1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :],
+                    tl.dot(tl.trans(dout1_g), xk, input_precision="tf32"),
                 )
-                mask_in = (q_in_unclamped >= h_in_qmin) & (
-                    q_in_unclamped <= h_in_qmax
-                )
-                contrib = tl.where(mask_in, contrib, 0.0)
-
-            # Each k-tile of `contrib` writes to a DIFFERENT range of dh_acc.
-            dh_w_ptrs = (
-                dh_acc_ptr
-                + offs_b[:, None] * sdh_b
-                + (pid_block * BLKSZ + offs_k)[None, :]
-            )
-            tl.store(
-                dh_w_ptrs, contrib,
-                mask=mask_b[:, None] & mask_k[None, :],
-            )
-
-            # dWh_partial accumulation: dgh^T @ h_prev_chunk, per gate.
-            h_prev_tile = h_prev_tile_raw
             if QUANT_H_IN:
-                q = tl.extra.cuda.libdevice.rint(h_prev_tile / h_in_scale)
-                q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
-                h_prev_tile = q * h_in_scale
-            # [BLKSZ_PAD, BLOCK_B] @ [BLOCK_B, BLOCK_K] -> [BLKSZ_PAD, BLOCK_K].
-            # Padded oh rows of dgh^T contain garbage; mask_oh on the
-            # store ensures only real rows reach memory.
-            dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
-            dWz = tl.dot(tl.trans(dgh_z), h_prev_tile, input_precision="tf32")
-            dWn = tl.dot(tl.trans(dgh_n), h_prev_tile, input_precision="tf32")
+                dhmm = dhmm * mask_in
+            cur = tl.load(carry_ptr + offs_b[:, None] * scarry_b + cols[None, :], mask=mb, other=0.0)
+            tl.store(carry_ptr + offs_b[:, None] * scarry_b + cols[None, :], cur + dhmm, mask=mb)
 
-            dWh_base = (
-                dWh_partial_ptr
-                + pid_b * sdWp_pid
-                + pid_block * sdWp_n
-            )
-            Wr_dW_ptrs = dWh_base + 0 * sdWp_g + offs_oh[:, None] * sdWp_o + offs_k[None, :]
-            Wz_dW_ptrs = dWh_base + 1 * sdWp_g + offs_oh[:, None] * sdWp_o + offs_k[None, :]
-            Wn_dW_ptrs = dWh_base + 2 * sdWp_g + offs_oh[:, None] * sdWp_o + offs_k[None, :]
-            dW_mask = mask_oh[:, None] & mask_k[None, :]
-            tl.store(
-                Wr_dW_ptrs,
-                tl.load(Wr_dW_ptrs, mask=dW_mask, other=0.0) + dWr,
-                mask=dW_mask,
-            )
-            tl.store(
-                Wz_dW_ptrs,
-                tl.load(Wz_dW_ptrs, mask=dW_mask, other=0.0) + dWz,
-                mask=dW_mask,
-            )
-            tl.store(
-                Wn_dW_ptrs,
-                tl.load(Wn_dW_ptrs, mask=dW_mask, other=0.0) + dWn,
-                mask=dW_mask,
-            )
-
-        # Add dh_prev_direct to dh_acc[this block range] (offs_oh).
-        dh_dir_ptrs = (
-            dh_acc_ptr
-            + offs_b[:, None] * sdh_b
-            + (pid_block * BLKSZ + offs_oh)[None, :]
-        )
-        existing = tl.load(dh_dir_ptrs, mask=mask_bo, other=0.0)
-        tl.store(dh_dir_ptrs, existing + dh_prev_direct, mask=mask_bo)
-
-        # Cross-CTA barrier: ensures next iteration sees this step's writes.
-        tl.atomic_add(barrier_ptr + t_rev, 1, sem="release")
-        done = tl.atomic_add(barrier_ptr + t_rev, 0, sem="acquire")
-        while done < NUM_PROGRAMS:
-            done = tl.atomic_add(barrier_ptr + t_rev, 0, sem="acquire")
-
-    # Final dh_acc -> dh0 for this block range.
-    dh_final_ptrs = (
-        dh_acc_ptr
-        + offs_b[:, None] * sdh_b
-        + (pid_block * BLKSZ + offs_oh)[None, :]
-    )
-    dh_final = tl.load(
-        dh_final_ptrs, mask=mask_bo, other=0.0,
-    )
-    dh0_ptrs = (
-        dh0_ptr
-        + offs_b[:, None] * sdh0_b
-        + (pid_block * BLKSZ + offs_oh)[None, :]
-    )
-    tl.store(dh0_ptrs, dh_final, mask=mask_bo)
+    # dh0 = final carry
+    for k in range(0, NBLOCKS):
+        cols = k * BLKSZ + ar
+        c = tl.load(carry_ptr + offs_b[:, None] * scarry_b + cols[None, :], mask=mb, other=0.0)
+        tl.store(dh0_ptr + offs_b[:, None] * H + cols[None, :], c, mask=mb)
 
 
 def gru_scan_monarch_backward_triton(
     gi: torch.Tensor,
     h0: torch.Tensor,
-    Wh_struct: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
     bh_cat: torch.Tensor,
     out: torch.Tensor,
     dout: torch.Tensor,
     *,
-    block_b: int | None = None,
-    block_k: int | None = None,
+    block_b: int = 32,
     num_warps: int = 4,
-    num_stages: int | None = None,
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Triton backward for the Monarch hidden-side scan."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton backward for the two-factor Monarch scan.
+
+    Returns ``(dgi, dh0, dW1, dW2, dbh)``. ``out`` is the forward output
+    (used to build ``h_prev[t] = h_{t-1}``).
+    """
     T, B, three_H = gi.shape
     H = three_H // 3
-    n_gates, nblocks, out_blksz, in_blksz = Wh_struct.shape
-    if n_gates != 3:
-        raise ValueError(
-            f"Wh_struct dim 0 (n_gates) must be 3; got {n_gates} "
-            f"(shape {tuple(Wh_struct.shape)})"
-        )
-    if not (out_blksz == in_blksz == H // nblocks):
-        raise ValueError(
-            f"Wh_struct block dims must be square and tile H: expected "
-            f"out_blksz == in_blksz == H // nblocks == {H // nblocks}; got "
-            f"out_blksz={out_blksz}, in_blksz={in_blksz}, H={H}, nblocks={nblocks}"
-        )
+    _, nblocks, blksz, _ = W1.shape
 
     gi = gi.contiguous()
-    h0 = h0.contiguous()
-    Wh_struct = Wh_struct.contiguous()
-    bh_cat = bh_cat.contiguous()
-    out = out.contiguous()
     dout = dout.contiguous()
+    W1 = W1.contiguous()
+    W2 = W2.contiguous()
+    bh_cat = bh_cat.contiguous()
+    # h_prev[t] = h_{t-1}: h0 for t=0, out[t-1] otherwise.
+    h_prev = torch.cat([h0.unsqueeze(0), out[:-1]], dim=0).contiguous()
 
-    dgi = torch.zeros_like(gi)
-    dh0 = torch.zeros_like(h0)
+    dgi = torch.empty_like(gi)
+    dh0 = torch.empty_like(h0)
+    dW1 = torch.zeros_like(W1)
+    dW2 = torch.zeros_like(W2)
+    dbh = torch.zeros_like(bh_cat)
+    carry = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
+    out1 = torch.empty((3, B, H), device=gi.device, dtype=gi.dtype)
+    dout1 = torch.empty((3, B, H), device=gi.device, dtype=gi.dtype)
 
-    blksz_pad = triton.next_power_of_2(out_blksz)
-    sm_count = torch.cuda.get_device_properties(gi.device).multi_processor_count
-    auto_b, auto_k, auto_s = _pick_tile(blksz_pad, fwd=False)
-    if block_b is None:
-        block_b = auto_b
-    if block_k is None:
-        block_k = auto_k
-    if num_stages is None:
-        num_stages = auto_s
-    n_pid_b = triton.cdiv(B, block_b)
-    num_programs = n_pid_b * nblocks
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -(2**31), 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -(2**31), 2**31 - 1)
 
-    if num_programs > sm_count:
-        raise RuntimeError(
-            f"persistent grid {num_programs} > SM count {sm_count}; "
-            f"would deadlock on the spin-wait barrier."
-        )
-
-    dWh_partial = torch.zeros(
-        (n_pid_b, 3, nblocks, out_blksz, in_blksz),
-        device=gi.device, dtype=gi.dtype,
-    )
-    dbh_partial = torch.zeros(
-        (n_pid_b, 3 * H), device=gi.device, dtype=gi.dtype,
-    )
-    dh_acc = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
-    barrier = torch.zeros((T,), device=gi.device, dtype=torch.int32)
-
-    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
-    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
-
-    grid = (n_pid_b, nblocks)
+    grid = (triton.cdiv(B, block_b),)
     gru_scan_monarch_bwd_kernel[grid](
-        gi, h0, Wh_struct, bh_cat, out,
-        dout,
-        dgi, dh0,
-        dWh_partial, dbh_partial,
-        dh_acc, barrier,
+        gi, h_prev, W1, W2, bh_cat, dout,
+        dgi, dh0, dW1, dW2, dbh,
+        carry, out1, dout1,
         T, B,
         gi.stride(0), gi.stride(1),
-        h0.stride(0),
-        Wh_struct.stride(0), Wh_struct.stride(1), Wh_struct.stride(2),
-        out.stride(0), out.stride(1),
+        h_prev.stride(0), h_prev.stride(1),
+        W1.stride(0), W1.stride(1), W1.stride(2),
         dout.stride(0), dout.stride(1),
         dgi.stride(0), dgi.stride(1),
-        dh0.stride(0),
-        dWh_partial.stride(0), dWh_partial.stride(1),
-        dWh_partial.stride(2), dWh_partial.stride(3),
-        dbh_partial.stride(0),
-        dh_acc.stride(0),
-        num_programs,
+        out1.stride(0), out1.stride(1),
+        carry.stride(0),
         in_s, in_qmin, in_qmax,
         out_s, out_qmin, out_qmax,
         H=H,
-        BLKSZ=out_blksz,
-        BLKSZ_PAD=blksz_pad,
+        BLKSZ=blksz,
         NBLOCKS=nblocks,
         BLOCK_B=block_b,
-        BLOCK_K=block_k,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps,
-        num_stages=num_stages,
+        num_stages=1,
     )
-
-    dWh_struct = dWh_partial.sum(dim=0)
-    dbh = dbh_partial.sum(dim=0)
-    return dgi, dh0, dWh_struct, dbh
+    return dgi, dh0, dW1, dW2, dbh
 
 
 class GRUScanMonarchFunction(torch.autograd.Function):
-    """autograd wrapper around the Monarch persistent kernels.
-
-    Forward and backward both use 2D persistent grids (batch_tile,
-    block) with a cross-CTA barrier between timesteps. Optional
-    in-kernel fake-quant on hidden state (per-tensor symmetric, frozen
-    scale) — same semantics as ``GRUScanPersistentFunction``.
-    """
+    """Autograd bridge: fused Triton forward and hand-derived Triton backward."""
 
     @staticmethod
     def forward(
         ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
-        Wh_struct: torch.Tensor,
+        W1: torch.Tensor,
+        W2: torch.Tensor,
         bh_cat: torch.Tensor,
         h_in_quant: tuple[float, int, int] | None,
         h_out_quant: tuple[float, int, int] | None,
     ) -> torch.Tensor:
         out = gru_scan_monarch_forward_triton(
-            gi, h0, Wh_struct, bh_cat,
+            gi, h0, W1, W2, bh_cat,
             h_in_quant=h_in_quant, h_out_quant=h_out_quant,
         )
-        ctx.save_for_backward(gi, h0, Wh_struct, bh_cat, out)
+        ctx.save_for_backward(gi, h0, W1, W2, bh_cat, out)
         ctx.h_in_quant = h_in_quant
         ctx.h_out_quant = h_out_quant
         return out
 
     @staticmethod
-    def backward(
-        ctx: Any, dout: torch.Tensor
-    ) -> Any:
-        gi, h0, Wh_struct, bh_cat, out = ctx.saved_tensors
-        grads = gru_scan_monarch_backward_triton(
-            gi, h0, Wh_struct, bh_cat, out, dout,
+    def backward(ctx: Any, dout: torch.Tensor) -> Any:
+        gi, h0, W1, W2, bh_cat, out = ctx.saved_tensors
+        dgi, dh0, dW1, dW2, dbh = gru_scan_monarch_backward_triton(
+            gi, h0, W1, W2, bh_cat, out, dout.contiguous(),
             h_in_quant=ctx.h_in_quant, h_out_quant=ctx.h_out_quant,
         )
-        return (*grads, None, None)
+        return dgi, dh0, dW1, dW2, dbh, None, None
 
 
 def gru_scan_monarch(
     gi: torch.Tensor,
     h0: torch.Tensor,
-    Wh_struct: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
     bh_cat: torch.Tensor,
     *,
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
-    """Public API: differentiable Monarch-hidden-side GRU scan.
+    """Public autograd wrapper for the two-factor Monarch scan.
 
-    Mirror of ``gru_scan_persistent`` but with block-diagonal Wh:
-    - ``Wh_struct: [3, nblocks, blksz, blksz]`` where ``blksz = H/nblocks``.
-    - ``bh_cat: [3*H]``, same as dense.
-    With ``h_in_quant`` / ``h_out_quant`` supplied (each
-    ``(scale, qmin, qmax)``), the kernel applies in-kernel fake-quant on
-    hidden state every step, identical to ``gru_scan_persistent``.
-    Use ``extract_monarch_factors(cell)`` to pull factors out of a
-    tier-1 structured GRUCellQuant.
+    - ``gi: [T, B, 3H]`` pre-batched input projection.
+    - ``W1, W2: [3, nblocks, blksz, blksz]`` per-gate Monarch factors.
+    - ``bh_cat: [3H]`` hidden bias.
+    Returns ``out: [T, B, H]``.
     """
     return cast(
         torch.Tensor,
         GRUScanMonarchFunction.apply(  # type: ignore[no-untyped-call]
-            gi, h0, Wh_struct, bh_cat, h_in_quant, h_out_quant
+            gi, h0, W1, W2, bh_cat, h_in_quant, h_out_quant
         ),
     )
-
-
-def gru_scan_monarch_backward_pytorch(
-    gi: torch.Tensor,
-    h0: torch.Tensor,
-    Wh_struct: torch.Tensor,
-    bh_cat: torch.Tensor,
-    out: torch.Tensor,
-    dout: torch.Tensor,
-    *,
-    h_in_quant: tuple[float, int, int] | None = None,
-    h_out_quant: tuple[float, int, int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference backward.
-
-    Returns:
-        dgi:        [T, B, 3H]
-        dh0:        [B, H]
-        dWh_struct: [3, nblocks, blksz, blksz]
-        dbh_cat:    [3H]
-    """
-    T, B, _ = gi.shape
-    H = h0.shape[-1]
-    n_gates, nblocks, out_blksz, in_blksz = Wh_struct.shape
-    blksz = out_blksz
-
-    dgi = torch.zeros_like(gi)
-    dWh_struct = torch.zeros_like(Wh_struct)
-    dbh = torch.zeros_like(bh_cat)
-    dh_acc = torch.zeros_like(h0)
-
-    for t in reversed(range(T)):
-        h_prev = h0 if t == 0 else out[t - 1]
-
-        # Forward recompute (with quant_h_in on the matmul-side h).
-        gi_r = gi[t, :, 0:H]
-        gi_z = gi[t, :, H:2 * H]
-        gi_n = gi[t, :, 2 * H:3 * H]
-        h_for_matmul, mask_in = _fake_quant(h_prev, h_in_quant)
-        h_chunks = h_for_matmul.view(B, nblocks, blksz)
-        gh = torch.einsum("bni,gnoi->bgno", h_chunks, Wh_struct)
-        gh = gh.reshape(B, 3, H) + bh_cat.view(3, H)
-        gh_r = gh[:, 0, :]
-        gh_z = gh[:, 1, :]
-        gh_n = gh[:, 2, :]
-        r = torch.sigmoid(gi_r + gh_r)
-        z = torch.sigmoid(gi_z + gh_z)
-        n = torch.tanh(gi_n + r * gh_n)
-        h_t_raw = (1.0 - z) * n + z * h_prev
-
-        dh_t = dout[t] + dh_acc
-
-        # STE backward through quant_h_out: gradient on h_t_q -> on h_t_raw.
-        if h_out_quant is not None:
-            _, mask_out = _fake_quant(h_t_raw, h_out_quant)
-            assert mask_out is not None  # non-None params => non-None mask
-            dh_t = dh_t * mask_out
-
-        # h_t_raw = (1-z)*n + z*h_prev
-        dn = dh_t * (1.0 - z)
-        dz = dh_t * (h_prev - n)
-        dh_prev_direct = dh_t * z
-
-        # n = tanh(gn_pre); gn_pre = gi_n + r*gh_n
-        dgn_pre = dn * (1.0 - n * n)
-        dgi_n = dgn_pre
-        dr = dgn_pre * gh_n
-        dgh_n = dgn_pre * r
-
-        # z = sigmoid(gi_z + gh_z)
-        dgz_pre = dz * z * (1.0 - z)
-        dgi_z = dgz_pre
-        dgh_z = dgz_pre
-
-        # r = sigmoid(gi_r + gh_r)
-        dgr_pre = dr * r * (1.0 - r)
-        dgi_r = dgr_pre
-        dgh_r = dgr_pre
-
-        dgi[t] = torch.cat([dgi_r, dgi_z, dgi_n], dim=-1)
-
-        # Stack dgh per gate into [B, 3, H] -> reshape to [B, 3, nblocks, blksz]
-        dgh = torch.stack([dgh_r, dgh_z, dgh_n], dim=1)  # [B, 3, H]
-        dbh += dgh.sum(dim=0).reshape(-1)  # accumulate over batch and time
-        dgh_chunks = dgh.view(B, 3, nblocks, blksz)
-
-        # gh = einsum('bni,gnoi->bgno', h_chunks, Wh_struct)  with h_chunks
-        # being the *quantized* h_for_matmul. Backward:
-        #   dWh_struct accumulates against quantized h_chunks (matches forward).
-        #   dh_chunks (grad on quantized h) -> grad on raw h via STE mask.
-        dWh_struct += torch.einsum("bgno,bni->gnoi", dgh_chunks, h_chunks)
-        dh_via_W_chunks = torch.einsum(
-            "bgno,gnoi->bni", dgh_chunks, Wh_struct
-        )
-        dh_via_W = dh_via_W_chunks.reshape(B, H)
-        if mask_in is not None:
-            dh_via_W = dh_via_W * mask_in
-
-        dh_acc = dh_prev_direct + dh_via_W
-
-    return dgi, dh_acc, dWh_struct, dbh

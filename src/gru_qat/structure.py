@@ -1,9 +1,17 @@
 """Structured-matrix factorization for GRU weights.
 
-Plugs `torch-structured`'s drop-in nn.Linear replacements (Monarch,
-Circulant, Butterfly, LDR-style) into the QAT cell. The dense `[out, in]`
-weight matrix is replaced by a parameterization that has o(in*out)
-parameters and FLOPs.
+Plugs `torch-structured`'s drop-in nn.Linear replacements (block-diagonal,
+two-factor Monarch, Circulant, Butterfly, LDR-style) into the QAT cell. The
+dense `[out, in]` weight matrix is replaced by a parameterization that has
+o(in*out) parameters and FLOPs.
+
+Naming note (torch-structured 1.3.0): ``kind="blockdiag"`` is a single
+block-diagonal factor (no permutation, zero cross-block mixing) and is the
+kind backed by the ``scan_blockdiag`` Triton fast path. ``kind="monarch"``
+is the genuine two-factor Monarch (block-diagonal x permutation x
+block-diagonal, full cross-channel mixing) and has its own fused Triton fast
+path (``scan_monarch``). This library historically called the single
+block-diagonal factor "monarch"; that path is now ``"blockdiag"``.
 
 The dense path in ``gru_cell.py`` is unaffected by this module — it only
 gets touched when the caller passes a non-``None`` ``StructureConfig`` to
@@ -28,7 +36,9 @@ from typing import Any, Literal, cast
 import torch
 import torch.nn as nn
 
-StructuredKind = Literal["dense", "diagonal", "monarch", "circulant", "butterfly", "ldr"]
+StructuredKind = Literal[
+    "dense", "diagonal", "blockdiag", "monarch", "circulant", "butterfly", "ldr"
+]
 
 
 @dataclass
@@ -41,8 +51,10 @@ class StructureConfig:
     """
 
     kind: StructuredKind = "dense"
-    # Monarch: number of block-diagonal blocks. in/out must each be
-    # divisible by nblocks.
+    # Blockdiag / Monarch: number of blocks. in/out must each be divisible
+    # by nblocks. For "blockdiag" this is the single block-diagonal factor's
+    # block count; for "monarch" it is the shared block count of the two
+    # block-diagonal factors of the genuine two-factor construction.
     nblocks: int = 4
     # Butterfly: number of B / B^T factor pairs (alternating). Effective
     # depth is `butterfly_nblocks * log2(n)`.
@@ -77,10 +89,10 @@ def _validate_shapes(kind: StructuredKind, in_features: int, out_features: int, 
                 f"diagonal requires square (in == out); "
                 f"got in={in_features}, out={out_features}"
             )
-    elif kind == "monarch":
+    elif kind in ("blockdiag", "monarch"):
         if in_features % cfg.nblocks != 0 or out_features % cfg.nblocks != 0:
             raise ValueError(
-                f"monarch requires in/out divisible by nblocks={cfg.nblocks}; "
+                f"{kind} requires in/out divisible by nblocks={cfg.nblocks}; "
                 f"got in={in_features}, out={out_features}"
             )
     elif kind == "circulant":
@@ -147,11 +159,31 @@ def make_structured_linear(
     if cfg.kind == "diagonal":
         return _DiagonalLinear(in_features, bias=bias)
 
-    if cfg.kind == "monarch":
+    if cfg.kind == "blockdiag":
+        # Single block-diagonal factor: no permutation, zero cross-block
+        # mixing by construction. This is what torch-structured (and this
+        # library) historically exposed as "monarch"; the naming was
+        # corrected in torch-structured 1.3.0. The Triton fast path
+        # (scan_blockdiag) implements exactly this factor.
         ts = _import_torch_structured()
         return cast(
             nn.Module,
             ts.monarch.blockdiag_linear.BlockdiagLinear(
+                in_features, out_features, bias=bias, nblocks=cfg.nblocks
+            ),
+        )
+
+    if cfg.kind == "monarch":
+        # Genuine two-factor Monarch (block-diagonal x permutation x
+        # block-diagonal), full cross-channel mixing by construction — Dao
+        # et al. 2022. Distinct from "blockdiag" above; backed by its own
+        # fused Triton fast path (scan_monarch) when blksz=H/nblocks is a
+        # power of two >= 16, else the per-step reference path. Requires
+        # torch-structured >= 1.3.0, the first release exposing MonarchLinear.
+        ts = _import_torch_structured()
+        return cast(
+            nn.Module,
+            ts.monarch.monarch_linear.MonarchLinear(
                 in_features, out_features, bias=bias, nblocks=cfg.nblocks
             ),
         )
