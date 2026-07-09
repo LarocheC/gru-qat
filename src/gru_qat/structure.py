@@ -56,6 +56,14 @@ class StructureConfig:
     # block count; for "monarch" it is the shared block count of the two
     # block-diagonal factors of the genuine two-factor construction.
     nblocks: int = 4
+    # Monarch only: fused vs per-gate layout.
+    #   True  (default) — one MonarchLinear(in -> 3H) per projection: the first
+    #     factor w1 is SHARED across the three gates. This is the correct,
+    #     parameter-efficient design and matches the native StructuredGRU.
+    #   False — three independent MonarchLinear(in -> H), one w1 per gate. A
+    #     larger, more expressive (and non-native) model; kept for comparison.
+    # Ignored for non-monarch kinds.
+    monarch_fused: bool = True
     # Butterfly: number of B / B^T factor pairs (alternating). Effective
     # depth is `butterfly_nblocks * log2(n)`.
     butterfly_nblocks: int = 1
@@ -217,6 +225,66 @@ def make_structured_linear(
         )
 
     raise ValueError(f"unknown structured kind: {cfg.kind!r}")
+
+
+def make_monarch_fused_gates(
+    cfg: StructureConfig,
+    in_features: int,
+    hidden_size: int,
+    *,
+    bias: bool = False,
+) -> tuple[nn.Module, nn.Module, nn.Module]:
+    """Three per-gate MonarchLinear modules that realize ONE fused
+    ``MonarchLinear(in_features -> 3*hidden_size)``.
+
+    The correct Monarch GRU projection is a single ``MonarchLinear(in -> 3H)``:
+    the first factor ``w1`` (input-side block mixing) is shared across all
+    three gates, and the second factor ``w2`` produces the 3H outputs that are
+    sliced into gate chunks. Building three independent ``MonarchLinear(in ->
+    H)`` instead (one ``w1`` per gate) is a *different, larger* model — it
+    triples the ``w1`` cost for no expressivity the fused form lacks. See
+    ``triton_kernels/scan_monarch.py`` for the math.
+
+    This returns three ``MonarchLinear(in -> H)`` modules wired so they are
+    exactly the fused layer: all three share a single ``w1`` Parameter, and
+    their ``w2`` tensors are the three slices of the fused ``w2``. So the
+    per-gate calling convention (``struct_W*_r/_z/_n``) that the reference
+    forward and the other structured kinds use is preserved, while the
+    parameter count, initialization, and gradients match the fused
+    ``MonarchLinear(in -> 3H)`` bit for bit (``w1`` counted once by
+    ``Module.parameters()`` since it is one shared object).
+
+    Requires ``in_features`` and ``hidden_size`` divisible by ``cfg.nblocks``.
+    """
+    if cfg.kind != "monarch":
+        raise ValueError(f"make_monarch_fused_gates is monarch-only; got {cfg.kind!r}")
+    nb = cfg.nblocks
+    if in_features % nb != 0 or hidden_size % nb != 0:
+        raise ValueError(
+            f"monarch requires in/hidden divisible by nblocks={nb}; "
+            f"got in={in_features}, hidden={hidden_size}"
+        )
+    ts = _import_torch_structured()
+    ml = ts.monarch.monarch_linear.MonarchLinear
+    # One fused layer holds the correct init; distribute its factors.
+    fused = ml(in_features, 3 * hidden_size, bias=False, nblocks=nb)
+    in_blksz = in_features // nb
+    out_blksz = hidden_size // nb
+    # fused.w2: [nb, 3*out_blksz, in_blksz] -> per-gate [3, nb, out_blksz, in_blksz]
+    w2_gates = (
+        cast(torch.Tensor, fused.w2)
+        .view(nb, 3, out_blksz, in_blksz)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+    gates: list[nn.Module] = []
+    for g in range(3):
+        m = ml(in_features, hidden_size, bias=bias, nblocks=nb)
+        # Share the single w1 (same Parameter object -> counted once, one grad).
+        m.w1 = fused.w1
+        m.w2 = nn.Parameter(w2_gates[g].clone())
+        gates.append(cast(nn.Module, m))
+    return gates[0], gates[1], gates[2]
 
 
 class _DiagonalLinear(nn.Module):

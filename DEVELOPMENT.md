@@ -40,11 +40,17 @@ src/gru_qat/
     scan_blockdiag.py     Blockdiag persistent fwd+bwd. nblocks block-diagonal matmuls
                           per timestep. In-kernel fake-quant for QAT. Backs
                           kind="blockdiag".
-    scan_monarch.py       Two-factor Monarch fused fwd+bwd (two block-diagonal
-                          matmuls + transpose-permute per gate/step via a scratch
-                          round-trip; hand-derived reverse-time backward with
-                          atomic weight-grad accumulation). In-kernel fake-quant.
-                          Backs kind="monarch".
+    scan_monarch.py       Two-factor Monarch fwd+bwd. kind="monarch" defaults
+                          to the FUSED layout (StructureConfig.monarch_fused):
+                          ONE MonarchLinear(H->3H) per projection = a SHARED
+                          first factor w1 (mid computed once) + three per-gate
+                          w2 slices -> full cross-block mixing at the native
+                          fused param count. monarch_fused=False gives the
+                          per-gate layout (three independent w1) for comparison.
+                          One kernel handles both via a SHARED_W1 constexpr
+                          (keyed on W1.ndim: 3=fused, 4=per-gate). Hand-derived
+                          reverse-time backward, atomic weight-grad accum.
+                          In-kernel fake-quant. Backs kind="monarch".
     scan_butterfly.py     Butterfly persistent fwd+bwd. log_H stages of strided
                           2x2 mixing. In-kernel fake-quant for QAT.
 
@@ -144,7 +150,7 @@ half across all T timesteps):
 | `scan.py` (dense) | autotune + persistent | grid `(B_tile, OH_tile)` with spin-wait barrier | Both autotune (1D grid, no inter-CTA) and persistent (2D grid + barrier) variants. QAT support. |
 | `scan_diagonal.py` | persistent, no barrier | grid `(B_tile, H_tile)`, no cross-CTA sync | Elementwise hidden recurrence (no matmul) so each program owns its slab; `h` carries in registers. Smallest params, fastest variant. QAT support. |
 | `scan_blockdiag.py` | persistent | grid `(B_tile, block)` | One small `[blksz, blksz]` matmul per (block, gate). Best speed at typical training shapes. QAT support. Backs `kind="blockdiag"`. |
-| `scan_monarch.py` | non-persistent | grid `(B_tile,)`, intra-CTA barrier only | Two `[blksz, blksz]` matmuls per (block, gate) + a transpose-permute via a scratch round-trip → full cross-channel mixing. Program owns all H for its rows so the recurrence needs no cross-CTA barrier. QAT support. Hand-derived reverse-time backward (recompute + atomic weight-grad accumulation). Backs `kind="monarch"`. Parallelism = `ceil(B/BLOCK_B)`, so occupancy-bound at small B. |
+| `scan_monarch.py` | non-persistent | grid `(B_tile,)`, intra-CTA barrier only | **Fused** two-factor Monarch: shared first factor `w1` (one `mid` per step) + three per-gate `w2`, with a transpose-permute via a scratch round-trip → full cross-block mixing at the native `MonarchLinear(H→3H)` param count. Program owns all H for its rows so the recurrence needs no cross-CTA barrier. QAT support. Hand-derived reverse-time backward (`dmid` summed over gates, single `dW1`; atomic weight-grad accumulation). Backs `kind="monarch"`. Parallelism = `ceil(B/BLOCK_B)`, occupancy-bound at small B. |
 | `scan_butterfly.py` | persistent | grid `(B_tile,)` | log_H stages of strided 2×2 mixing per gate. No tensor-core utilization. QAT support. |
 
 **Cross-CTA barriers** use the release/acquire atomic_add pattern:

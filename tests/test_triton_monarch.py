@@ -46,10 +46,14 @@ def _fp32_recipe() -> QuantRecipe:
     )
 
 
-def _make_monarch_layer(H: int, nblocks: int, use_triton: bool | str) -> GRULayer:
+def _make_monarch_layer(
+    H: int, nblocks: int, use_triton: bool | str, *, fused: bool = True
+) -> GRULayer:
     return GRULayer(
         H, H, recipe=_fp32_recipe(), gate_layout="fused",
-        structure_hidden=StructureConfig(kind="monarch", nblocks=nblocks),
+        structure_hidden=StructureConfig(
+            kind="monarch", nblocks=nblocks, monarch_fused=fused
+        ),
         use_triton=use_triton,
     )
 
@@ -62,6 +66,63 @@ def _build_gi(cell: object, x: torch.Tensor) -> torch.Tensor:
     )
     bi = torch.cat([cell.b_ir, cell.b_iz, cell.b_in])
     return torch.nn.functional.linear(cell.quant_x(x), Wi, bi)
+
+
+def test_monarch_hidden_is_fused_shared_w1() -> None:
+    """kind='monarch' builds the FUSED MonarchLinear(H->3H): the first factor
+    w1 is a single shared Parameter across the three gates (not three
+    independent w1's), so the hidden param count matches the native fused
+    layer — smaller than a per-gate layout by the duplicated-w1 cost.
+    Construction-only; runs without CUDA."""
+    from torch_structured.monarch.monarch_linear import MonarchLinear
+
+    H, nb = 64, 4
+    cell = _make_monarch_layer(H, nb, use_triton=False).cell
+    # One shared w1 Parameter object across the three gate modules.
+    assert cell.struct_Wh_r.w1 is cell.struct_Wh_z.w1
+    assert cell.struct_Wh_z.w1 is cell.struct_Wh_n.w1
+
+    # Unique hidden structured params == fused MonarchLinear(H -> 3H).
+    seen: set[int] = set()
+    fused_count = 0
+    for m in (cell.struct_Wh_r, cell.struct_Wh_z, cell.struct_Wh_n):
+        for p in m.parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                fused_count += p.numel()
+    native = MonarchLinear(H, 3 * H, bias=False, nblocks=nb)
+    assert fused_count == native.w1.numel() + native.w2.numel()
+    # And strictly fewer than the per-gate layout (three independent w1's).
+    per_gate = 3 * (nb * (H // nb) ** 2) + 3 * (nb * (H // nb) ** 2)
+    assert fused_count < per_gate
+
+
+def test_monarch_pergate_has_independent_w1() -> None:
+    """monarch_fused=False builds three independent MonarchLinear(H->H): each
+    gate has its own w1 (not shared), so the hidden param count is larger than
+    the fused layout — the deliberately non-native, more expressive variant."""
+    H, nb = 64, 4
+    cell = _make_monarch_layer(H, nb, use_triton=False, fused=False).cell
+    # Three distinct w1 objects (not shared).
+    assert cell.struct_Wh_r.w1 is not cell.struct_Wh_z.w1
+    assert cell.struct_Wh_z.w1 is not cell.struct_Wh_n.w1
+
+    def unique_params(*mods: object) -> int:
+        seen: set[int] = set()
+        total = 0
+        for m in mods:
+            for p in m.parameters():  # type: ignore[attr-defined]
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    total += p.numel()
+        return total
+
+    pergate = unique_params(cell.struct_Wh_r, cell.struct_Wh_z, cell.struct_Wh_n)
+    fused_cell = _make_monarch_layer(H, nb, use_triton=False, fused=True).cell
+    fused = unique_params(
+        fused_cell.struct_Wh_r, fused_cell.struct_Wh_z, fused_cell.struct_Wh_n
+    )
+    assert pergate > fused
 
 
 @pytest.mark.parametrize("T,B,H,nb", [(8, 4, 64, 4), (16, 8, 128, 8)])
@@ -92,7 +153,7 @@ def test_monarch_triton_forward_matches_pytorch(T: int, B: int, H: int, nb: int)
     blksz = H // nb
     gi = (torch.randn(T, B, 3 * H, device=dev) * 0.5).contiguous()
     h0 = (torch.randn(B, H, device=dev) * 0.5).contiguous()
-    W1 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
+    W1 = (torch.randn(nb, blksz, blksz, device=dev) * 0.1).contiguous()
     W2 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
     bh = (torch.randn(3 * H, device=dev) * 0.1).contiguous()
     ref = gru_scan_monarch_forward_pytorch(gi, h0, W1, W2, bh)
@@ -111,7 +172,7 @@ def test_monarch_triton_qat_forward_matches_pytorch(T: int, B: int, H: int, nb: 
     blksz = H // nb
     gi = (torch.randn(T, B, 3 * H, device=dev) * 0.1).contiguous()
     h0 = (torch.randn(B, H, device=dev) * 0.1).contiguous()
-    W1 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
+    W1 = (torch.randn(nb, blksz, blksz, device=dev) * 0.1).contiguous()
     W2 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
     bh = (torch.randn(3 * H, device=dev) * 0.05).contiguous()
     bits = 8
@@ -137,7 +198,7 @@ def test_monarch_triton_backward_matches_reference(T: int, B: int, H: int, nb: i
     blksz = H // nb
     gi = (torch.randn(T, B, 3 * H, device=dev) * 0.3).contiguous()
     h0 = (torch.randn(B, H, device=dev) * 0.2).contiguous()
-    W1 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
+    W1 = (torch.randn(nb, blksz, blksz, device=dev) * 0.1).contiguous()
     W2 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
     bh = (torch.randn(3 * H, device=dev) * 0.1).contiguous()
     out = gru_scan_monarch_forward_triton(gi, h0, W1, W2, bh)
@@ -161,7 +222,7 @@ def test_monarch_triton_qat_backward_matches_reference(T: int, B: int, H: int, n
     blksz = H // nb
     gi = (torch.randn(T, B, 3 * H, device=dev) * 0.3).contiguous()
     h0 = (torch.randn(B, H, device=dev) * 0.2).contiguous()
-    W1 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
+    W1 = (torch.randn(nb, blksz, blksz, device=dev) * 0.1).contiguous()
     W2 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
     bh = (torch.randn(3 * H, device=dev) * 0.1).contiguous()
     q = (0.02, -127, 127)
@@ -188,8 +249,8 @@ def test_monarch_autograd_grads_match_reference(T: int, B: int, H: int, nb: int)
     def leaves() -> list[torch.Tensor]:
         g = [
             (torch.randn(T, B, 3 * H, device=dev) * 0.1),
-            (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1),
-            (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1),
+            (torch.randn(nb, blksz, blksz, device=dev) * 0.1),  # shared W1
+            (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1),  # per-gate W2
             (torch.randn(3 * H, device=dev) * 0.1),
         ]
         return g
@@ -219,15 +280,49 @@ def test_monarch_autograd_grads_match_reference(T: int, B: int, H: int, nb: int)
 
 
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nb", [(8, 16, 64, 4), (16, 16, 128, 8)])
-def test_grulayer_monarch_triton_matches_pytorch_path(T: int, B: int, H: int, nb: int) -> None:
-    """GRULayer use_triton=True must match use_triton=False for two-factor
-    Monarch, forward and final hidden state, fp32."""
+@pytest.mark.parametrize("T,B,H,nb", [(8, 32, 64, 4), (12, 96, 128, 8)])
+def test_monarch_pergate_kernel_matches_reference(T: int, B: int, H: int, nb: int) -> None:
+    """Per-gate layout at the kernel level (W1 = [3, nb, blksz, blksz], one w1
+    per gate): Triton fwd + hand-derived bwd must match the PyTorch reference.
+    B=96 exercises cross-program atomics on the 3x-wider dW1."""
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("high")
     dev = torch.device("cuda")
-    pt = _make_monarch_layer(H, nb, use_triton=False).to(dev)
-    tri = _make_monarch_layer(H, nb, use_triton=True).to(dev)
+    blksz = H // nb
+    gi = (torch.randn(T, B, 3 * H, device=dev) * 0.3).contiguous()
+    h0 = (torch.randn(B, H, device=dev) * 0.2).contiguous()
+    W1 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()  # per-gate
+    W2 = (torch.randn(3, nb, blksz, blksz, device=dev) * 0.1).contiguous()
+    bh = (torch.randn(3 * H, device=dev) * 0.1).contiguous()
+
+    ref = gru_scan_monarch_forward_pytorch(gi, h0, W1, W2, bh)
+    tri = gru_scan_monarch_forward_triton(gi, h0, W1, W2, bh)
+    assert (ref - tri).abs().max().item() / max(ref.abs().max().item(), 1e-6) < 5e-3
+
+    out = gru_scan_monarch_forward_triton(gi, h0, W1, W2, bh)
+    dout = (torch.randn(T, B, H, device=dev) * 0.1).contiguous()
+    tg = gru_scan_monarch_backward_triton(gi, h0, W1, W2, bh, out, dout)
+    rg = gru_scan_monarch_backward_pytorch(gi, h0, W1, W2, bh, dout)
+    for name, a, b in zip(["dgi", "dh0", "dW1", "dW2", "dbh"], tg, rg):
+        assert a.shape == b.shape
+        rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-9)
+        assert rel < 5e-3, f"{name} rel diff {rel:.4e}"
+
+
+@cuda_only
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("T,B,H,nb", [(8, 16, 64, 4), (16, 16, 128, 8)])
+def test_grulayer_monarch_triton_matches_pytorch_path(
+    T: int, B: int, H: int, nb: int, fused: bool
+) -> None:
+    """GRULayer use_triton=True must match use_triton=False for two-factor
+    Monarch — both the fused (shared w1) and per-gate layouts — forward and
+    final hidden state, fp32."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    dev = torch.device("cuda")
+    pt = _make_monarch_layer(H, nb, use_triton=False, fused=fused).to(dev)
+    tri = _make_monarch_layer(H, nb, use_triton=True, fused=fused).to(dev)
     tri.load_state_dict(pt.state_dict())
     assert tri.use_triton is True and pt.use_triton is False
 
@@ -242,15 +337,16 @@ def test_grulayer_monarch_triton_matches_pytorch_path(T: int, B: int, H: int, nb
 
 
 @cuda_only
-def test_grulayer_monarch_triton_backward_matches_pytorch_path() -> None:
+@pytest.mark.parametrize("fused", [True, False])
+def test_grulayer_monarch_triton_backward_matches_pytorch_path(fused: bool) -> None:
     """Backward through the GRULayer monarch fast path must match the per-step
-    reference path (fp32)."""
+    reference path (fp32), for both the fused and per-gate layouts."""
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("high")
     dev = torch.device("cuda")
     T, B, H, nb = 8, 16, 64, 4
-    pt = _make_monarch_layer(H, nb, use_triton=False).to(dev)
-    tri = _make_monarch_layer(H, nb, use_triton=True).to(dev)
+    pt = _make_monarch_layer(H, nb, use_triton=False, fused=fused).to(dev)
+    tri = _make_monarch_layer(H, nb, use_triton=True, fused=fused).to(dev)
     tri.load_state_dict(pt.state_dict())
 
     x_pt = (torch.randn(T, B, H, device=dev) * 0.1).requires_grad_()

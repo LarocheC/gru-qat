@@ -12,10 +12,12 @@ hidden weights and a multi-step persistent Triton kernel.
   path is Triton.
 - **Plus**: hidden weights can be parameterized as Diagonal (one
   vector per gate), Blockdiag (single block-diagonal factor), Monarch
-  (genuine two-factor: block-diagonal × permutation × block-diagonal),
-  Butterfly (`O(H log H)` twiddle), Circulant, or LDR (low-displacement
-  rank) structured matrices, with matching Triton kernels for Diagonal,
-  Blockdiag, Monarch and Butterfly.
+  (genuine two-factor; defaults to fused — one `MonarchLinear(H→3H)` per
+  projection with a shared first factor — with `monarch_fused=False`
+  selecting a per-gate layout for comparison), Butterfly (`O(H log H)`
+  twiddle), Circulant, or LDR (low-displacement rank) structured matrices,
+  with matching Triton kernels for Diagonal, Blockdiag, Monarch and
+  Butterfly.
 
 ## Read first
 

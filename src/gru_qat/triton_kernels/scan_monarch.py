@@ -1,14 +1,28 @@
 """Genuine two-factor Monarch hidden weights for the multi-step GRU scan.
 
-Distinct from ``scan_blockdiag`` (a single block-diagonal factor). Here each
-gate's hidden weight is the two-factor Monarch construction
-(``torch_structured.monarch.MonarchLinear``): a block-diagonal factor ``w1``,
-a transpose-permutation, then a second block-diagonal factor ``w2``. Unlike
-the single block-diagonal factor, this mixes information across all blocks by
-construction (full dense-equivalent rank), which is why it needs both a
-first-factor and a second-factor matmul with a reshuffle between them.
+Distinct from ``scan_blockdiag`` (a single block-diagonal factor). The hidden
+projection is the FUSED two-factor Monarch ``MonarchLinear(H -> 3H)``: a
+block-diagonal factor ``w1``, a transpose-permutation, then a second
+block-diagonal factor ``w2`` whose 3H outputs are the three gates. Crucially
+``w1`` is SHARED across the gates — that is the correct, parameter-efficient
+Monarch GRU (one input-side mixing per projection), matching the native
+``MonarchLinear(H -> 3H)``. Building three independent ``MonarchLinear(H -> H)``
+would triple ``w1`` for no gain. See ``structure.make_monarch_fused_gates``.
 
-Math (square hidden, ``H`` channels, ``nblocks`` blocks, ``blksz = H/nblocks``):
+In factor terms the fused layer is ``W1: [nblocks, blksz, blksz]`` (one shared
+first factor) and ``W2: [3, nblocks, blksz, blksz]`` (three square second
+factors = the three slices of the fused ``w2``). Each gate is the square
+two-factor map below, reading the SAME ``mid``.
+
+A per-gate layout (``StructureConfig.monarch_fused=False``) — three
+independent ``MonarchLinear(H->H)``, one ``w1`` per gate — is also supported
+for comparison: then ``W1`` is ``[3, nblocks, blksz, blksz]`` and each gate
+computes its own ``mid``. The kernels key on ``W1.ndim`` (3 = shared/fused,
+4 = per-gate) via the ``SHARED_W1`` constexpr; the fused path is the correct,
+native-matching, parameter-efficient default.
+
+Math (square hidden, ``H`` channels, ``nblocks`` blocks, ``blksz = H/nblocks``,
+per gate; the shared ``w1`` makes ``mid`` common to all three gates):
 
     X[k, p]      = h[k * blksz + p]                       # reshape to blocks
     out1[k, q]   = sum_p w1[k, q, p] * X[k, p]            # factor 1 (block-diag)
@@ -52,16 +66,24 @@ from gru_qat.ste import fake_quant_ste
 def extract_monarch_factors(
     cell: nn.Module,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pull the three hidden-side two-factor Monarch weights out of a cell.
+    """Pull the two-factor Monarch hidden weights out of a cell.
+
+    Handles both Monarch layouts (``StructureConfig.monarch_fused``):
+    - fused (default): the three gate modules SHARE one first factor ``w1``
+      (see ``structure.make_monarch_fused_gates``) -> ``W1`` is
+      ``[nblocks, blksz, blksz]``.
+    - per-gate: three independent ``w1`` -> ``W1`` is
+      ``[3, nblocks, blksz, blksz]``.
+    The layout is detected from whether ``w1`` is a shared object; the returned
+    ``W1.ndim`` (3 vs 4) is what the kernel keys on.
 
     Args:
-        cell: a ``GRUCellQuant`` whose ``structure_hidden`` was a Monarch
-              ``StructureConfig``. Must have ``struct_Wh_r/z/n`` MonarchLinear
-              modules, each exposing ``w1``/``w2`` factor tensors.
+        cell: a ``GRUCellQuant`` with Monarch ``struct_Wh_r/z/n`` modules.
 
     Returns:
-        W1: [3, nblocks, blksz, blksz] — first factors, gates in (r, z, n).
-        W2: [3, nblocks, blksz, blksz] — second factors, gates in (r, z, n).
+        W1: [nblocks, blksz, blksz] (fused) or [3, nblocks, blksz, blksz]
+            (per-gate) — first factor(s).
+        W2: [3, nblocks, blksz, blksz] — per-gate second factors, (r, z, n).
         bh_cat: [3*H] — concat of (b_hr, b_hz, b_hn).
     """
     if cell._hidden_dense:
@@ -71,10 +93,14 @@ def extract_monarch_factors(
         mod = cast(nn.Module, getattr(cell, name))
         return cast(torch.Tensor, getattr(mod, attr))
 
-    W1 = torch.stack(
-        [_w("struct_Wh_r", "w1"), _w("struct_Wh_z", "w1"), _w("struct_Wh_n", "w1")],
-        dim=0,
-    )
+    w1_r = _w("struct_Wh_r", "w1")
+    shared = w1_r is _w("struct_Wh_z", "w1") and w1_r is _w("struct_Wh_n", "w1")
+    if shared:
+        W1 = w1_r  # [nblocks, blksz, blksz] — one shared first factor
+    else:
+        W1 = torch.stack(
+            [w1_r, _w("struct_Wh_z", "w1"), _w("struct_Wh_n", "w1")], dim=0
+        )  # [3, nblocks, blksz, blksz]
     W2 = torch.stack(
         [_w("struct_Wh_r", "w2"), _w("struct_Wh_z", "w2"), _w("struct_Wh_n", "w2")],
         dim=0,
@@ -131,10 +157,16 @@ def gru_scan_monarch_forward_pytorch(
 
     Differentiable (STE fake-quant), so it doubles as the backward reference.
 
+    Handles both layouts: fused (``W1`` is ``[nblocks, blksz, blksz]``, one
+    shared first factor -> ``mid`` computed once) and per-gate (``W1`` is
+    ``[3, nblocks, blksz, blksz]`` -> a ``mid`` per gate).
+
     Args:
         gi: [T, B, 3H] — pre-batched input projection (already with bi).
         h0: [B, H]
-        W1, W2: [3, nblocks, blksz, blksz] — per-gate Monarch factors.
+        W1: [nblocks, blksz, blksz] (fused) or [3, nblocks, blksz, blksz]
+            (per-gate) — first factor(s).
+        W2: [3, nblocks, blksz, blksz] — per-gate second factors.
         bh_cat: [3H]
         h_in_quant: optional (scale, qmin, qmax) for the matmul-side h.
         h_out_quant: optional (scale, qmin, qmax) for h_new before store.
@@ -143,18 +175,21 @@ def gru_scan_monarch_forward_pytorch(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    n_gates, nblocks, blksz, in_blksz = W1.shape
-    assert n_gates == 3
+    shared = W1.ndim == 3
+    _, nblocks, blksz, in_blksz = W2.shape
     assert blksz == in_blksz, "square Monarch only"
     assert nblocks * blksz == H, f"nblocks*blksz={nblocks * blksz} != H={H}"
 
     perm = _permute_index(nblocks, blksz, gi.device)
     bh = bh_cat.view(3, H)
 
-    def monarch2(h_mm: torch.Tensor, g: int) -> torch.Tensor:
+    def compute_mid(h_mm: torch.Tensor, g: int) -> torch.Tensor:
+        w1 = W1 if shared else W1[g]
         X = h_mm.view(B, nblocks, blksz)
-        out1 = torch.einsum("kqp,bkp->bkq", W1[g], X).reshape(B, nblocks * blksz)
-        mid = out1[:, perm].view(B, nblocks, blksz)
+        out1 = torch.einsum("kqp,bkp->bkq", w1, X).reshape(B, nblocks * blksz)
+        return out1[:, perm].view(B, nblocks, blksz)
+
+    def factor2(mid: torch.Tensor, g: int) -> torch.Tensor:
         out2 = torch.einsum("lsr,blr->bsl", W2[g], mid)  # [B, s, l]
         return out2.reshape(B, blksz * nblocks)  # flat s*nblocks + l
 
@@ -162,9 +197,15 @@ def gru_scan_monarch_forward_pytorch(
     outs: list[torch.Tensor] = []
     for t in range(T):
         h_mm = _ste(h, h_in_quant)
-        gh_r = monarch2(h_mm, 0) + bh[0]
-        gh_z = monarch2(h_mm, 1) + bh[1]
-        gh_n = monarch2(h_mm, 2) + bh[2]
+        if shared:
+            mid = compute_mid(h_mm, 0)
+            gh_r = factor2(mid, 0) + bh[0]
+            gh_z = factor2(mid, 1) + bh[1]
+            gh_n = factor2(mid, 2) + bh[2]
+        else:
+            gh_r = factor2(compute_mid(h_mm, 0), 0) + bh[0]
+            gh_z = factor2(compute_mid(h_mm, 1), 1) + bh[1]
+            gh_n = factor2(compute_mid(h_mm, 2), 2) + bh[2]
 
         gi_r = gi[t, :, 0:H]
         gi_z = gi[t, :, H : 2 * H]
@@ -185,17 +226,18 @@ def gru_scan_monarch_forward_pytorch(
 def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
-    W1_ptr,            # [3, nblocks, blksz, blksz], fp32
+    W1_ptr,            # [nblocks,bs,bs] (fused) or [3,nblocks,bs,bs] (per-gate)
     W2_ptr,            # [3, nblocks, blksz, blksz], fp32
     bh_ptr,            # [3H], fp32
-    scratch_ptr,       # [3, B, H], fp32 (per-program rows; factor-1 output)
+    scratch_ptr,       # [3, B, H], fp32 (per-program rows; factor-1 output(s))
     out_ptr,           # [T, B, H], fp32
     T,
     B,
     sg_t, sg_b,
     sh0_b,
-    sW_g, sW_n, sW_o,   # W1/W2 strides (identical layout): gate, block, out-row
-    ss_g, ss_b,         # scratch strides: gate, batch
+    sW1_g, sW1_n, sW1_o,  # W1 strides: gate (0 if shared), block, out-row
+    sW2_g, sW2_n, sW2_o,  # W2 strides: gate, block, out-row
+    ss_g, ss_b,           # scratch strides: gate, batch
     so_t, so_b,
     h_in_scale, h_in_qmin, h_in_qmax,
     h_out_scale, h_out_qmin, h_out_qmax,
@@ -205,14 +247,15 @@ def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
     BLOCK_B: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
+    SHARED_W1: tl.constexpr,  # fused (one shared w1) vs per-gate (three w1)
 ):
-    """Forward over the two-factor Monarch recurrence.
+    """Forward over the two-factor Monarch recurrence (fused or per-gate).
 
-    Grid ``(pid_b,)``: each program owns ``BLOCK_B`` batch rows across ALL H
-    channels. Per timestep it runs factor 1 for all three gates into a scratch
-    buffer, a CTA barrier, then factor 2 + the gate recurrence per output
-    block. No cross-CTA barrier is needed because a program's rows never touch
-    another program's rows.
+    Grid ``(pid_b,)``: each program owns ``BLOCK_B`` batch rows across ALL H.
+    Per timestep it runs factor 1 (once when ``SHARED_W1`` -> one ``mid``, else
+    three per-gate ``mid``) into a scratch buffer, a CTA barrier, then factor 2
+    (three per-gate ``w2``) + the gate recurrence per output block. No cross-CTA
+    barrier is needed because a program's rows never touch another's.
     """
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -223,7 +266,8 @@ def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
     sh_b = sh0_b
 
     for t in range(0, T):
-        # ---- factor 1: out1[g, :, k, q] -> scratch[g] at flat k*BLKSZ + q ----
+        # ---- factor 1: mid(s) -> scratch. SHARED_W1: one mid in scratch[0];
+        #      per-gate: mid_g in scratch[g]. ----
         for k in range(0, NBLOCKS):
             cols = k * BLKSZ + ar  # p positions in h (contiguous block k)
             h_ptrs = h_in_ptr + offs_b[:, None] * sh_b + cols[None, :]
@@ -232,15 +276,18 @@ def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
                 q = tl.extra.cuda.libdevice.rint(hk / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 hk = q * h_in_scale
-            for g in range(0, 3):
-                w1 = tl.load(
-                    W1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :]
-                )  # [q, p]
-                o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")  # [BB, q]
-                s_ptrs = (
-                    scratch_ptr + g * ss_g + offs_b[:, None] * ss_b + cols[None, :]
-                )
-                tl.store(s_ptrs, o1, mask=mask_b[:, None])
+            if SHARED_W1:
+                w1 = tl.load(W1_ptr + k * sW1_n + ar[:, None] * sW1_o + ar[None, :])
+                o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")
+                tl.store(scratch_ptr + offs_b[:, None] * ss_b + cols[None, :], o1, mask=mask_b[:, None])
+            else:
+                for g in range(0, 3):
+                    w1 = tl.load(W1_ptr + g * sW1_g + k * sW1_n + ar[:, None] * sW1_o + ar[None, :])
+                    o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")
+                    tl.store(
+                        scratch_ptr + g * ss_g + offs_b[:, None] * ss_b + cols[None, :],
+                        o1, mask=mask_b[:, None],
+                    )
 
         tl.debug_barrier()
 
@@ -248,22 +295,15 @@ def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
         for lb in range(0, NBLOCKS):
             chan = lb + NBLOCKS * ar  # output channels o = s*NBLOCKS + lb; mid r positions
 
-            # gate r/z/n second factor: gh[:, s] = mid[:, r] @ w2[lb].T
-            mid_r = tl.load(
-                scratch_ptr + 0 * ss_g + offs_b[:, None] * ss_b + chan[None, :],
-                mask=mask_b[:, None], other=0.0,
-            )
-            mid_z = tl.load(
-                scratch_ptr + 1 * ss_g + offs_b[:, None] * ss_b + chan[None, :],
-                mask=mask_b[:, None], other=0.0,
-            )
-            mid_n = tl.load(
-                scratch_ptr + 2 * ss_g + offs_b[:, None] * ss_b + chan[None, :],
-                mask=mask_b[:, None], other=0.0,
-            )
-            w2r = tl.load(W2_ptr + 0 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
-            w2z = tl.load(W2_ptr + 1 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
-            w2n = tl.load(W2_ptr + 2 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            sr = 0 if SHARED_W1 else 0
+            sz = 0 if SHARED_W1 else 1
+            sn = 0 if SHARED_W1 else 2
+            mid_r = tl.load(scratch_ptr + sr * ss_g + offs_b[:, None] * ss_b + chan[None, :], mask=mask_b[:, None], other=0.0)
+            mid_z = tl.load(scratch_ptr + sz * ss_g + offs_b[:, None] * ss_b + chan[None, :], mask=mask_b[:, None], other=0.0)
+            mid_n = tl.load(scratch_ptr + sn * ss_g + offs_b[:, None] * ss_b + chan[None, :], mask=mask_b[:, None], other=0.0)
+            w2r = tl.load(W2_ptr + 0 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :])
+            w2z = tl.load(W2_ptr + 1 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :])
+            w2n = tl.load(W2_ptr + 2 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :])
             ghr = tl.dot(mid_r, tl.trans(w2r), input_precision="tf32")
             ghz = tl.dot(mid_z, tl.trans(w2z), input_precision="tf32")
             ghn = tl.dot(mid_n, tl.trans(w2n), input_precision="tf32")
@@ -314,21 +354,28 @@ def gru_scan_monarch_forward_triton(
     h_in_quant: tuple[float, int, int] | None = None,
     h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
-    """Triton forward for the two-factor Monarch hidden-side scan."""
+    """Triton forward for the two-factor Monarch hidden-side scan.
+
+    ``W1`` is ``[nblocks, blksz, blksz]`` (fused, shared first factor) or
+    ``[3, nblocks, blksz, blksz]`` (per-gate); the layout is keyed on
+    ``W1.ndim``.
+    """
     if not (gi.is_cuda and W1.is_cuda and W2.is_cuda):
         raise ValueError("gi, W1, W2 must be CUDA tensors")
     T, B, three_H = gi.shape
     H = three_H // 3
-    n_gates, nblocks, blksz, in_blksz = W1.shape
-    if n_gates != 3 or W2.shape[0] != 3:
-        raise ValueError(f"W1/W2 dim 0 (n_gates) must be 3; got {n_gates}, {W2.shape[0]}")
+    shared_w1 = W1.ndim == 3
+    _, nblocks, blksz, in_blksz = W2.shape
+    if W2.shape[0] != 3:
+        raise ValueError(f"W2 dim 0 (n_gates) must be 3; got {W2.shape[0]}")
+    exp_w1 = (nblocks, blksz, blksz) if shared_w1 else (3, nblocks, blksz, blksz)
+    if tuple(W1.shape) != exp_w1:
+        raise ValueError(f"W1 shape {tuple(W1.shape)} != expected {exp_w1}")
     if not (blksz == in_blksz and nblocks * blksz == H):
         raise ValueError(
             f"Monarch factors must be square and tile H: got nblocks={nblocks}, "
             f"blksz={blksz}x{in_blksz}, H={H}"
         )
-    if tuple(W2.shape) != (3, nblocks, blksz, blksz):
-        raise ValueError(f"W2 shape {tuple(W2.shape)} != W1 shape {tuple(W1.shape)}")
     if blksz < 16 or (blksz & (blksz - 1)) != 0:
         raise ValueError(
             f"Triton Monarch kernel requires blksz (=H/nblocks) a power of 2 >= 16; "
@@ -343,6 +390,7 @@ def gru_scan_monarch_forward_triton(
 
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
     scratch = torch.empty((3, B, H), device=gi.device, dtype=gi.dtype)
+    sW1_g = 0 if shared_w1 else W1.stride(0)
 
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -(2**31), 2**31 - 1)
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -(2**31), 2**31 - 1)
@@ -353,7 +401,8 @@ def gru_scan_monarch_forward_triton(
         T, B,
         gi.stride(0), gi.stride(1),
         h0.stride(0),
-        W1.stride(0), W1.stride(1), W1.stride(2),
+        sW1_g, W1.stride(-3), W1.stride(-2),
+        W2.stride(0), W2.stride(1), W2.stride(2),
         scratch.stride(0), scratch.stride(1),
         out.stride(0), out.stride(1),
         in_s, in_qmin, in_qmax,
@@ -364,6 +413,7 @@ def gru_scan_monarch_forward_triton(
         BLOCK_B=block_b,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
+        SHARED_W1=shared_w1,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -400,14 +450,14 @@ def gru_scan_monarch_backward_pytorch(
 def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H]
     hprev_ptr,         # [T, B, H]   h_prev[t] = h_{t-1}  (= cat([h0], out[:-1]))
-    W1_ptr,            # [3, nblocks, blksz, blksz]
+    W1_ptr,            # [nblocks,bs,bs] (fused) or [3,nblocks,bs,bs] (per-gate)
     W2_ptr,            # [3, nblocks, blksz, blksz]
     bh_ptr,            # [3H]
     dout_ptr,          # [T, B, H]   upstream grad
     dgi_ptr,           # [T, B, 3H]  (out)
     dh0_ptr,           # [B, H]      (out)
-    dW1_ptr,           # [3, nblocks, blksz, blksz]  (out, zero-init, atomic)
-    dW2_ptr,           # [3, nblocks, blksz, blksz]  (out, zero-init, atomic)
+    dW1_ptr,           # like W1                        (out, zero-init, atomic)
+    dW2_ptr,           # [3, nblocks, blksz, blksz]     (out, zero-init, atomic)
     dbh_ptr,           # [3H]        (out, zero-init, atomic)
     carry_ptr,         # [B, H]      scratch (zero-init)
     out1_ptr,          # [3, B, H]   scratch (factor-1 recompute)
@@ -416,7 +466,8 @@ def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
     B,
     sg_t, sg_b,
     shp_t, shp_b,
-    sW_g, sW_n, sW_o,
+    sW1_g, sW1_n, sW1_o,
+    sW2_g, sW2_n, sW2_o,
     sd_t, sd_b,          # dout strides
     sdgi_t, sdgi_b,
     ss_g, ss_b,
@@ -429,16 +480,18 @@ def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
     BLOCK_B: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
+    SHARED_W1: tl.constexpr,
 ):
     """Reverse-time backward for the two-factor Monarch recurrence.
 
     Grid ``(pid_b,)``: each program owns ``BLOCK_B`` batch rows across all H
-    and walks t from T-1 down to 0, carrying ``dh`` (grad w.r.t. the current
-    hidden state) in the ``carry`` buffer. Per step it recomputes the forward
-    (factor 1 -> scratch, factor 2), runs the gate backward, factor-2 backward
-    (dmid + dW2) with the inverse-permute into ``dout1``, then factor-1
-    backward (dX + dW1) folding the matmul term into the carry. Weight grads
-    accumulate via ``atomic_add`` (uncontended when B <= BLOCK_B).
+    and walks t from T-1 down to 0, carrying ``dh`` in the ``carry`` buffer.
+    Per step it recomputes factor 1 (one shared ``mid`` when ``SHARED_W1``,
+    else three), runs the gate backward and factor-2 backward (per-gate
+    ``dW2``; ``dmid`` SUMMED over gates when shared, else per gate) with the
+    inverse-permute into ``dout1``, then factor-1 backward (``dX`` + ``dW1``,
+    single shared when ``SHARED_W1`` else per gate) folding the matmul term
+    into the carry. Weight grads accumulate via ``atomic_add``.
     """
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -449,7 +502,7 @@ def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
     for t in range(T - 1, -1, -1):
         hprev_row = hprev_ptr + t * shp_t + offs_b[:, None] * shp_b
 
-        # ---- recompute factor 1 -> out1 scratch (all 3 gates) ----
+        # ---- recompute factor 1 -> out1 scratch (one mid if shared, else 3) ----
         for k in range(0, NBLOCKS):
             cols = k * BLKSZ + ar
             hk = tl.load(hprev_row + cols[None, :], mask=mb, other=0.0)
@@ -457,22 +510,29 @@ def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
                 q = tl.extra.cuda.libdevice.rint(hk / h_in_scale)
                 q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
                 hk = q * h_in_scale
-            for g in range(0, 3):
-                w1 = tl.load(W1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :])
+            if SHARED_W1:
+                w1 = tl.load(W1_ptr + k * sW1_n + ar[:, None] * sW1_o + ar[None, :])
                 o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")
-                tl.store(out1_ptr + g * ss_g + offs_b[:, None] * ss_b + cols[None, :], o1, mask=mb)
+                tl.store(out1_ptr + offs_b[:, None] * ss_b + cols[None, :], o1, mask=mb)
+            else:
+                for g in range(0, 3):
+                    w1 = tl.load(W1_ptr + g * sW1_g + k * sW1_n + ar[:, None] * sW1_o + ar[None, :])
+                    o1 = tl.dot(hk, tl.trans(w1), input_precision="tf32")
+                    tl.store(out1_ptr + g * ss_g + offs_b[:, None] * ss_b + cols[None, :], o1, mask=mb)
         tl.debug_barrier()
 
         # ---- factor 2 recompute + gate backward + factor 2 backward ----
         for lb in range(0, NBLOCKS):
             chan = lb + NBLOCKS * ar
             cptr = offs_b[:, None] * ss_b + chan[None, :]
-            mid_r = tl.load(out1_ptr + 0 * ss_g + cptr, mask=mb, other=0.0)
-            mid_z = tl.load(out1_ptr + 1 * ss_g + cptr, mask=mb, other=0.0)
-            mid_n = tl.load(out1_ptr + 2 * ss_g + cptr, mask=mb, other=0.0)
-            w2r = tl.load(W2_ptr + 0 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
-            w2z = tl.load(W2_ptr + 1 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
-            w2n = tl.load(W2_ptr + 2 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :])
+            gz = 0 if SHARED_W1 else 1
+            gn = 0 if SHARED_W1 else 2
+            mid_r = tl.load(out1_ptr + cptr, mask=mb, other=0.0)
+            mid_z = tl.load(out1_ptr + gz * ss_g + cptr, mask=mb, other=0.0)
+            mid_n = tl.load(out1_ptr + gn * ss_g + cptr, mask=mb, other=0.0)
+            w2r = tl.load(W2_ptr + 0 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :])
+            w2z = tl.load(W2_ptr + 1 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :])
+            w2n = tl.load(W2_ptr + 2 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :])
             ghr = tl.dot(mid_r, tl.trans(w2r), input_precision="tf32") + tl.load(bh_ptr + 0 * H + chan)[None, :]
             ghz = tl.dot(mid_z, tl.trans(w2z), input_precision="tf32") + tl.load(bh_ptr + 1 * H + chan)[None, :]
             ghn = tl.dot(mid_n, tl.trans(w2n), input_precision="tf32") + tl.load(bh_ptr + 2 * H + chan)[None, :]
@@ -524,26 +584,30 @@ def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
             tl.atomic_add(dbh_ptr + 1 * H + chan, tl.sum(dgh_z, axis=0))
             tl.atomic_add(dbh_ptr + 2 * H + chan, tl.sum(dgh_n, axis=0))
 
-            # factor 2 backward per gate: dmid + dW2
-            dmid_r = tl.dot(dgh_r, w2r, input_precision="tf32")
-            dmid_z = tl.dot(dgh_z, w2z, input_precision="tf32")
-            dmid_n = tl.dot(dgh_n, w2n, input_precision="tf32")
+            # factor 2 backward: per-gate dW2 (each with its own mid).
             tl.atomic_add(
-                dW2_ptr + 0 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :],
+                dW2_ptr + 0 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :],
                 tl.dot(tl.trans(dgh_r), mid_r, input_precision="tf32"),
             )
             tl.atomic_add(
-                dW2_ptr + 1 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :],
+                dW2_ptr + 1 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :],
                 tl.dot(tl.trans(dgh_z), mid_z, input_precision="tf32"),
             )
             tl.atomic_add(
-                dW2_ptr + 2 * sW_g + lb * sW_n + ar[:, None] * sW_o + ar[None, :],
+                dW2_ptr + 2 * sW2_g + lb * sW2_n + ar[:, None] * sW2_o + ar[None, :],
                 tl.dot(tl.trans(dgh_n), mid_n, input_precision="tf32"),
             )
-            # inverse-permute: dout1_flat[r*NBLOCKS + lb] = dmid[lb, r] -> chan positions
-            tl.store(dout1_ptr + 0 * ss_g + cptr, dmid_r, mask=mb)
-            tl.store(dout1_ptr + 1 * ss_g + cptr, dmid_z, mask=mb)
-            tl.store(dout1_ptr + 2 * ss_g + cptr, dmid_n, mask=mb)
+            dmid_r = tl.dot(dgh_r, w2r, input_precision="tf32")
+            dmid_z = tl.dot(dgh_z, w2z, input_precision="tf32")
+            dmid_n = tl.dot(dgh_n, w2n, input_precision="tf32")
+            # inverse-permute: dout1_flat[r*NBLOCKS + lb] = dmid[lb, r] -> chan positions.
+            # Shared w1: sum dmid over gates (one mid). Per-gate: store per gate.
+            if SHARED_W1:
+                tl.store(dout1_ptr + cptr, dmid_r + dmid_z + dmid_n, mask=mb)
+            else:
+                tl.store(dout1_ptr + 0 * ss_g + cptr, dmid_r, mask=mb)
+                tl.store(dout1_ptr + 1 * ss_g + cptr, dmid_z, mask=mb)
+                tl.store(dout1_ptr + 2 * ss_g + cptr, dmid_n, mask=mb)
         tl.debug_barrier()
 
         # ---- factor 1 backward per input block: dX + dW1, fold into carry ----
@@ -557,15 +621,24 @@ def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
                 xk = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax) * h_in_scale
             else:
                 xk = hk
-            dhmm = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
-            for g in range(0, 3):
-                dout1_g = tl.load(dout1_ptr + g * ss_g + kptr, mask=mb, other=0.0)
-                w1 = tl.load(W1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :])
-                dhmm += tl.dot(dout1_g, w1, input_precision="tf32")
+            if SHARED_W1:
+                dout1_k = tl.load(dout1_ptr + kptr, mask=mb, other=0.0)
+                w1 = tl.load(W1_ptr + k * sW1_n + ar[:, None] * sW1_o + ar[None, :])
+                dhmm = tl.dot(dout1_k, w1, input_precision="tf32")
                 tl.atomic_add(
-                    dW1_ptr + g * sW_g + k * sW_n + ar[:, None] * sW_o + ar[None, :],
-                    tl.dot(tl.trans(dout1_g), xk, input_precision="tf32"),
+                    dW1_ptr + k * sW1_n + ar[:, None] * sW1_o + ar[None, :],
+                    tl.dot(tl.trans(dout1_k), xk, input_precision="tf32"),
                 )
+            else:
+                dhmm = tl.zeros((BLOCK_B, BLKSZ), dtype=tl.float32)
+                for g in range(0, 3):
+                    dout1_g = tl.load(dout1_ptr + g * ss_g + kptr, mask=mb, other=0.0)
+                    w1 = tl.load(W1_ptr + g * sW1_g + k * sW1_n + ar[:, None] * sW1_o + ar[None, :])
+                    dhmm += tl.dot(dout1_g, w1, input_precision="tf32")
+                    tl.atomic_add(
+                        dW1_ptr + g * sW1_g + k * sW1_n + ar[:, None] * sW1_o + ar[None, :],
+                        tl.dot(tl.trans(dout1_g), xk, input_precision="tf32"),
+                    )
             if QUANT_H_IN:
                 dhmm = dhmm * mask_in
             cur = tl.load(carry_ptr + offs_b[:, None] * scarry_b + cols[None, :], mask=mb, other=0.0)
@@ -599,7 +672,8 @@ def gru_scan_monarch_backward_triton(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    _, nblocks, blksz, _ = W1.shape
+    shared_w1 = W1.ndim == 3
+    _, nblocks, blksz, _ = W2.shape
 
     gi = gi.contiguous()
     dout = dout.contiguous()
@@ -617,6 +691,7 @@ def gru_scan_monarch_backward_triton(
     carry = torch.zeros((B, H), device=gi.device, dtype=gi.dtype)
     out1 = torch.empty((3, B, H), device=gi.device, dtype=gi.dtype)
     dout1 = torch.empty((3, B, H), device=gi.device, dtype=gi.dtype)
+    sW1_g = 0 if shared_w1 else W1.stride(0)
 
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -(2**31), 2**31 - 1)
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -(2**31), 2**31 - 1)
@@ -629,7 +704,8 @@ def gru_scan_monarch_backward_triton(
         T, B,
         gi.stride(0), gi.stride(1),
         h_prev.stride(0), h_prev.stride(1),
-        W1.stride(0), W1.stride(1), W1.stride(2),
+        sW1_g, W1.stride(-3), W1.stride(-2),
+        W2.stride(0), W2.stride(1), W2.stride(2),
         dout.stride(0), dout.stride(1),
         dgi.stride(0), dgi.stride(1),
         out1.stride(0), out1.stride(1),
@@ -642,6 +718,7 @@ def gru_scan_monarch_backward_triton(
         BLOCK_B=block_b,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
+        SHARED_W1=shared_w1,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -694,7 +771,8 @@ def gru_scan_monarch(
     """Public autograd wrapper for the two-factor Monarch scan.
 
     - ``gi: [T, B, 3H]`` pre-batched input projection.
-    - ``W1, W2: [3, nblocks, blksz, blksz]`` per-gate Monarch factors.
+    - ``W1: [nblocks, blksz, blksz]`` shared first factor;
+      ``W2: [3, nblocks, blksz, blksz]`` per-gate second factors.
     - ``bh_cat: [3H]`` hidden bias.
     Returns ``out: [T, B, H]``.
     """

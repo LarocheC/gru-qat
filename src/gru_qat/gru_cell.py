@@ -29,7 +29,11 @@ from gru_qat.quantizers import (
     QuantizerConfig,
     make_quantizer,
 )
-from gru_qat.structure import StructureConfig, make_structured_linear
+from gru_qat.structure import (
+    StructureConfig,
+    make_monarch_fused_gates,
+    make_structured_linear,
+)
 
 GateLayout = Literal["split", "fused"]
 
@@ -136,15 +140,24 @@ class GRUCellQuant(nn.Module):
             # input_size == hidden_size — the fused [3*hidden] output
             # would never be square.
             assert structure_input is not None
-            self.struct_Wi_r = make_structured_linear(
-                structure_input, input_size, hidden_size, bias=False,
-            )
-            self.struct_Wi_z = make_structured_linear(
-                structure_input, input_size, hidden_size, bias=False,
-            )
-            self.struct_Wi_n = make_structured_linear(
-                structure_input, input_size, hidden_size, bias=False,
-            )
+            if structure_input.kind == "monarch" and structure_input.monarch_fused:
+                # Fused Monarch: one MonarchLinear(in -> 3H) with a shared w1,
+                # exposed as three per-gate modules (see make_monarch_fused_gates).
+                self.struct_Wi_r, self.struct_Wi_z, self.struct_Wi_n = (
+                    make_monarch_fused_gates(
+                        structure_input, input_size, hidden_size, bias=False,
+                    )
+                )
+            else:
+                self.struct_Wi_r = make_structured_linear(
+                    structure_input, input_size, hidden_size, bias=False,
+                )
+                self.struct_Wi_z = make_structured_linear(
+                    structure_input, input_size, hidden_size, bias=False,
+                )
+                self.struct_Wi_n = make_structured_linear(
+                    structure_input, input_size, hidden_size, bias=False,
+                )
             # Output-side fake-quant per gate (placement: matmul output,
             # before bias). Three quantizers so each gate's running stats
             # are independent.
@@ -159,15 +172,24 @@ class GRUCellQuant(nn.Module):
             self.W_hn = nn.Parameter(torch.empty(hidden_size, hidden_size))
         else:
             assert structure_hidden is not None
-            self.struct_Wh_r = make_structured_linear(
-                structure_hidden, hidden_size, hidden_size, bias=False,
-            )
-            self.struct_Wh_z = make_structured_linear(
-                structure_hidden, hidden_size, hidden_size, bias=False,
-            )
-            self.struct_Wh_n = make_structured_linear(
-                structure_hidden, hidden_size, hidden_size, bias=False,
-            )
+            if structure_hidden.kind == "monarch" and structure_hidden.monarch_fused:
+                # Fused Monarch: one MonarchLinear(H -> 3H) with a shared w1,
+                # exposed as three per-gate modules (see make_monarch_fused_gates).
+                self.struct_Wh_r, self.struct_Wh_z, self.struct_Wh_n = (
+                    make_monarch_fused_gates(
+                        structure_hidden, hidden_size, hidden_size, bias=False,
+                    )
+                )
+            else:
+                self.struct_Wh_r = make_structured_linear(
+                    structure_hidden, hidden_size, hidden_size, bias=False,
+                )
+                self.struct_Wh_z = make_structured_linear(
+                    structure_hidden, hidden_size, hidden_size, bias=False,
+                )
+                self.struct_Wh_n = make_structured_linear(
+                    structure_hidden, hidden_size, hidden_size, bias=False,
+                )
             self.quant_struct_Wh_r = make_quantizer(recipe.weight)
             self.quant_struct_Wh_z = make_quantizer(recipe.weight)
             self.quant_struct_Wh_n = make_quantizer(recipe.weight)
